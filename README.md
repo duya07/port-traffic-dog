@@ -77,6 +77,26 @@ Alpine 预装脚本已同步更新，包含：
 - `crond` 启动与开机启动注册；
 - 安装后命令级自检（`nft/tc/ss/jq/awk/bc/unzip/cron/curl/bash`）。
 
+旧 VPS 保留配置迁移到自定义版（先备份后覆盖）：
+
+```bash
+wget -O migrate-to-custom.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/migrate-to-custom.sh && chmod +x migrate-to-custom.sh && sudo ./migrate-to-custom.sh
+```
+
+可选：指定仓库/分支（默认 `duya07/port-traffic-dog` + `main`）：
+
+```bash
+sudo REPO="duya07/port-traffic-dog" BRANCH="main" ./migrate-to-custom.sh
+```
+
+迁移脚本会自动备份：
+
+- `/etc/port-traffic-dog`
+- `/usr/local/bin/port-traffic-dog.sh`
+- `/usr/local/bin/dog`
+
+备份位置示例：`/etc/port-traffic-dog-migration-backup/20260530-230000/`
+
 #### 2.2 telegram.sh
 
 修改说明：
@@ -100,6 +120,7 @@ chmod +x telegram.sh
 .
 ├── PORT_TRAFFIC_DOG_CUSTOM.md
 ├── alpine-port-traffic-dog-preinstall.sh
+├── migrate-to-custom.sh
 ├── port-traffic-dog.sh
 ├── telegram.sh
 └── wecom.sh
