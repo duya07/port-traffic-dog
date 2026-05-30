@@ -52,6 +52,30 @@ build_telegram_send_url() {
     fi
 }
 
+mask_telegram_token() {
+    local token="$1"
+    local token_len=${#token}
+
+    if [ "$token_len" -le 10 ]; then
+        echo "***"
+        return
+    fi
+
+    local head="${token:0:6}"
+    local tail="${token: -4}"
+    echo "${head}***${tail}"
+}
+
+build_telegram_send_url_preview() {
+    local api_base="$1"
+    local bot_token="$2"
+    local send_url
+    send_url=$(build_telegram_send_url "$api_base" "$bot_token")
+    local masked_token
+    masked_token=$(mask_telegram_token "$bot_token")
+    echo "${send_url//$bot_token/$masked_token}"
+}
+
 send_telegram_message() {
     local message="$1"
 
@@ -65,28 +89,43 @@ send_telegram_message() {
         return 1
     fi
 
-    # URL编码：Telegram API要求空格和换行符必须编码
-    local encoded_message=$(printf '%s' "$message" | sed 's/ /%20/g; s/\n/%0A/g')
+    local route=$(get_telegram_api_route)
+    local send_url_preview
+    send_url_preview=$(build_telegram_send_url_preview "$api_base" "$bot_token")
+    log_notification "Telegram发送线路: ${route} | endpoint: ${send_url_preview}"
 
     local retry_count=0
 
     # 重试机制
     while [ $retry_count -le $TELEGRAM_MAX_RETRIES ]; do
-        local response=$(curl -s --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
-            "$send_url" \
-            -d "chat_id=${chat_id}" \
-            -d "text=${encoded_message}" \
-            -d "parse_mode=HTML" \
-            2>/dev/null)
+        local curl_output=""
+        local curl_exit=0
 
-        # Telegram API成功响应的标准判断
-        if echo "$response" | grep -q '"ok":true'; then
+        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
+            "$send_url" \
+            --data-urlencode "chat_id=${chat_id}" \
+            --data-urlencode "text=${message}" \
+            -d "parse_mode=HTML" \
+            2>&1) || curl_exit=$?
+
+        if [ $curl_exit -ne 0 ]; then
+            local curl_error
+            curl_error=$(echo "$curl_output" | tr '\n' ' ' | cut -c1-220)
+            log_notification "Telegram请求失败(curl=$curl_exit) | endpoint: ${send_url_preview} | error: ${curl_error}"
+        elif echo "$curl_output" | grep -q '"ok":true'; then
             if [ $retry_count -gt 0 ]; then
                 log_notification "Telegram消息发送成功 (重试第${retry_count}次后成功)"
             else
                 log_notification "Telegram消息发送成功"
             fi
             return 0
+        else
+            local api_error
+            api_error=$(echo "$curl_output" | jq -r '.description // empty' 2>/dev/null || true)
+            if [ -z "$api_error" ]; then
+                api_error=$(echo "$curl_output" | tr '\n' ' ' | cut -c1-220)
+            fi
+            log_notification "Telegram接口返回失败 | endpoint: ${send_url_preview} | error: ${api_error}"
         fi
 
         retry_count=$((retry_count + 1))
