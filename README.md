@@ -1,29 +1,12 @@
-# personal-scripts
+# port-traffic-dog
 
-个人自用 Shell 脚本集合，主要基于公开项目脚本进行适配和小幅修改。
+基于公开项目脚本进行适配和修改的 `port-traffic-dog` 自定义版本。
 
 > 脚本仅用于个人使用场景，请在执行前自行审阅内容，并根据实际环境调整配置。
 
-## 脚本列表
+## 脚本说明
 
-### 1. kejilion.sh
-
-来源：[kejilion/sh](https://github.com/kejilion/sh)
-
-修改说明：
-
-- 基于原项目脚本进行简单修改。
-- 关闭默认上传功能。
-
-安装并运行：
-
-```bash
-wget -O kejilion.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/personal-scripts/kejilion.sh
-chmod +x kejilion.sh
-./kejilion.sh
-```
-
-### 2. 端口流量狗
+### 端口流量狗
 
 #### 2.1 port-traffic-dog.sh
 
