@@ -5,6 +5,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="1.2.5"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
+readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
 readonly CONFIG_DIR="/etc/port-traffic-dog"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly LOG_FILE="$CONFIG_DIR/logs/traffic.log"
@@ -20,6 +21,14 @@ readonly SHORT_CONNECT_TIMEOUT=5
 readonly SHORT_MAX_TIMEOUT=7
 readonly SCRIPT_URL="https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh"
 readonly SHORTCUT_COMMAND="dog"
+
+get_script_exec_path() {
+    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        echo "$INSTALLED_SCRIPT_PATH"
+    else
+        echo "$SCRIPT_PATH"
+    fi
+}
 
 detect_system() {
     # Ubuntu优先检测：避免Debian系统误判
@@ -121,8 +130,8 @@ setup_script_permissions() {
         chmod +x "$SCRIPT_PATH" 2>/dev/null || true
     fi
 
-    if [ -f "/usr/local/bin/port-traffic-dog.sh" ]; then
-        chmod +x "/usr/local/bin/port-traffic-dog.sh" 2>/dev/null || true
+    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
     fi
 }
 
@@ -2585,8 +2594,8 @@ install_update_script() {
 
     if download_with_sources "$SCRIPT_URL" "$temp_file"; then
         if [ -s "$temp_file" ] && grep -q "端口流量狗" "$temp_file" 2>/dev/null; then
-            mv "$temp_file" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
+            mv "$temp_file" "$INSTALLED_SCRIPT_PATH"
+            chmod +x "$INSTALLED_SCRIPT_PATH"
 
             create_shortcut_command
 
@@ -2611,14 +2620,19 @@ install_update_script() {
 }
 
 create_shortcut_command() {
-    if [ ! -f "/usr/local/bin/$SHORTCUT_COMMAND" ]; then
-        cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
-#!/bin/bash
-exec bash "$SCRIPT_PATH" "\$@"
-EOF
-        chmod +x "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
-        echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
+    if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ] && [ ! -f "$INSTALLED_SCRIPT_PATH" ]; then
+        cp "$SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH"
+        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+    elif [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
     fi
+
+    cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
+#!/bin/bash
+exec bash "$INSTALLED_SCRIPT_PATH" "\$@"
+EOF
+    chmod +x "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
+    echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
 }
 
 # 卸载脚本
@@ -2627,7 +2641,7 @@ uninstall_script() {
     echo "────────────────────────────────────────────────────────"
 
     echo -e "${YELLOW}将要删除以下内容:${NC}"
-    echo "  - 脚本文件: $SCRIPT_PATH"
+    echo "  - 脚本文件: $INSTALLED_SCRIPT_PATH"
     echo "  - 快捷命令: /usr/local/bin/$SHORTCUT_COMMAND"
     echo "  - 配置目录: $CONFIG_DIR"
     echo "  - 所有nftables规则"
@@ -2655,7 +2669,7 @@ uninstall_script() {
 
         rm -rf "$CONFIG_DIR" 2>/dev/null || true
         rm -f "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
-        rm -f "$SCRIPT_PATH" 2>/dev/null || true
+        rm -f "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
 
         echo -e "${GREEN}卸载完成！${NC}"
         echo -e "${YELLOW}感谢使用端口流量狗！${NC}"
@@ -2693,7 +2707,7 @@ manage_notifications() {
 
 load_telegram_module() {
     local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-    local local_telegram_script="$(dirname "$SCRIPT_PATH")/telegram.sh"
+    local local_telegram_script="$(dirname "$(get_script_exec_path)")/telegram.sh"
 
     if [ -f "$telegram_script" ]; then
         source "$telegram_script" 2>/dev/null || true
@@ -2822,7 +2836,8 @@ manage_wecom_notifications() {
 }
 
 setup_telegram_notification_cron() {
-    local script_path="$SCRIPT_PATH"
+    local script_path
+    script_path=$(get_script_exec_path)
     local temp_cron=$(mktemp)
 
     crontab -l 2>/dev/null | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
@@ -2848,7 +2863,8 @@ setup_telegram_notification_cron() {
 }
 
 setup_wecom_notification_cron() {
-    local script_path="$SCRIPT_PATH"
+    local script_path
+    script_path=$(get_script_exec_path)
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
 
@@ -2919,7 +2935,8 @@ export_notification_functions() {
 
 setup_port_auto_reset_cron() {
     local port="$1"
-    local script_path="$SCRIPT_PATH"
+    local script_path
+    script_path=$(get_script_exec_path)
     local temp_cron=$(mktemp)
 
     # 保留现有任务，移除该端口的旧任务
