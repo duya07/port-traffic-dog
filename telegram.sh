@@ -150,6 +150,7 @@ send_telegram_message() {
     local html_message
     html_message=$(escape_telegram_html_text "$safe_message")
 
+    local migrated_once=false
     local retry_count=0
 
     # 重试机制
@@ -165,7 +166,26 @@ send_telegram_message() {
             local curl_error
             curl_error=$(echo "$curl_output" | tr '\n' ' ' | cut -c1-220)
             log_notification "Telegram请求失败(curl=$curl_exit) | endpoint: ${send_url_preview} | error: ${curl_error}"
-        elif echo "$curl_output" | grep -q '"ok":true'; then
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -le $TELEGRAM_MAX_RETRIES ]; then
+                sleep 2  # 避免频繁请求被限流
+            fi
+            continue
+        fi
+
+        if [ "$migrated_once" = "false" ]; then
+            local migrated_chat_id
+            migrated_chat_id=$(echo "$curl_output" | jq -r '.parameters.migrate_to_chat_id // empty' 2>/dev/null || true)
+            if [ -n "$migrated_chat_id" ]; then
+                chat_id="$migrated_chat_id"
+                update_config ".notifications.telegram.chat_id = \"$migrated_chat_id\""
+                log_notification "Telegram群已升级为supergroup，已自动更新chat_id为: ${migrated_chat_id}，正在重试"
+                migrated_once=true
+                continue
+            fi
+        fi
+
+        if echo "$curl_output" | grep -q '"ok":true'; then
             if [ $retry_count -gt 0 ]; then
                 log_notification "Telegram消息发送成功 (重试第${retry_count}次后成功)"
             else
