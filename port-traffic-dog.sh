@@ -2691,43 +2691,48 @@ manage_notifications() {
     esac
 }
 
-manage_telegram_notifications() {
-    local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-
-    if [ -f "$telegram_script" ]; then
-        # 导出通知管理函数供模块使用
-        export_notification_functions
-        source "$telegram_script"
-        telegram_configure
-        manage_notifications
-    else
-        echo -e "${RED}Telegram 通知模块不存在${NC}"
-        echo "请检查文件: $telegram_script"
-        sleep 2
-        manage_notifications
-    fi
-}
-
-manage_telegram_api_route() {
+load_telegram_module() {
     local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
     local local_telegram_script="$(dirname "$SCRIPT_PATH")/telegram.sh"
 
-    # 优先加载运行目录中的telegram模块
     if [ -f "$telegram_script" ]; then
         source "$telegram_script" 2>/dev/null || true
     fi
 
-    # 如果运行目录模块太旧，尝试用主脚本同目录模块补上能力
-    if ! declare -F telegram_switch_api_route >/dev/null 2>&1; then
+    # 运行目录模块缺能力时，回退加载主脚本同目录模块
+    if ! declare -F telegram_send_status_notification >/dev/null 2>&1; then
         if [ -f "$local_telegram_script" ]; then
             source "$local_telegram_script" 2>/dev/null || true
-            if declare -F telegram_switch_api_route >/dev/null 2>&1; then
+
+            # 仅在缺失能力时补齐，避免覆盖用户自定义模块
+            if declare -F telegram_send_status_notification >/dev/null 2>&1; then
                 mkdir -p "$CONFIG_DIR/notifications"
                 cp "$local_telegram_script" "$telegram_script"
                 chmod +x "$telegram_script" 2>/dev/null || true
             fi
         fi
     fi
+
+    declare -F telegram_send_status_notification >/dev/null 2>&1
+}
+
+manage_telegram_notifications() {
+    # 导出通知管理函数供模块使用
+    export_notification_functions
+
+    if load_telegram_module && declare -F telegram_configure >/dev/null 2>&1; then
+        telegram_configure
+        manage_notifications
+    else
+        echo -e "${RED}Telegram 通知模块不存在${NC}"
+        echo "请检查文件: $CONFIG_DIR/notifications/telegram.sh"
+        sleep 2
+        manage_notifications
+    fi
+}
+
+manage_telegram_api_route() {
+    load_telegram_module || true
 
     if declare -F telegram_switch_api_route >/dev/null 2>&1; then
         telegram_switch_api_route
@@ -3021,9 +3026,7 @@ send_status_notification() {
     local total_count=0
 
     # 发送Telegram通知
-    local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-    if [ -f "$telegram_script" ]; then
-        source "$telegram_script"
+    if load_telegram_module; then
         total_count=$((total_count + 1))
         if telegram_send_status_notification; then
             success_count=$((success_count + 1))
@@ -3068,9 +3071,7 @@ main() {
                 exit 0
                 ;;
             --send-telegram-status)
-                local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-                if [ -f "$telegram_script" ]; then
-                    source "$telegram_script"
+                if load_telegram_module; then
                     telegram_send_status_notification
                 fi
                 exit 0

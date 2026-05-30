@@ -76,6 +76,34 @@ build_telegram_send_url_preview() {
     echo "${send_url//$bot_token/$masked_token}"
 }
 
+telegram_do_post() {
+    local send_url="$1"
+    local chat_id="$2"
+    local message="$3"
+    local parse_mode="${4:-}"
+
+    local curl_exit=0
+    local curl_output=""
+
+    if [ -n "$parse_mode" ]; then
+        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
+            "$send_url" \
+            --data-urlencode "chat_id=${chat_id}" \
+            --data-urlencode "text=${message}" \
+            -d "parse_mode=${parse_mode}" \
+            2>&1) || curl_exit=$?
+    else
+        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
+            "$send_url" \
+            --data-urlencode "chat_id=${chat_id}" \
+            --data-urlencode "text=${message}" \
+            2>&1) || curl_exit=$?
+    fi
+
+    printf '%s\n' "$curl_exit"
+    printf '%s' "$curl_output"
+}
+
 send_telegram_message() {
     local message="$1"
 
@@ -98,15 +126,12 @@ send_telegram_message() {
 
     # 重试机制
     while [ $retry_count -le $TELEGRAM_MAX_RETRIES ]; do
-        local curl_output=""
-        local curl_exit=0
-
-        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
-            "$send_url" \
-            --data-urlencode "chat_id=${chat_id}" \
-            --data-urlencode "text=${message}" \
-            -d "parse_mode=HTML" \
-            2>&1) || curl_exit=$?
+        local post_result
+        post_result=$(telegram_do_post "$send_url" "$chat_id" "$message" "HTML")
+        local curl_exit
+        curl_exit=$(echo "$post_result" | head -n1)
+        local curl_output
+        curl_output=$(echo "$post_result" | tail -n +2)
 
         if [ $curl_exit -ne 0 ]; then
             local curl_error
@@ -125,7 +150,30 @@ send_telegram_message() {
             if [ -z "$api_error" ]; then
                 api_error=$(echo "$curl_output" | tr '\n' ' ' | cut -c1-220)
             fi
-            log_notification "Telegram接口返回失败 | endpoint: ${send_url_preview} | error: ${api_error}"
+
+            if echo "$api_error" | grep -Eqi "parse entities|can't parse|parse_mode|Unsupported parse mode"; then
+                log_notification "Telegram检测到HTML格式不兼容，尝试降级纯文本发送 | endpoint: ${send_url_preview} | error: ${api_error}"
+                local fallback_result
+                fallback_result=$(telegram_do_post "$send_url" "$chat_id" "$message")
+                local fallback_exit
+                fallback_exit=$(echo "$fallback_result" | head -n1)
+                local fallback_output
+                fallback_output=$(echo "$fallback_result" | tail -n +2)
+
+                if [ $fallback_exit -eq 0 ] && echo "$fallback_output" | grep -q '"ok":true'; then
+                    log_notification "Telegram纯文本降级发送成功"
+                    return 0
+                fi
+
+                local fallback_error
+                fallback_error=$(echo "$fallback_output" | jq -r '.description // empty' 2>/dev/null || true)
+                if [ -z "$fallback_error" ]; then
+                    fallback_error=$(echo "$fallback_output" | tr '\n' ' ' | cut -c1-220)
+                fi
+                log_notification "Telegram纯文本降级也失败 | endpoint: ${send_url_preview} | error: ${fallback_error}"
+            else
+                log_notification "Telegram接口返回失败 | endpoint: ${send_url_preview} | error: ${api_error}"
+            fi
         fi
 
         retry_count=$((retry_count + 1))
