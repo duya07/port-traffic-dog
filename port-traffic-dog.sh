@@ -169,7 +169,7 @@ init_config() {
       "chat_id": "",
       "server_name": "",
       "api_route": "official",
-      "custom_api_base": "",
+      "custom_api_base": "https://tgapi.duyaw.com/",
       "status_notifications": {
         "enabled": false,
         "interval": "1h"
@@ -997,8 +997,6 @@ show_main_menu() {
     local daily_total=$(get_daily_total_traffic)
 
     echo -e "${BLUE}=== 端口流量狗 v$SCRIPT_VERSION ===${NC}"
-    echo -e "${GREEN}介绍主页:${NC}https://zywe.de | ${GREEN}项目开源:${NC}https://github.com/zywe03/realm-xwPF"
-    echo -e "${GREEN}一只轻巧的‘守护犬’，时刻守护你的端口流量 | 快捷命令: dog${NC}"
     echo
 
     echo -e "${GREEN}状态: 监控中${NC} | ${BLUE}守护端口: ${port_count}个${NC} | ${YELLOW}端口总流量: $daily_total${NC}"
@@ -2712,23 +2710,93 @@ manage_telegram_notifications() {
 
 manage_telegram_api_route() {
     local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
+    local local_telegram_script="$(dirname "$SCRIPT_PATH")/telegram.sh"
 
+    # 优先加载运行目录中的telegram模块
     if [ -f "$telegram_script" ]; then
-        source "$telegram_script"
-        if declare -F telegram_switch_api_route >/dev/null 2>&1; then
-            telegram_switch_api_route
-        else
-            echo -e "${RED}当前telegram模块不支持线路切换${NC}"
-            echo "请更新 telegram.sh 后重试"
-            sleep 2
-        fi
-        manage_notifications
-    else
-        echo -e "${RED}Telegram 通知模块不存在${NC}"
-        echo "请检查文件: $telegram_script"
-        sleep 2
-        manage_notifications
+        source "$telegram_script" 2>/dev/null || true
     fi
+
+    # 如果运行目录模块太旧，尝试用主脚本同目录模块补上能力
+    if ! declare -F telegram_switch_api_route >/dev/null 2>&1; then
+        if [ -f "$local_telegram_script" ]; then
+            source "$local_telegram_script" 2>/dev/null || true
+            if declare -F telegram_switch_api_route >/dev/null 2>&1; then
+                mkdir -p "$CONFIG_DIR/notifications"
+                cp "$local_telegram_script" "$telegram_script"
+                chmod +x "$telegram_script" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    if declare -F telegram_switch_api_route >/dev/null 2>&1; then
+        telegram_switch_api_route
+    else
+        telegram_switch_api_route_fallback
+    fi
+
+    manage_notifications
+}
+
+telegram_switch_api_route_fallback() {
+    local current_route=$(jq -r '.notifications.telegram.api_route // "official"' "$CONFIG_FILE" 2>/dev/null || echo "official")
+    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // "https://tgapi.duyaw.com/"' "$CONFIG_FILE" 2>/dev/null || echo "https://tgapi.duyaw.com/")
+    custom_base=$(echo "$custom_base" | tr -d ' ')
+    custom_base="${custom_base%/}"
+    if [ -z "$custom_base" ] || [ "$custom_base" = "null" ]; then
+        custom_base="https://tgapi.duyaw.com"
+    fi
+
+    local current_route_display="官方"
+    if [ "$current_route" = "custom" ]; then
+        current_route_display="自定义"
+    fi
+
+    echo -e "${BLUE}=== Telegram通信线路切换 ===${NC}"
+    echo "当前线路: ${current_route_display}"
+    echo "当前自定义地址: ${custom_base}"
+    echo
+    echo "1. 官方线路 (https://api.telegram.org)"
+    echo "2. 自定义线路"
+    echo "0. 返回"
+    echo
+    read -p "请选择 [0-2]: " route_choice
+
+    case "$route_choice" in
+        1)
+            update_config ".notifications.telegram.api_route = \"official\""
+            echo -e "${GREEN}已切换到官方线路${NC}"
+            ;;
+        2)
+            read -p "请输入自定义API基础地址 (回车默认: ${custom_base}): " input_custom
+            if [ -z "$input_custom" ]; then
+                input_custom="$custom_base"
+            fi
+            input_custom=$(echo "$input_custom" | tr -d ' ')
+            input_custom="${input_custom%/}"
+            if [[ ! "$input_custom" =~ ^https?:// ]]; then
+                echo -e "${RED}地址格式错误，必须以 http:// 或 https:// 开头${NC}"
+                sleep 2
+                return 1
+            fi
+
+            local tmp_file=$(mktemp)
+            jq --arg base "$input_custom" \
+               '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
+               "$CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$CONFIG_FILE"
+
+            echo -e "${GREEN}已切换到自定义线路${NC}"
+            echo "当前地址: $input_custom"
+            ;;
+        0|"")
+            return 0
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            ;;
+    esac
+
+    sleep 1
 }
 
 manage_wecom_notifications() {
@@ -2898,20 +2966,16 @@ $(format_port_list "telegram")"
 format_text_status_message() {
     local server_name="${1:-$(hostname)}"
     local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local notification_icon="🔔"
     local active_ports=($(get_active_ports))
     local port_count=${#active_ports[@]}
     local daily_total=$(get_daily_total_traffic)
 
-    local message="${notification_icon} 端口流量狗 v${SCRIPT_VERSION} | ⏰ ${timestamp}
-介绍主页: https://zywe.de | 项目开源: https://github.com/zywe03/realm-xwPF
-一只轻巧的'守护犬'，时刻守护你的端口流量 | 快捷命令: dog
----
+    local message="🔗 服务器: ${server_name} | ⏰ ${timestamp}
+
+────────────────────────────────────────
 状态: 监控中 | 守护端口: ${port_count}个 | 端口总流量: ${daily_total}
 ────────────────────────────────────────
-$(format_port_list "message")
-────────────────────────────────────────
-🔗 服务器: ${server_name}"
+$(format_port_list "telegram")"
 
     echo "$message"
 }
@@ -2920,20 +2984,16 @@ $(format_port_list "message")
 format_markdown_status_message() {
     local server_name="${1:-$(hostname)}"
     local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local notification_icon="🔔"
     local active_ports=($(get_active_ports))
     local port_count=${#active_ports[@]}
     local daily_total=$(get_daily_total_traffic)
 
-    local message="**${notification_icon} 端口流量狗 v${SCRIPT_VERSION}** | ⏰ ${timestamp}
-介绍主页: \`https://zywe.de\` | 项目开源: \`https://github.com/zywe03/realm-xwPF\`
-一只轻巧的'守护犬'，时刻守护你的端口流量 | 快捷命令: dog
----
+    local message="🔗 **服务器**: ${server_name} | ⏰ ${timestamp}
+
+────────────────────────────────────────
 **状态**: 监控中 | **守护端口**: ${port_count}个 | **端口总流量**: ${daily_total}
 ────────────────────────────────────────
-$(format_port_list "markdown")
-────────────────────────────────────────
-🔗 **服务器**: ${server_name}"
+$(format_port_list "telegram")"
 
     echo "$message"
 }
@@ -3043,8 +3103,6 @@ main() {
                 ;;
             --version)
                 echo -e "${BLUE}$SCRIPT_NAME v$SCRIPT_VERSION${NC}"
-                echo -e "${GREEN}介绍主页:${NC} https://zywe.de"
-                echo -e "${GREEN}项目开源:${NC} https://github.com/zywe03/realm-xwPF"
                 exit 0
                 ;;
             --install)
