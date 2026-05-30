@@ -909,7 +909,19 @@ build_usage_progress_bar() {
         capped=100
     fi
 
-    local filled=$((capped * width / 100))
+    local filled=0
+    if [ "$capped" -le 0 ]; then
+        filled=0
+    elif [ "$capped" -lt 50 ]; then
+        # 50%以下按5%一格向上取整：1%-5%显示1格
+        filled=$(((capped + 4) / 5))
+    else
+        # 50%及以上保持线性：50%=10格，100%=20格
+        filled=$((capped / 5))
+    fi
+    if [ "$filled" -gt "$width" ]; then
+        filled="$width"
+    fi
     local empty=$((width - filled))
     local bar=""
     local i
