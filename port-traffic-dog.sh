@@ -19,7 +19,8 @@ readonly NC='\033[0m'
 # 网络超时设置
 readonly SHORT_CONNECT_TIMEOUT=5
 readonly SHORT_MAX_TIMEOUT=7
-readonly SCRIPT_URL="https://raw.githubusercontent.com/zywe03/realm-xwPF/main/port-traffic-dog.sh"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh"
+readonly MODULES_ARCHIVE_URL="https://github.com/duya07/port-traffic-dog/archive/refs/heads/main.zip"
 readonly SHORTCUT_COMMAND="dog"
 
 get_script_exec_path() {
@@ -2534,7 +2535,6 @@ download_notification_modules() {
     local sync_mode="${1:-fill_missing}"
     local notifications_dir="$CONFIG_DIR/notifications"
     local temp_dir=$(mktemp -d)
-    local repo_url="https://github.com/zywe03/realm-xwPF/archive/refs/heads/main.zip"
     local script_dir
     script_dir=$(dirname "$(get_script_exec_path)")
 
@@ -2559,13 +2559,43 @@ download_notification_modules() {
     fi
 
     # 下载解压后同步通知模块：默认只补齐缺失；force 模式覆盖同步
-    if download_with_sources "$repo_url" "$temp_dir/repo.zip" &&
-       (cd "$temp_dir" && unzip -q repo.zip) &&
-       [ -d "$temp_dir/realm-xwPF-main/notifications" ]; then
-        for module_file in "$temp_dir/realm-xwPF-main/notifications"/*.sh; do
+    if download_with_sources "$MODULES_ARCHIVE_URL" "$temp_dir/repo.zip" &&
+       (cd "$temp_dir" && unzip -q repo.zip); then
+        local extracted_root=""
+        local d
+        for d in "$temp_dir"/*; do
+            [ -d "$d" ] || continue
+            if [ "$(basename "$d")" != "." ] && [ "$(basename "$d")" != ".." ]; then
+                extracted_root="$d"
+                break
+            fi
+        done
+
+        if [ -z "$extracted_root" ]; then
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        local remote_telegram=""
+        local remote_wecom=""
+        if [ -f "$extracted_root/notifications/telegram.sh" ]; then
+            remote_telegram="$extracted_root/notifications/telegram.sh"
+        elif [ -f "$extracted_root/telegram.sh" ]; then
+            remote_telegram="$extracted_root/telegram.sh"
+        fi
+        if [ -f "$extracted_root/notifications/wecom.sh" ]; then
+            remote_wecom="$extracted_root/notifications/wecom.sh"
+        elif [ -f "$extracted_root/wecom.sh" ]; then
+            remote_wecom="$extracted_root/wecom.sh"
+        fi
+
+        local module_file
+        for module_file in "$remote_telegram" "$remote_wecom"; do
+            [ -n "$module_file" ] || continue
             [ -f "$module_file" ] || continue
 
-            local module_name=$(basename "$module_file")
+            local module_name
+            module_name=$(basename "$module_file")
             local target_file="$notifications_dir/$module_name"
 
             if [ "$sync_mode" = "force" ] || [ ! -f "$target_file" ]; then
@@ -2573,13 +2603,15 @@ download_notification_modules() {
             fi
         done
 
-        chmod +x "$notifications_dir"/*.sh 2>/dev/null || true
-        rm -rf "$temp_dir"
-        return 0
-    else
-        rm -rf "$temp_dir"
-        return 1
+        if [ -f "$notifications_dir/telegram.sh" ] && [ -f "$notifications_dir/wecom.sh" ]; then
+            chmod +x "$notifications_dir"/*.sh 2>/dev/null || true
+            rm -rf "$temp_dir"
+            return 0
+        fi
     fi
+
+    rm -rf "$temp_dir"
+    return 1
 }
 
 # 安装(更新)脚本
