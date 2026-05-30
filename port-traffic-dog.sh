@@ -898,7 +898,7 @@ get_port_cycle_range() {
 
 build_usage_progress_bar() {
     local percent="${1:-0}"
-    local width=24
+    local width=20
     local capped="$percent"
 
     if [ "$capped" -lt 0 ]; then
@@ -2531,32 +2531,34 @@ download_with_sources() {
 
 # 下载通知模块
 download_notification_modules() {
+    local sync_mode="${1:-fill_missing}"
     local notifications_dir="$CONFIG_DIR/notifications"
     local temp_dir=$(mktemp -d)
     local repo_url="https://github.com/zywe03/realm-xwPF/archive/refs/heads/main.zip"
-    local script_dir=$(dirname "$SCRIPT_PATH")
+    local script_dir
+    script_dir=$(dirname "$(get_script_exec_path)")
 
     mkdir -p "$notifications_dir"
 
-    # 优先使用主脚本同目录下的通知模块，仅补齐缺失文件，避免覆盖用户自定义内容
+    # 优先使用主脚本同目录下的通知模块
     for local_module in "$script_dir"/telegram.sh "$script_dir"/wecom.sh; do
         [ -f "$local_module" ] || continue
 
         local module_name=$(basename "$local_module")
         local target_file="$notifications_dir/$module_name"
 
-        if [ ! -f "$target_file" ]; then
+        if [ "$sync_mode" = "force" ] || [ ! -f "$target_file" ]; then
             cp "$local_module" "$target_file"
         fi
     done
 
-    if [ -f "$notifications_dir/telegram.sh" ] && [ -f "$notifications_dir/wecom.sh" ]; then
+    if [ "$sync_mode" != "force" ] && [ -f "$notifications_dir/telegram.sh" ] && [ -f "$notifications_dir/wecom.sh" ]; then
         chmod +x "$notifications_dir"/*.sh 2>/dev/null || true
         rm -rf "$temp_dir"
         return 0
     fi
 
-    # 下载解压后只补齐缺失的通知模块，保留用户已经修改过的 telegram.sh/wecom.sh
+    # 下载解压后同步通知模块：默认只补齐缺失；force 模式覆盖同步
     if download_with_sources "$repo_url" "$temp_dir/repo.zip" &&
        (cd "$temp_dir" && unzip -q repo.zip) &&
        [ -d "$temp_dir/realm-xwPF-main/notifications" ]; then
@@ -2566,7 +2568,7 @@ download_notification_modules() {
             local module_name=$(basename "$module_file")
             local target_file="$notifications_dir/$module_name"
 
-            if [ ! -f "$target_file" ]; then
+            if [ "$sync_mode" = "force" ] || [ ! -f "$target_file" ]; then
                 cp "$module_file" "$target_file"
             fi
         done
@@ -2687,9 +2689,10 @@ manage_notifications() {
     echo "2. 邮箱通知 [敬请期待]"
     echo "3. 企业wx 机器人通知"
     echo "4. Telegram通信线路切换"
+    echo "5. 强制同步通知模块(覆盖本地)"
     echo "0. 返回主菜单"
     echo
-    read -p "请选择操作 [0-4]: " choice
+    read -p "请选择操作 [0-5]: " choice
 
     case $choice in
         1) manage_telegram_notifications ;;
@@ -2700,9 +2703,32 @@ manage_notifications() {
             ;;
         3) manage_wecom_notifications ;;
         4) manage_telegram_api_route ;;
+        5) force_sync_notification_modules ;;
         0) show_main_menu ;;
         *) echo -e "${RED}无效选择${NC}"; sleep 1; manage_notifications ;;
     esac
+}
+
+force_sync_notification_modules() {
+    echo -e "${BLUE}=== 强制同步通知模块 ===${NC}"
+    echo -e "${YELLOW}此操作会覆盖当前通知模块(telegram.sh/wecom.sh)${NC}"
+    read -p "确认继续? [y/N]: " confirm
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消"
+        sleep 1
+        manage_notifications
+        return
+    fi
+
+    echo -e "${YELLOW}正在强制同步通知模块...${NC}"
+    if download_notification_modules "force" >/dev/null 2>&1; then
+        echo -e "${GREEN}通知模块强制同步完成${NC}"
+    else
+        echo -e "${RED}通知模块同步失败，请检查网络后重试${NC}"
+    fi
+    sleep 2
+    manage_notifications
 }
 
 load_telegram_module() {
@@ -3070,6 +3096,118 @@ send_status_notification() {
     fi
 }
 
+self_check() {
+    local total=0
+    local failed=0
+    local warned=0
+
+    check_ok() {
+        total=$((total + 1))
+        echo -e "${GREEN}[OK]${NC} $1"
+    }
+
+    check_warn() {
+        total=$((total + 1))
+        warned=$((warned + 1))
+        echo -e "${YELLOW}[WARN]${NC} $1"
+    }
+
+    check_fail() {
+        total=$((total + 1))
+        failed=$((failed + 1))
+        echo -e "${RED}[FAIL]${NC} $1"
+    }
+
+    echo -e "${BLUE}=== 端口流量狗 自检 ===${NC}"
+    echo
+
+    if [ -f "$CONFIG_FILE" ]; then
+        if jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            check_ok "配置文件存在且JSON有效: $CONFIG_FILE"
+        else
+            check_fail "配置文件JSON无效: $CONFIG_FILE"
+        fi
+    else
+        check_fail "配置文件不存在: $CONFIG_FILE"
+    fi
+
+    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        check_ok "主脚本安装路径存在: $INSTALLED_SCRIPT_PATH"
+    else
+        check_warn "主脚本安装路径不存在，当前使用: $SCRIPT_PATH"
+    fi
+
+    local dep_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl")
+    local missing_dep=()
+    local dep
+    for dep in "${dep_tools[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_dep+=("$dep")
+        fi
+    done
+    if [ ${#missing_dep[@]} -eq 0 ]; then
+        check_ok "依赖命令完整"
+    else
+        check_fail "缺少依赖命令: ${missing_dep[*]}"
+    fi
+
+    local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
+    local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
+    if [ -f "$telegram_script" ] && [ -f "$wecom_script" ]; then
+        check_ok "通知模块文件存在"
+    else
+        check_fail "通知模块缺失(telegram.sh 或 wecom.sh)"
+    fi
+
+    if load_telegram_module; then
+        if declare -F send_telegram_message >/dev/null 2>&1 && declare -F telegram_send_status_notification >/dev/null 2>&1; then
+            check_ok "Telegram模块函数完整"
+        else
+            check_fail "Telegram模块函数不完整"
+        fi
+    else
+        check_fail "Telegram模块加载失败"
+    fi
+
+    local telegram_enabled
+    telegram_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo "false")
+    local bot_token
+    bot_token=$(jq -r '.notifications.telegram.bot_token // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
+    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ]; then
+        local api_base
+        api_base=$(get_telegram_api_base 2>/dev/null || echo "https://api.telegram.org")
+        local getme_url
+        if [[ "$api_base" =~ /bot$ ]]; then
+            getme_url="${api_base}${bot_token}/getMe"
+        else
+            getme_url="${api_base}/bot${bot_token}/getMe"
+        fi
+        local getme_resp
+        getme_resp=$(curl -sS --connect-timeout 5 --max-time 12 "$getme_url" 2>/dev/null || true)
+        if echo "$getme_resp" | grep -q '"ok":true'; then
+            check_ok "Telegram线路与Token可用(getMe通过)"
+        else
+            local err_desc
+            err_desc=$(echo "$getme_resp" | jq -r '.description // empty' 2>/dev/null || true)
+            if [ -z "$err_desc" ]; then
+                err_desc=$(echo "$getme_resp" | tr '\n' ' ' | cut -c1-160)
+            fi
+            check_warn "Telegram连通性异常: ${err_desc:-无响应}"
+        fi
+    else
+        check_warn "Telegram未启用或Token为空，跳过连通性检测"
+    fi
+
+    echo
+    echo "自检汇总: 总计 ${total} 项 | 失败 ${failed} 项 | 警告 ${warned} 项"
+    if [ "$failed" -eq 0 ]; then
+        echo -e "${GREEN}自检完成：可用${NC}"
+        return 0
+    fi
+    echo -e "${RED}自检完成：存在失败项，请先修复${NC}"
+    return 1
+}
+
 main() {
     check_root
 
@@ -3128,6 +3266,20 @@ main() {
                 uninstall_script
                 exit 0
                 ;;
+            --self-check)
+                self_check
+                exit $?
+                ;;
+            --sync-notification-modules)
+                echo -e "${YELLOW}正在强制同步通知模块...${NC}"
+                if download_notification_modules "force"; then
+                    echo -e "${GREEN}通知模块强制同步完成${NC}"
+                    exit 0
+                else
+                    echo -e "${RED}通知模块同步失败，请检查网络后重试${NC}"
+                    exit 1
+                fi
+                ;;
             *)
                 echo -e "${YELLOW}用法: $0 [选项]${NC}"
                 echo "选项:"
@@ -3138,6 +3290,8 @@ main() {
                 echo "  --send-status             发送所有启用的状态通知"
                 echo "  --send-telegram-status    发送Telegram状态通知"
                 echo "  --send-wecom-status       发送企业wx 状态通知"
+                echo "  --self-check              执行一键自检"
+                echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --reset-port PORT         重置指定端口流量"
                 echo
                 echo -e "${GREEN}快捷命令: $SHORTCUT_COMMAND${NC}"
