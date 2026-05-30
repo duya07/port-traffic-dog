@@ -2958,7 +2958,6 @@ format_status_message() {
     local daily_total=$(get_daily_total_traffic)
 
     local message="🔗 服务器: ${server_name} | ⏰ ${timestamp}
-
 ────────────────────────────────────────
 状态: 监控中 | 守护端口: ${port_count}个 | 端口总流量: ${daily_total}
 ────────────────────────────────────────
@@ -2976,7 +2975,6 @@ format_text_status_message() {
     local daily_total=$(get_daily_total_traffic)
 
     local message="🔗 服务器: ${server_name} | ⏰ ${timestamp}
-
 ────────────────────────────────────────
 状态: 监控中 | 守护端口: ${port_count}个 | 端口总流量: ${daily_total}
 ────────────────────────────────────────
@@ -2994,7 +2992,6 @@ format_markdown_status_message() {
     local daily_total=$(get_daily_total_traffic)
 
     local message="🔗 **服务器**: ${server_name} | ⏰ ${timestamp}
-
 ────────────────────────────────────────
 **状态**: 监控中 | **守护端口**: ${port_count}个 | **端口总流量**: ${daily_total}
 ────────────────────────────────────────
