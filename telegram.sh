@@ -104,6 +104,29 @@ telegram_do_post() {
     printf '%s' "$curl_output"
 }
 
+escape_telegram_html_text() {
+    local text="$1"
+    text="${text//&/&amp;}"
+    text="${text//</&lt;}"
+    text="${text//>/&gt;}"
+    echo "$text"
+}
+
+truncate_telegram_message() {
+    local text="$1"
+    local max_len=3900
+    local text_len
+    text_len=$(printf '%s' "$text" | wc -m | awk '{print $1}')
+    if [ "$text_len" -le "$max_len" ]; then
+        echo "$text"
+        return
+    fi
+    local truncated="${text:0:$max_len}"
+    echo "${truncated}
+
+[消息过长，已截断]"
+}
+
 send_telegram_message() {
     local message="$1"
 
@@ -122,12 +145,17 @@ send_telegram_message() {
     send_url_preview=$(build_telegram_send_url_preview "$api_base" "$bot_token")
     log_notification "Telegram发送线路: ${route} | endpoint: ${send_url_preview}"
 
+    local safe_message
+    safe_message=$(truncate_telegram_message "$message")
+    local html_message
+    html_message=$(escape_telegram_html_text "$safe_message")
+
     local retry_count=0
 
     # 重试机制
     while [ $retry_count -le $TELEGRAM_MAX_RETRIES ]; do
         local post_result
-        post_result=$(telegram_do_post "$send_url" "$chat_id" "$message" "HTML")
+        post_result=$(telegram_do_post "$send_url" "$chat_id" "$html_message" "HTML")
         local curl_exit
         curl_exit=$(echo "$post_result" | head -n1)
         local curl_output
@@ -154,7 +182,7 @@ send_telegram_message() {
             if echo "$api_error" | grep -Eqi "parse entities|can't parse|parse_mode|Unsupported parse mode"; then
                 log_notification "Telegram检测到HTML格式不兼容，尝试降级纯文本发送 | endpoint: ${send_url_preview} | error: ${api_error}"
                 local fallback_result
-                fallback_result=$(telegram_do_post "$send_url" "$chat_id" "$message")
+                fallback_result=$(telegram_do_post "$send_url" "$chat_id" "$safe_message")
                 local fallback_exit
                 fallback_exit=$(echo "$fallback_result" | head -n1)
                 local fallback_output
