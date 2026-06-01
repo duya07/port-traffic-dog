@@ -83,7 +83,7 @@ echo "已更新: ${NOTIFICATIONS_DIR}/telegram.sh"
 echo "已更新: ${NOTIFICATIONS_DIR}/wecom.sh"
 
 echo
-echo "[4/4] 重建 dog 快捷命令..."
+echo "[4/5] 重建 dog 快捷命令..."
 cat > "${DOG_PATH}" <<'EOF'
 #!/bin/bash
 exec bash /usr/local/bin/port-traffic-dog.sh "$@"
@@ -92,8 +92,18 @@ chmod +x "${DOG_PATH}"
 echo "已更新: ${DOG_PATH}"
 
 echo
+echo "[5/5] 强制同步通知模块并刷新通知定时任务..."
+bash "${INSTALLED_SCRIPT_PATH}" --sync-notification-modules >/dev/null 2>&1 || true
+bash "${INSTALLED_SCRIPT_PATH}" --refresh-notification-cron >/dev/null 2>&1 || true
+echo "已执行: --sync-notification-modules"
+echo "已执行: --refresh-notification-cron"
+
+echo
 echo "迁移完成。"
 echo "备份目录: ${BACKUP_DIR}"
+echo
+echo "当前版本："
+bash "${INSTALLED_SCRIPT_PATH}" --version || true
 echo
 echo "建议执行自检："
 echo "  dog --self-check"

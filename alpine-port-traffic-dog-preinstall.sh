@@ -47,7 +47,7 @@ fi
 
 echo "[4/4] Verifying required commands..."
 missing=""
-for tool in nft tc ss jq awk bc unzip cron curl bash; do
+for tool in nft tc ss jq awk bc unzip cron crontab curl bash; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing="$missing $tool"
     fi

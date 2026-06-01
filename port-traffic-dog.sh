@@ -2646,7 +2646,7 @@ install_update_script() {
             create_shortcut_command
 
             echo -e "${YELLOW}正在更新通知模块...${NC}"
-            download_notification_modules >/dev/null 2>&1 || true
+            download_notification_modules "force" >/dev/null 2>&1 || true
 
             echo -e "${GREEN}依赖检查完成${NC}"
             echo -e "${GREEN}脚本更新完成${NC}"
@@ -2712,6 +2712,7 @@ uninstall_script() {
 
         remove_telegram_notification_cron 2>/dev/null || true
         remove_wecom_notification_cron 2>/dev/null || true
+        remove_all_port_auto_reset_cron 2>/dev/null || true
 
         rm -rf "$CONFIG_DIR" 2>/dev/null || true
         rm -f "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
@@ -2995,6 +2996,45 @@ remove_wecom_notification_cron() {
     crontab -l 2>/dev/null | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
     crontab "$temp_cron"
     rm -f "$temp_cron"
+}
+
+remove_all_port_auto_reset_cron() {
+    local temp_cron=$(mktemp)
+    crontab -l 2>/dev/null | \
+        grep -v "端口流量狗自动重置端口" | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' \
+        > "$temp_cron" || true
+    crontab "$temp_cron"
+    rm -f "$temp_cron"
+}
+
+ensure_cron_service_running() {
+    # Debian/Ubuntu
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable cron >/dev/null 2>&1 || true
+        systemctl start cron >/dev/null 2>&1 || true
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        service cron start >/dev/null 2>&1 || true
+    fi
+
+    # Alpine/OpenRC
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update add crond default >/dev/null 2>&1 || true
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service crond start >/dev/null 2>&1 || true
+    fi
+    if command -v crond >/dev/null 2>&1 && ! pgrep -x crond >/dev/null 2>&1; then
+        crond -b >/dev/null 2>&1 || true
+    fi
+}
+
+refresh_notification_cron_from_config() {
+    setup_telegram_notification_cron
+    setup_wecom_notification_cron
+    ensure_cron_service_running
 }
 
 export_notification_functions() {
@@ -3291,6 +3331,7 @@ main() {
     check_dependencies
     init_config
     create_shortcut_command
+    refresh_notification_cron_from_config
 
     if [ $# -gt 0 ]; then
         case $1 in
@@ -3324,6 +3365,11 @@ main() {
                     exit 1
                 fi
                 ;;
+            --refresh-notification-cron)
+                refresh_notification_cron_from_config
+                echo -e "${GREEN}通知定时任务已刷新${NC}"
+                exit 0
+                ;;
             *)
                 echo -e "${YELLOW}用法: $0 [选项]${NC}"
                 echo "选项:"
@@ -3336,6 +3382,7 @@ main() {
                 echo "  --send-wecom-status       发送企业wx 状态通知"
                 echo "  --self-check              执行一键自检"
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
+                echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
                 echo "  --reset-port PORT         重置指定端口流量"
                 echo
                 echo -e "${GREEN}快捷命令: $SHORTCUT_COMMAND${NC}"
