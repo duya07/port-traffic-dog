@@ -1,56 +1,45 @@
 # port-traffic-dog
 
-基于公开项目脚本进行适配和修改的 `port-traffic-dog` 自定义版本。
+基于上游项目定制的端口流量监控脚本集合。
 
-> 脚本仅用于个人使用场景，请在执行前自行审阅内容，并根据实际环境调整配置。
+## 参考来源
 
-## 脚本说明
+- 上游仓库: <https://github.com/zywe03/realm-xwPF>
+- 上游主脚本: <https://github.com/zywe03/realm-xwPF/blob/main/port-traffic-dog.sh>
+- 上游通知模块: <https://github.com/zywe03/realm-xwPF/tree/main/notifications>
 
-### 端口流量狗
+## 本仓库主要改动
 
-#### 2.1 port-traffic-dog.sh
+1. Telegram 通知排版优化（更适合消息推送阅读）。
+2. Telegram 支持官方线路与自定义线路切换。
+3. 默认内置自定义线路地址示例: `https://tgapi.duyaw.com/`。
+4. 通知模块同步支持“默认只补缺失”和“强制同步覆盖”两种模式；手动更新、迁移和 `--sync-notification-modules` 会使用强制同步。
+5. 增加自检命令: `dog --self-check`。
+6. 增加迁移脚本: `migrate-to-custom.sh`。
+7. Alpine 预装脚本同步维护: `alpine-port-traffic-dog-preinstall.sh`。
+8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
+9. 卸载时会清理通知 cron 和端口自动重置 cron。
 
-参考/引用：
+## 下载方式说明
 
-- 上游项目说明：[realm-xwPF/port-traffic-dog-README.md](https://github.com/zywe03/realm-xwPF/blob/main/port-traffic-dog-README.md)
-- 上游主脚本：[realm-xwPF/port-traffic-dog.sh](https://github.com/zywe03/realm-xwPF/blob/main/port-traffic-dog.sh)
-- 上游通知模块目录：[realm-xwPF/notifications](https://github.com/zywe03/realm-xwPF/tree/main/notifications)
+- 直连（海外网络优先）  
+  使用 `https://raw.githubusercontent.com/...`
+- 国内优先（代理加速）  
+  使用 `https://v6.gh-proxy.org/https://raw.githubusercontent.com/...`
 
-修改说明：
+---
 
-1) 通知模块同步策略（重点）：
+## 1) 安装主脚本
 
-- 优先读取 `port-traffic-dog.sh` 同目录下的 `telegram.sh` / `wecom.sh`。
-- 同步到运行目录 `/etc/port-traffic-dog/notifications/` 时，改为“仅补齐缺失”：
-  - 本地已有文件不覆盖；
-  - 远程下载模块也只补缺失、不覆盖。
+直连:
 
-2) Telegram 状态通知排版优化：
+```bash
+wget -O port-traffic-dog.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh
+chmod +x port-traffic-dog.sh
+./port-traffic-dog.sh
+```
 
-- 移除原先头部介绍文案，改为更简洁的状态卡片。
-- 顶部显示：`🔗 服务器 | ⏰ 时间`
-- 端口区支持编号、多行明细、配额百分比与周期显示。
-- 新增文本进度条（按百分比渲染），用于快速查看配额使用情况。
-
-3) Telegram 通信线路切换（官方/自定义）：
-
-- 新增菜单入口：`通知管理 -> Telegram通信线路切换`。
-- 支持切换：
-  - 官方线路（`https://api.telegram.org`）
-  - 自定义线路（可输入 API 基础地址）
-- 配置项新增：
-  - `.notifications.telegram.api_route`
-  - `.notifications.telegram.custom_api_base`
-
-4) 其他行为说明：
-
-- `port-traffic-dog.sh` 不会在每次运行时自动更新自身。
-- 只有手动执行“安装依赖(更新)脚本”时，才会拉取并替换主脚本。
-- 针对通知模块更新已改为“只补缺失不覆盖”。
-
-> 当前修改尚未完全测试，请在生产环境使用前先进行验证。
-
-安装并运行：
+国内优先（gh-proxy）:
 
 ```bash
 wget -O port-traffic-dog.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh
@@ -58,63 +47,166 @@ chmod +x port-traffic-dog.sh
 ./port-traffic-dog.sh
 ```
 
-Alpine 安装并运行：
+## 2) Alpine 安装
+
+直连:
+
+```bash
+wget -O alpine-port-traffic-dog-preinstall.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/alpine-port-traffic-dog-preinstall.sh && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
+```
+
+国内优先（gh-proxy）:
 
 ```bash
 wget -O alpine-port-traffic-dog-preinstall.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/alpine-port-traffic-dog-preinstall.sh && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
 ```
 
-Alpine 一键试用（可替换仓库）：
+Alpine 一键试用（可替换仓库）:
+
+直连:
 
 ```bash
 REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "https://raw.githubusercontent.com/${REPO}/main/alpine-port-traffic-dog-preinstall.sh" && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh "https://raw.githubusercontent.com/${REPO}/main/port-traffic-dog.sh" && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
 ```
 
-Alpine 预装脚本已同步更新，包含：
+国内优先（gh-proxy）:
 
-- 依赖补齐：`curl/tzdata` 等；
-- `cron` 命令兼容处理（`cron` -> `crond`）；
-- `crond` 启动与开机启动注册；
-- 安装后命令级自检（`nft/tc/ss/jq/awk/bc/unzip/cron/curl/bash`）。
+```bash
+REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/alpine-port-traffic-dog-preinstall.sh" && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/port-traffic-dog.sh" && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
+```
 
-旧 VPS 保留配置迁移到自定义版（先备份后覆盖）：
+Alpine 预装脚本会补齐 `bash/nftables/iproute2/jq/gawk/bc/unzip/dcron/ca-certificates/curl/tzdata` 等依赖，创建 `cron -> crond` 兼容命令，启动并注册 `crond`，并检查 `nft/tc/ss/jq/awk/bc/unzip/cron/crontab/curl/bash` 是否可用。
+
+## 3) 旧 VPS 迁移到定制版
+
+迁移脚本会先备份，再覆盖安装。
+
+直连:
 
 ```bash
 wget -O migrate-to-custom.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/migrate-to-custom.sh && chmod +x migrate-to-custom.sh && sudo ./migrate-to-custom.sh
 ```
 
-可选：指定仓库/分支（默认 `duya07/port-traffic-dog` + `main`）：
+国内优先（gh-proxy）:
+
+```bash
+wget -O migrate-to-custom.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/migrate-to-custom.sh && chmod +x migrate-to-custom.sh && sudo ./migrate-to-custom.sh
+```
+
+可选：指定仓库和分支（默认 `duya07/port-traffic-dog` + `main`）:
 
 ```bash
 sudo REPO="duya07/port-traffic-dog" BRANCH="main" ./migrate-to-custom.sh
 ```
 
-迁移脚本会自动备份：
+默认备份目录示例:
 
-- `/etc/port-traffic-dog`
-- `/usr/local/bin/port-traffic-dog.sh`
-- `/usr/local/bin/dog`
+- `/etc/port-traffic-dog-migration-backup/20260530-230000/`
 
-备份位置示例：`/etc/port-traffic-dog-migration-backup/20260530-230000/`
+迁移完成后会自动强制同步通知模块、刷新 Telegram / 企业微信状态通知定时任务，并显示当前脚本版本。迁移后建议再执行一次:
 
-#### 2.2 telegram.sh
+```bash
+sudo dog --self-check
+```
 
-修改说明：
+## 4) 常用维护命令
 
-- 支持按配置切换 Telegram 通信线路（官方 / 自定义）。
-- 自定义线路支持输入 API 基础地址，并自动拼接 `sendMessage` 地址。
-- 兼容自定义地址以 `/bot` 结尾的场景。
-- 保持默认 `parse_mode=HTML`，并适配新的状态消息格式。
+```bash
+sudo dog --self-check
+sudo dog --sync-notification-modules
+sudo dog --refresh-notification-cron
+sudo dog --uninstall
+```
 
-安装并运行：
+- `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
+- `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
+- `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
+- `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron 和端口自动重置 cron。
+
+## 5) 单独下载通知脚本
+
+### telegram.sh
+
+直连:
+
+```bash
+wget -O telegram.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/telegram.sh
+```
+
+国内优先（gh-proxy）:
 
 ```bash
 wget -O telegram.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/telegram.sh
-chmod +x telegram.sh
-./telegram.sh
 ```
 
-## 目录文件
+### wecom.sh
+
+直连:
+
+```bash
+wget -O wecom.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/wecom.sh
+```
+
+国内优先（gh-proxy）:
+
+```bash
+wget -O wecom.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/wecom.sh
+```
+
+## 6) 限速规则核查与清理（nft/tc）
+
+用于检查旧 VPS 上是否还有残留规则，并做兜底清理。
+
+### 6.1 先查（不改系统）
+
+```bash
+sudo nft list tables | grep -E 'port_traffic_monitor|table inet port_traffic_monitor' || echo "nft table not found"
+sudo nft list table inet port_traffic_monitor 2>/dev/null || true
+
+IFACE="$(ip route | awk '/default/ {print $5; exit}')"
+echo "default iface: ${IFACE}"
+sudo tc qdisc show dev "${IFACE}"
+sudo tc class show dev "${IFACE}"
+sudo tc filter show dev "${IFACE}"
+
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' || echo "no related cron"
+```
+
+### 6.2 再清（卸载后兜底）
+
+建议先执行:
+
+```bash
+sudo dog --uninstall
+```
+
+如果仍有残留，再执行:
+
+```bash
+sudo nft delete table inet port_traffic_monitor 2>/dev/null || true
+
+IFACE="$(ip route | awk '/default/ {print $5; exit}')"
+if sudo tc qdisc show dev "${IFACE}" | grep -q 'htb 1:'; then
+  sudo tc qdisc del dev "${IFACE}" root
+fi
+
+sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' | sudo crontab -
+```
+
+### 6.3 复查（确认清理完成）
+
+```bash
+sudo nft list table inet port_traffic_monitor 2>/dev/null && echo "still exists" || echo "nft table removed"
+
+IFACE="$(ip route | awk '/default/ {print $5; exit}')"
+sudo tc qdisc show dev "${IFACE}"
+sudo tc class show dev "${IFACE}"
+sudo tc filter show dev "${IFACE}"
+
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' || echo "cron clean"
+```
+
+## 目录结构
 
 ```text
 .
@@ -128,6 +220,7 @@ chmod +x telegram.sh
 
 ## 注意事项
 
-- 脚本可能会修改系统配置或安装依赖，建议先在测试环境运行。
-- 如需使用通知功能，请提前准备好 Telegram 或企业微信相关配置。
-- 若脚本下载失败，可检查代理地址或手动替换为可访问的 raw GitHub 地址。
+- 脚本可能会修改系统配置或安装依赖，建议先在测试环境执行。
+- 使用通知功能前，请先完成 Telegram / 企业微信配置。
+- 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
+- `tc qdisc del dev <iface> root` 会清理该网卡根队列，若同机有其他 QoS 业务请先确认。
