@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.3.1"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -835,8 +835,12 @@ apply_reset_policy_to_port() {
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
     if [ "$policy_type" != "none" ]; then
+        local from_date="$current_date"
+        if [ "$policy_type" != "fixed_date" ]; then
+            from_date=$(add_days_to_date "$current_date" 1)
+        fi
         local next_reset_date
-        next_reset_date=$(calculate_port_next_reset_date "$port" "$current_date")
+        next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
         if [ -n "$next_reset_date" ]; then
             jq --arg port "$port" --arg next "$next_reset_date" '
                 .ports[$port].quota.reset_policy.next_reset_date = $next
@@ -1218,11 +1222,18 @@ get_quota_enabled() {
     jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE" 2>/dev/null
 }
 
+is_known_reset_policy_type() {
+    case "$1" in
+        monthly|interval_days|interval_months|yearly|fixed_date|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get_reset_policy_type() {
     local port="$1"
     local policy_type
     policy_type=$(jq -r ".ports.\"$port\".quota.reset_policy.type // empty" "$CONFIG_FILE" 2>/dev/null)
-    if [ -n "$policy_type" ] && [ "$policy_type" != "null" ]; then
+    if [ -n "$policy_type" ] && [ "$policy_type" != "null" ] && is_known_reset_policy_type "$policy_type"; then
         echo "$policy_type"
         return
     fi
@@ -1349,7 +1360,12 @@ ensure_port_next_reset_date() {
     local next_reset_date
     next_reset_date=$(jq -r ".ports.\"$port\".quota.reset_policy.next_reset_date // empty" "$CONFIG_FILE" 2>/dev/null)
     if ! is_valid_date "$next_reset_date"; then
-        next_reset_date=$(calculate_port_next_reset_date "$port" "$(get_current_date)")
+        local from_date
+        from_date=$(get_current_date)
+        if [ "$policy_type" != "fixed_date" ]; then
+            from_date=$(add_days_to_date "$from_date" 1)
+        fi
+        next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
         [ -n "$next_reset_date" ] || return 1
         jq --arg port "$port" --arg next "$next_reset_date" '
             .ports[$port].quota.reset_policy.next_reset_date = $next
@@ -1434,7 +1450,7 @@ get_port_cycle_range() {
             else
                 local end_date
                 end_date=$(add_days_to_date "$next_date" -1 2>/dev/null || true)
-                if [ -n "$end_date" ]; then
+                if [ -n "$end_date" ] && ! date_lt "$end_date" "$start_date"; then
                     echo "${start_date}-${end_date}"
                 else
                     echo "${start_date}-${next_date}"
@@ -2715,13 +2731,39 @@ set_reset_day() {
     echo
     local port_list=$(IFS=','; echo "${ports_to_set[*]}")
     echo "为端口 $port_list 设置自动重置策略:"
-    prompt_reset_policy 1
-    local reset_policy_config="$RESET_POLICY_CONFIG"
-    local policy_type
-    policy_type=$(printf '%s' "$reset_policy_config" | jq -r '.type')
+    local reset_policy_config=""
+    local RESET_POLICY_CONFIGS=()
+    local separate_policy="false"
+
+    if [ ${#ports_to_set[@]} -gt 1 ]; then
+        read -p "是否为每个端口分别设置策略? [y/N]: " separate_choice
+        if [[ "$separate_choice" =~ ^[Yy]$ ]]; then
+            separate_policy="true"
+        fi
+    fi
+
+    if [ "$separate_policy" = "true" ]; then
+        for port in "${ports_to_set[@]}"; do
+            echo
+            echo "设置端口 $port 的自动重置策略:"
+            prompt_reset_policy 1
+            RESET_POLICY_CONFIGS+=("$RESET_POLICY_CONFIG")
+        done
+    else
+        prompt_reset_policy 1
+        reset_policy_config="$RESET_POLICY_CONFIG"
+    fi
 
     local success_count=0
-    for port in "${ports_to_set[@]}"; do
+    for i in "${!ports_to_set[@]}"; do
+        local port="${ports_to_set[$i]}"
+        local current_policy_config="$reset_policy_config"
+        if [ "$separate_policy" = "true" ]; then
+            current_policy_config="${RESET_POLICY_CONFIGS[$i]}"
+        fi
+        local policy_type
+        policy_type=$(printf '%s' "$current_policy_config" | jq -r '.type')
+
         if [ "$policy_type" = "none" ]; then
             jq --arg port "$port" '
                 del(.ports[$port].quota.reset_day) |
@@ -2736,7 +2778,7 @@ set_reset_day() {
                 echo -e "${YELLOW}端口 $port 未设置流量配额，请先通过「端口限制设置管理→设置端口流量配额」设置配额后再设置自动重置策略${NC}"
                 continue
             fi
-            apply_reset_policy_to_port "$port" "$reset_policy_config"
+            apply_reset_policy_to_port "$port" "$current_policy_config"
             setup_port_auto_reset_cron "$port"
             local next_reset_label
             next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
