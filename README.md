@@ -19,6 +19,7 @@
 7. Alpine 预装脚本同步维护: `alpine-port-traffic-dog-preinstall.sh`。
 8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
+10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
 
 ## 下载方式说明
 
@@ -123,7 +124,26 @@ sudo dog --uninstall
 - `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron 和端口自动重置 cron。
 
-## 5) 单独下载通知脚本
+## 5) 流量配额自动重置
+
+添加端口监控时，如果设置了流量配额，脚本会立即提示设置自动重置策略，不需要再到管理菜单里单独改默认日期。
+
+支持的策略:
+
+- 每月几号重置：兼容原脚本逻辑，默认每月 1 日。
+- 每隔多少天重置：例如每 30 天重置一次。
+- 每隔多少个月重置：例如每 3 个月重置一次，可指定每次按几号结算。
+- 每年几月几号重置：适合年度流量包。
+- 指定到期日期重置一次：到期重置后会自动关闭该端口的自动重置。
+
+日期处理规则:
+
+- 31 号遇到没有 31 号的月份，会按该月最后一天处理。
+- 2 月 29 日遇到非闰年，会按 2 月 28 日处理。
+- 自动任务每天 00:05 检查是否到期，只有到期端口才会真正重置。
+- 手动“立即重置”只清零当前流量，不会自动改变下一次到期日期。
+
+## 6) 单独下载通知脚本
 
 ### telegram.sh
 
@@ -153,11 +173,11 @@ wget -O wecom.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/
 wget -O wecom.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/wecom.sh
 ```
 
-## 6) 限速规则核查与清理（nft/tc）
+## 7) 限速规则核查与清理（nft/tc）
 
 用于检查旧 VPS 上是否还有残留规则，并做兜底清理。
 
-### 6.1 先查（不改系统）
+### 7.1 先查（不改系统）
 
 ```bash
 sudo nft list tables | grep -E 'port_traffic_monitor|table inet port_traffic_monitor' || echo "nft table not found"
@@ -169,10 +189,10 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' || echo "no related cron"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' || echo "no related cron"
 ```
 
-### 6.2 再清（卸载后兜底）
+### 7.2 再清（卸载后兜底）
 
 建议先执行:
 
@@ -190,10 +210,10 @@ if sudo tc qdisc show dev "${IFACE}" | grep -q 'htb 1:'; then
   sudo tc qdisc del dev "${IFACE}" root
 fi
 
-sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' | sudo crontab -
+sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' | sudo crontab -
 ```
 
-### 6.3 复查（确认清理完成）
+### 7.3 复查（确认清理完成）
 
 ```bash
 sudo nft list table inet port_traffic_monitor 2>/dev/null && echo "still exists" || echo "nft table removed"
@@ -203,7 +223,7 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port' || echo "cron clean"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' || echo "cron clean"
 ```
 
 ## 目录结构

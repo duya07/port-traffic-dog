@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.2.5"
+readonly SCRIPT_VERSION="1.3.0"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -589,14 +589,6 @@ get_port_status_label() {
     local rate_limit=$(echo "$port_config" | jq -r '.bandwidth_limit.rate // "unlimited"')
     local quota_enabled=$(echo "$port_config" | jq -r '.quota.enabled // true')
     local monthly_limit=$(echo "$port_config" | jq -r '.quota.monthly_limit // "unlimited"')
-    local reset_day_raw=$(echo "$port_config" | jq -r '.quota.reset_day')
-    local reset_day="null"
-    
-    # 有流量限额时，获取重置日期（null表示用户取消了自动重置）
-    if [ "$monthly_limit" != "unlimited" ] && [ "$reset_day_raw" != "null" ]; then
-        reset_day="${reset_day_raw:-1}"  # 未配置时默认为1
-    fi
-
     local status_tags=()
 
     if [ -n "$remark" ] && [ "$remark" != "null" ] && [ "$remark" != "" ]; then
@@ -616,21 +608,10 @@ get_port_status_label() {
                 status_tags+=("[单向${quota_display}]")
             fi
             
-            # 只有配置了reset_day时才显示重置日期信息
-            if [ "$reset_day" != "null" ]; then
-                local time_info=($(get_beijing_month_year))
-                local current_day=${time_info[0]}
-                local current_month=${time_info[1]}
-                local next_month=$current_month
-
-                if [ $current_day -ge $reset_day ]; then
-                    next_month=$((current_month + 1))
-                    if [ $next_month -gt 12 ]; then
-                        next_month=1
-                    fi
-                fi
-                
-                status_tags+=("[${next_month}月${reset_day}日重置]")
+            local next_reset_label
+            next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
+            if [ -n "$next_reset_label" ]; then
+                status_tags+=("[$next_reset_label]")
             fi
 
             if [ $usage_percent -ge 100 ]; then
@@ -688,6 +669,179 @@ validate_quota() {
         return 0
     else
         return 1
+    fi
+}
+
+validate_day_1_31() {
+    local day="$1"
+    [[ "$day" =~ ^[0-9]+$ ]] && [ "$day" -ge 1 ] && [ "$day" -le 31 ]
+}
+
+validate_month_1_12() {
+    local month="$1"
+    [[ "$month" =~ ^[0-9]+$ ]] && [ "$month" -ge 1 ] && [ "$month" -le 12 ]
+}
+
+build_reset_policy_json() {
+    local type="$1"
+    shift || true
+    case "$type" in
+        none)
+            echo '{"type":"none"}'
+            ;;
+        monthly)
+            local day="$1"
+            printf '{"type":"monthly","day":%s}\n' "$day"
+            ;;
+        interval_days)
+            local every="$1"
+            local anchor_date="$2"
+            printf '{"type":"interval_days","every":%s,"anchor_date":"%s"}\n' "$every" "$anchor_date"
+            ;;
+        interval_months)
+            local every="$1"
+            local anchor_date="$2"
+            local day="$3"
+            printf '{"type":"interval_months","every":%s,"anchor_date":"%s","day":%s}\n' "$every" "$anchor_date" "$day"
+            ;;
+        yearly)
+            local month="$1"
+            local day="$2"
+            printf '{"type":"yearly","month":%s,"day":%s}\n' "$month" "$day"
+            ;;
+        fixed_date)
+            local date_value="$1"
+            printf '{"type":"fixed_date","date":"%s"}\n' "$date_value"
+            ;;
+    esac
+}
+
+prompt_reset_policy() {
+    local default_day="${1:-1}"
+    RESET_POLICY_CONFIG=""
+
+    while true; do
+        echo
+        echo -e "${BLUE}=== 自动重置策略 ===${NC}"
+        echo "1. 每月几号重置（默认每月${default_day}日）"
+        echo "2. 每隔多少天重置"
+        echo "3. 每隔多少个月重置"
+        echo "4. 每年几月几号重置"
+        echo "5. 指定到期日期重置一次"
+        echo "0. 不自动重置"
+        echo
+        read -p "请选择(回车默认1) [0-5]: " policy_choice
+
+        case "$policy_choice" in
+            1|"")
+                read -p "每月几号重置(回车默认${default_day}) [1-31]: " reset_day
+                reset_day="${reset_day:-$default_day}"
+                if validate_day_1_31 "$reset_day"; then
+                    RESET_POLICY_CONFIG=$(build_reset_policy_json "monthly" "$reset_day")
+                    return 0
+                fi
+                echo -e "${RED}日期无效，必须是1-31之间的数字${NC}"
+                ;;
+            2)
+                read -p "每隔多少天重置 [1-3650]: " every_days
+                if ! [[ "$every_days" =~ ^[0-9]+$ ]] || [ "$every_days" -lt 1 ] || [ "$every_days" -gt 3650 ]; then
+                    echo -e "${RED}天数无效，必须是1-3650之间的数字${NC}"
+                    continue
+                fi
+                local default_anchor
+                default_anchor=$(get_current_date)
+                read -p "起算日期(回车默认今天${default_anchor}) [YYYY-MM-DD]: " anchor_date
+                anchor_date="${anchor_date:-$default_anchor}"
+                if ! is_valid_date "$anchor_date"; then
+                    echo -e "${RED}起算日期无效，请使用YYYY-MM-DD格式${NC}"
+                    continue
+                fi
+                RESET_POLICY_CONFIG=$(build_reset_policy_json "interval_days" "$every_days" "$anchor_date")
+                return 0
+                ;;
+            3)
+                read -p "每隔多少个月重置 [1-120]: " every_months
+                if ! [[ "$every_months" =~ ^[0-9]+$ ]] || [ "$every_months" -lt 1 ] || [ "$every_months" -gt 120 ]; then
+                    echo -e "${RED}月份间隔无效，必须是1-120之间的数字${NC}"
+                    continue
+                fi
+                local default_anchor
+                default_anchor=$(get_current_date)
+                read -p "起算日期(回车默认今天${default_anchor}) [YYYY-MM-DD]: " anchor_date
+                anchor_date="${anchor_date:-$default_anchor}"
+                if ! is_valid_date "$anchor_date"; then
+                    echo -e "${RED}起算日期无效，请使用YYYY-MM-DD格式${NC}"
+                    continue
+                fi
+                local anchor_parts=($(date_parts "$anchor_date"))
+                read -p "每次按几号重置(回车默认${anchor_parts[2]}) [1-31]: " reset_day
+                reset_day="${reset_day:-${anchor_parts[2]}}"
+                if ! validate_day_1_31 "$reset_day"; then
+                    echo -e "${RED}日期无效，必须是1-31之间的数字${NC}"
+                    continue
+                fi
+                RESET_POLICY_CONFIG=$(build_reset_policy_json "interval_months" "$every_months" "$anchor_date" "$reset_day")
+                return 0
+                ;;
+            4)
+                read -p "每年几月重置 [1-12]: " reset_month
+                read -p "每月几号重置 [1-31]: " reset_day
+                if ! validate_month_1_12 "$reset_month" || ! validate_day_1_31 "$reset_day"; then
+                    echo -e "${RED}月份或日期无效${NC}"
+                    continue
+                fi
+                RESET_POLICY_CONFIG=$(build_reset_policy_json "yearly" "$reset_month" "$reset_day")
+                return 0
+                ;;
+            5)
+                read -p "到期日期 [YYYY-MM-DD]: " fixed_date
+                if ! is_valid_date "$fixed_date"; then
+                    echo -e "${RED}到期日期无效，请使用YYYY-MM-DD格式${NC}"
+                    continue
+                fi
+                if date_lt "$fixed_date" "$(get_current_date)"; then
+                    echo -e "${RED}到期日期不能早于今天${NC}"
+                    continue
+                fi
+                RESET_POLICY_CONFIG=$(build_reset_policy_json "fixed_date" "$fixed_date")
+                return 0
+                ;;
+            0)
+                RESET_POLICY_CONFIG=$(build_reset_policy_json "none")
+                return 0
+                ;;
+            *)
+                echo -e "${RED}无效选择，请输入0-5${NC}"
+                ;;
+        esac
+    done
+}
+
+apply_reset_policy_to_port() {
+    local port="$1"
+    local policy_json="$2"
+    local current_date
+    current_date=$(get_current_date)
+    local policy_type
+    policy_type=$(printf '%s' "$policy_json" | jq -r '.type')
+
+    jq --arg port "$port" --argjson policy "$policy_json" '
+        .ports[$port].quota.reset_policy = $policy |
+        if $policy.type == "monthly" then
+            .ports[$port].quota.reset_day = $policy.day
+        else
+            del(.ports[$port].quota.reset_day)
+        end
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+    if [ "$policy_type" != "none" ]; then
+        local next_reset_date
+        next_reset_date=$(calculate_port_next_reset_date "$port" "$current_date")
+        if [ -n "$next_reset_date" ]; then
+            jq --arg port "$port" --arg next "$next_reset_date" '
+                .ports[$port].quota.reset_policy.next_reset_date = $next
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
     fi
 }
 
@@ -851,10 +1005,449 @@ clamp_day_to_month() {
     echo "$day"
 }
 
-get_port_cycle_range() {
+get_current_date() {
+    get_beijing_time +%Y-%m-%d
+}
+
+date_parts() {
+    local date_value="$1"
+    echo "${date_value:0:4} $((10#${date_value:5:2})) $((10#${date_value:8:2}))"
+}
+
+format_date() {
+    local year="$1"
+    local month="$2"
+    local day="$3"
+    printf '%04d-%02d-%02d\n' "$year" "$month" "$day"
+}
+
+is_valid_date() {
+    local date_value="$1"
+    [[ "$date_value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+
+    local parts=($(date_parts "$date_value"))
+    local year="${parts[0]}"
+    local month="${parts[1]}"
+    local day="${parts[2]}"
+
+    [ "$month" -ge 1 ] && [ "$month" -le 12 ] || return 1
+    local month_days
+    month_days=$(get_days_in_month "$year" "$month")
+    [ "$day" -ge 1 ] && [ "$day" -le "$month_days" ]
+}
+
+date_lt() {
+    [[ "$1" < "$2" ]]
+}
+
+date_le() {
+    [[ "$1" < "$2" || "$1" = "$2" ]]
+}
+
+add_days_to_date() {
+    local date_value="$1"
+    local days="$2"
+    local parts=($(date_parts "$date_value"))
+    local year="${parts[0]}"
+    local month="${parts[1]}"
+    local day="${parts[2]}"
+
+    while [ "$days" -gt 0 ]; do
+        local month_days
+        month_days=$(get_days_in_month "$year" "$month")
+        if [ "$day" -lt "$month_days" ]; then
+            day=$((day + 1))
+        else
+            day=1
+            month=$((month + 1))
+            if [ "$month" -gt 12 ]; then
+                month=1
+                year=$((year + 1))
+            fi
+        fi
+        days=$((days - 1))
+    done
+
+    while [ "$days" -lt 0 ]; do
+        if [ "$day" -gt 1 ]; then
+            day=$((day - 1))
+        else
+            month=$((month - 1))
+            if [ "$month" -lt 1 ]; then
+                month=12
+                year=$((year - 1))
+            fi
+            day=$(get_days_in_month "$year" "$month")
+        fi
+        days=$((days + 1))
+    done
+
+    format_date "$year" "$month" "$day"
+}
+
+add_months_to_date() {
+    local date_value="$1"
+    local months="$2"
+    local desired_day="${3:-}"
+    local parts=($(date_parts "$date_value"))
+    local year="${parts[0]}"
+    local month="${parts[1]}"
+    local day="${parts[2]}"
+
+    if [ -n "$desired_day" ]; then
+        day="$desired_day"
+    fi
+
+    local normalized=($(normalize_year_month "$year" "$((month + months))"))
+    year="${normalized[0]}"
+    month="${normalized[1]}"
+    day=$(clamp_day_to_month "$year" "$month" "$day")
+
+    format_date "$year" "$month" "$day"
+}
+
+add_years_to_date() {
+    local date_value="$1"
+    local years="$2"
+    local desired_month="${3:-}"
+    local desired_day="${4:-}"
+    local parts=($(date_parts "$date_value"))
+    local year="${parts[0]}"
+    local month="${parts[1]}"
+    local day="${parts[2]}"
+
+    year=$((year + years))
+    if [ -n "$desired_month" ]; then
+        month="$desired_month"
+    fi
+    if [ -n "$desired_day" ]; then
+        day="$desired_day"
+    fi
+    day=$(clamp_day_to_month "$year" "$month" "$day")
+
+    format_date "$year" "$month" "$day"
+}
+
+get_port_created_date() {
     local port="$1"
+    local created_at
+    created_at=$(jq -r ".ports.\"$port\".created_at // empty" "$CONFIG_FILE" 2>/dev/null)
+    if [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+        echo "${created_at:0:10}"
+    else
+        get_current_date
+    fi
+}
+
+calculate_monthly_next_date() {
+    local day="$1"
+    local from_date="$2"
+    local parts=($(date_parts "$from_date"))
+    local year="${parts[0]}"
+    local month="${parts[1]}"
+    local candidate_day
+    candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
+    local candidate
+    candidate=$(format_date "$year" "$month" "$candidate_day")
+
+    if date_lt "$candidate" "$from_date"; then
+        local next=($(normalize_year_month "$year" "$((month + 1))"))
+        year="${next[0]}"
+        month="${next[1]}"
+        candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
+        candidate=$(format_date "$year" "$month" "$candidate_day")
+    fi
+
+    echo "$candidate"
+}
+
+calculate_interval_days_next_date() {
+    local anchor_date="$1"
+    local every_days="$2"
+    local from_date="$3"
+    local candidate="$anchor_date"
+
+    while date_lt "$candidate" "$from_date"; do
+        candidate=$(add_days_to_date "$candidate" "$every_days")
+    done
+
+    echo "$candidate"
+}
+
+calculate_interval_months_next_date() {
+    local anchor_date="$1"
+    local every_months="$2"
+    local desired_day="$3"
+    local from_date="$4"
+    local candidate="$anchor_date"
+
+    while date_lt "$candidate" "$from_date"; do
+        candidate=$(add_months_to_date "$candidate" "$every_months" "$desired_day")
+    done
+
+    echo "$candidate"
+}
+
+calculate_yearly_next_date() {
+    local month="$1"
+    local day="$2"
+    local from_date="$3"
+    local parts=($(date_parts "$from_date"))
+    local year="${parts[0]}"
+    local candidate_day
+    candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
+    local candidate
+    candidate=$(format_date "$year" "$month" "$candidate_day")
+
+    if date_lt "$candidate" "$from_date"; then
+        year=$((year + 1))
+        candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
+        candidate=$(format_date "$year" "$month" "$candidate_day")
+    fi
+
+    echo "$candidate"
+}
+
+get_quota_limit() {
+    local port="$1"
+    jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE" 2>/dev/null
+}
+
+get_quota_enabled() {
+    local port="$1"
+    jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE" 2>/dev/null
+}
+
+get_reset_policy_type() {
+    local port="$1"
+    local policy_type
+    policy_type=$(jq -r ".ports.\"$port\".quota.reset_policy.type // empty" "$CONFIG_FILE" 2>/dev/null)
+    if [ -n "$policy_type" ] && [ "$policy_type" != "null" ]; then
+        echo "$policy_type"
+        return
+    fi
+
     local reset_day_raw
     reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_day // null" "$CONFIG_FILE" 2>/dev/null)
+    if [[ "$reset_day_raw" =~ ^[0-9]+$ ]] && [ "$reset_day_raw" -ge 1 ] && [ "$reset_day_raw" -le 31 ]; then
+        echo "monthly"
+    else
+        echo "none"
+    fi
+}
+
+port_has_auto_reset_policy() {
+    local port="$1"
+    local quota_enabled
+    quota_enabled=$(get_quota_enabled "$port")
+    local quota_limit
+    quota_limit=$(get_quota_limit "$port")
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+
+    [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ] && [ "$policy_type" != "none" ]
+}
+
+calculate_port_next_reset_date() {
+    local port="$1"
+    local from_date="${2:-$(get_current_date)}"
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+
+    case "$policy_type" in
+        monthly)
+            local day
+            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // 1" "$CONFIG_FILE" 2>/dev/null)
+            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
+                day=1
+            fi
+            calculate_monthly_next_date "$day" "$from_date"
+            ;;
+        interval_days)
+            local every_days
+            every_days=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 30" "$CONFIG_FILE" 2>/dev/null)
+            local anchor_date
+            anchor_date=$(jq -r ".ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
+            if ! [[ "$every_days" =~ ^[0-9]+$ ]] || [ "$every_days" -lt 1 ]; then
+                every_days=30
+            fi
+            if ! is_valid_date "$anchor_date"; then
+                anchor_date=$(get_port_created_date "$port")
+            fi
+            calculate_interval_days_next_date "$anchor_date" "$every_days" "$from_date"
+            ;;
+        interval_months)
+            local every_months
+            every_months=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 1" "$CONFIG_FILE" 2>/dev/null)
+            local anchor_date
+            anchor_date=$(jq -r ".ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
+            local day
+            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // empty" "$CONFIG_FILE" 2>/dev/null)
+            if ! [[ "$every_months" =~ ^[0-9]+$ ]] || [ "$every_months" -lt 1 ]; then
+                every_months=1
+            fi
+            if ! is_valid_date "$anchor_date"; then
+                anchor_date=$(get_port_created_date "$port")
+            fi
+            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
+                local parts=($(date_parts "$anchor_date"))
+                day="${parts[2]}"
+            fi
+            calculate_interval_months_next_date "$anchor_date" "$every_months" "$day" "$from_date"
+            ;;
+        yearly)
+            local month
+            local day
+            month=$(jq -r ".ports.\"$port\".quota.reset_policy.month // 1" "$CONFIG_FILE" 2>/dev/null)
+            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // 1" "$CONFIG_FILE" 2>/dev/null)
+            if ! [[ "$month" =~ ^[0-9]+$ ]] || [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
+                month=1
+            fi
+            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
+                day=1
+            fi
+            calculate_yearly_next_date "$month" "$day" "$from_date"
+            ;;
+        fixed_date)
+            local date_value
+            date_value=$(jq -r ".ports.\"$port\".quota.reset_policy.date // empty" "$CONFIG_FILE" 2>/dev/null)
+            if is_valid_date "$date_value"; then
+                echo "$date_value"
+            else
+                echo ""
+            fi
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+ensure_port_next_reset_date() {
+    local port="$1"
+    port_has_auto_reset_policy "$port" || return 1
+
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+    if [ "$policy_type" = "monthly" ]; then
+        local policy_saved_type
+        policy_saved_type=$(jq -r ".ports.\"$port\".quota.reset_policy.type // empty" "$CONFIG_FILE" 2>/dev/null)
+        if [ -z "$policy_saved_type" ]; then
+            local reset_day
+            reset_day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // 1" "$CONFIG_FILE" 2>/dev/null)
+            if ! [[ "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -lt 1 ] || [ "$reset_day" -gt 31 ]; then
+                reset_day=1
+            fi
+            jq --arg port "$port" --argjson day "$reset_day" '
+                .ports[$port].quota.reset_policy.type = "monthly" |
+                .ports[$port].quota.reset_policy.day = $day |
+                .ports[$port].quota.reset_day = $day
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
+    fi
+
+    local next_reset_date
+    next_reset_date=$(jq -r ".ports.\"$port\".quota.reset_policy.next_reset_date // empty" "$CONFIG_FILE" 2>/dev/null)
+    if ! is_valid_date "$next_reset_date"; then
+        next_reset_date=$(calculate_port_next_reset_date "$port" "$(get_current_date)")
+        [ -n "$next_reset_date" ] || return 1
+        jq --arg port "$port" --arg next "$next_reset_date" '
+            .ports[$port].quota.reset_policy.next_reset_date = $next
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    fi
+
+    echo "$next_reset_date"
+}
+
+advance_port_next_reset_date() {
+    local port="$1"
+    local after_date="${2:-$(get_current_date)}"
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+
+    if [ "$policy_type" = "fixed_date" ]; then
+        jq --arg port "$port" '
+            .ports[$port].quota.reset_policy.type = "none" |
+            del(.ports[$port].quota.reset_policy.next_reset_date)
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        setup_port_auto_reset_cron "$port"
+        return
+    fi
+
+    local from_date
+    from_date=$(add_days_to_date "$after_date" 1)
+    local next_reset_date
+    next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
+    [ -n "$next_reset_date" ] || return 1
+
+    jq --arg port "$port" --arg last "$after_date" --arg next "$next_reset_date" '
+        .ports[$port].quota.reset_policy.last_reset_date = $last |
+        .ports[$port].quota.reset_policy.next_reset_date = $next
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+get_port_next_reset_label() {
+    local port="$1"
+    port_has_auto_reset_policy "$port" || return 1
+
+    local next_reset_date
+    next_reset_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
+    [ -n "$next_reset_date" ] || return 1
+
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+    case "$policy_type" in
+        monthly) echo "${next_reset_date}重置" ;;
+        interval_days)
+            local every
+            every=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 30" "$CONFIG_FILE" 2>/dev/null)
+            echo "每${every}天，${next_reset_date}重置"
+            ;;
+        interval_months)
+            local every
+            every=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 1" "$CONFIG_FILE" 2>/dev/null)
+            echo "每${every}个月，${next_reset_date}重置"
+            ;;
+        yearly) echo "每年，${next_reset_date}重置" ;;
+        fixed_date) echo "${next_reset_date}到期重置一次" ;;
+        *) return 1 ;;
+    esac
+}
+
+get_port_cycle_range() {
+    local port="$1"
+    local policy_type
+    policy_type=$(get_reset_policy_type "$port")
+
+    if [ "$policy_type" != "monthly" ]; then
+        local start_date
+        start_date=$(jq -r ".ports.\"$port\".quota.reset_policy.last_reset_date // .ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
+        if ! is_valid_date "$start_date"; then
+            start_date=$(get_port_created_date "$port")
+        fi
+
+        local next_date
+        next_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
+        if is_valid_date "$next_date"; then
+            if [ "$policy_type" = "fixed_date" ]; then
+                echo "${start_date}-${next_date}"
+            else
+                local end_date
+                end_date=$(add_days_to_date "$next_date" -1 2>/dev/null || true)
+                if [ -n "$end_date" ]; then
+                    echo "${start_date}-${end_date}"
+                else
+                    echo "${start_date}-${next_date}"
+                fi
+            fi
+        else
+            echo "${start_date}-未设置"
+        fi
+        return
+    fi
+
+    local reset_day_raw
+    reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // null" "$CONFIG_FILE" 2>/dev/null)
 
     local reset_day=1
     if [[ "$reset_day_raw" =~ ^[0-9]+$ ]] && [ "$reset_day_raw" -ge 1 ] && [ "$reset_day_raw" -le 31 ]; then
@@ -1190,6 +1783,23 @@ add_port_monitoring() {
         break
     done
 
+    local reset_policy_config=""
+    local has_limited_quota=false
+    for quota in "${QUOTAS[@]}"; do
+        quota=$(echo "$quota" | tr -d ' ')
+        if [ "$quota" != "0" ] && [ -n "$quota" ]; then
+            has_limited_quota=true
+            break
+        fi
+    done
+
+    if [ "$has_limited_quota" = "true" ]; then
+        echo
+        echo "检测到已设置流量配额，请设置自动重置策略:"
+        prompt_reset_policy 1
+        reset_policy_config="$RESET_POLICY_CONFIG"
+    fi
+
     echo
     echo -e "${BLUE}=== 规则备注配置 ===${NC}"
     echo "请输入当前规则备注(可选，直接回车跳过):"
@@ -1258,6 +1868,9 @@ add_port_monitoring() {
 
         if [ "$monthly_limit" != "unlimited" ]; then
             apply_nftables_quota "$port" "$quota"
+            if [ -n "$reset_policy_config" ]; then
+                apply_reset_policy_to_port "$port" "$reset_policy_config"
+            fi
         fi
 
         echo -e "${GREEN}端口 $port 监控添加成功${NC}"
@@ -1663,6 +2276,25 @@ set_port_quota_limit() {
         break
     done
 
+    local reset_policy_config=""
+    local has_limited_quota=false
+    for quota in "${QUOTAS[@]}"; do
+        quota=$(echo "$quota" | tr -d ' ')
+        if [ "$quota" != "0" ] && [ -n "$quota" ]; then
+            has_limited_quota=true
+            break
+        fi
+    done
+
+    if [ "$has_limited_quota" = "true" ]; then
+        echo
+        read -p "是否同时修改自动重置策略? [y/N]: " change_reset_policy
+        if [[ "$change_reset_policy" =~ ^[Yy]$ ]]; then
+            prompt_reset_policy 1
+            reset_policy_config="$RESET_POLICY_CONFIG"
+        fi
+    fi
+
     local success_count=0
     for i in "${!ports_to_quota[@]}"; do
         local port="${ports_to_quota[$i]}"
@@ -1670,10 +2302,11 @@ set_port_quota_limit() {
 
         if [ "$quota" = "0" ] || [ -z "$quota" ]; then
             remove_nftables_quota "$port"
-            # 设为无限额时删除reset_day字段并清除定时任务
+            # 设为无限额时删除自动重置策略并清除定时任务
             jq ".ports.\"$port\".quota.enabled = true | 
                 .ports.\"$port\".quota.monthly_limit = \"unlimited\" | 
-                del(.ports.\"$port\".quota.reset_day)" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                del(.ports.\"$port\".quota.reset_day) |
+                del(.ports.\"$port\".quota.reset_policy)" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
             remove_port_auto_reset_cron "$port"
             echo -e "${GREEN}端口 $port 流量配额设置为无限制${NC}"
             success_count=$((success_count + 1))
@@ -1698,6 +2331,9 @@ set_port_quota_limit() {
                 .ports.\"$port\".quota.monthly_limit = \"$quota\""
         fi
         
+        if [ -n "$reset_policy_config" ]; then
+            apply_reset_policy_to_port "$port" "$reset_policy_config"
+        fi
         setup_port_auto_reset_cron "$port"
         echo -e "${GREEN}端口 $port 流量配额设置成功: $quota${NC}"
         success_count=$((success_count + 1))
@@ -2031,7 +2667,7 @@ remove_tc_limit() {
 
 manage_traffic_reset() {
     echo -e "${BLUE}流量重置管理${NC}"
-    echo "1. 重置流量月重置日设置"
+    echo "1. 自动重置策略设置"
     echo "2. 立即重置"
     echo "0. 返回主菜单"
     echo
@@ -2046,7 +2682,7 @@ manage_traffic_reset() {
 }
 
 set_reset_day() {
-    echo -e "${BLUE}=== 重置流量月重置日设置 ===${NC}"
+    echo -e "${BLUE}=== 自动重置策略设置 ===${NC}"
     echo
 
     local active_ports=($(get_active_ports))
@@ -2078,54 +2714,40 @@ set_reset_day() {
 
     echo
     local port_list=$(IFS=','; echo "${ports_to_set[*]}")
-    echo "为端口 $port_list 设置月重置日期:"
-    echo "请输入月重置日（多端口使用逗号,分隔）(0代表不重置):"
-    echo "(只输入一个值，应用到所有端口):"
-    read -p "月重置日 [0-31]: " reset_day_input
-
-    local RESET_DAYS=()
-    parse_comma_separated_input "$reset_day_input" RESET_DAYS
-
-    expand_single_value_to_array RESET_DAYS ${#ports_to_set[@]}
-    if [ ${#RESET_DAYS[@]} -ne ${#ports_to_set[@]} ]; then
-        echo -e "${RED}重置日期数量与端口数量不匹配${NC}"
-        sleep 2
-        set_reset_day
-        return
-    fi
+    echo "为端口 $port_list 设置自动重置策略:"
+    prompt_reset_policy 1
+    local reset_policy_config="$RESET_POLICY_CONFIG"
+    local policy_type
+    policy_type=$(printf '%s' "$reset_policy_config" | jq -r '.type')
 
     local success_count=0
-    for i in "${!ports_to_set[@]}"; do
-        local port="${ports_to_set[$i]}"
-        local reset_day=$(echo "${RESET_DAYS[$i]}" | tr -d ' ')
-
-        if ! [[ "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -lt 0 ] || [ "$reset_day" -gt 31 ]; then
-            echo -e "${RED}端口 $port 重置日期无效: $reset_day，必须是0-31之间的数字${NC}"
-            continue
-        fi
-
-        if [ "$reset_day" = "0" ]; then
-            # 删除reset_day字段并移除定时任务
-            jq "del(.ports.\"$port\".quota.reset_day)" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    for port in "${ports_to_set[@]}"; do
+        if [ "$policy_type" = "none" ]; then
+            jq --arg port "$port" '
+                del(.ports[$port].quota.reset_day) |
+                del(.ports[$port].quota.reset_policy)
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
             remove_port_auto_reset_cron "$port"
             echo -e "${GREEN}端口 $port 已取消自动重置${NC}"
         else
             # 无流量配额的端口不需要自动重置
-            local monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
+            local monthly_limit=$(get_quota_limit "$port")
             if [ "$monthly_limit" = "unlimited" ]; then
-                echo -e "${YELLOW}端口 $port 未设置流量配额，请先通过「端口限制设置管理→设置端口流量配额」设置配额后再设置重置日${NC}"
+                echo -e "${YELLOW}端口 $port 未设置流量配额，请先通过「端口限制设置管理→设置端口流量配额」设置配额后再设置自动重置策略${NC}"
                 continue
             fi
-            update_config ".ports.\"$port\".quota.reset_day = $reset_day"
+            apply_reset_policy_to_port "$port" "$reset_policy_config"
             setup_port_auto_reset_cron "$port"
-            echo -e "${GREEN}端口 $port 月重置日设置成功: 每月${reset_day}日${NC}"
+            local next_reset_label
+            next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
+            echo -e "${GREEN}端口 $port 自动重置策略设置成功${NC}${next_reset_label:+: $next_reset_label}"
         fi
         
         success_count=$((success_count + 1))
     done
 
     echo
-    echo -e "${GREEN}成功设置 $success_count 个端口的月重置日期${NC}"
+    echo -e "${GREEN}成功设置 $success_count 个端口的自动重置策略${NC}"
 
     sleep 2
     manage_traffic_reset
@@ -2228,6 +2850,32 @@ auto_reset_port() {
     log_notification "端口 $port 自动重置完成，重置前流量: $(format_bytes $total_bytes)"
 
     echo "端口 $port 自动重置完成"
+}
+
+check_reset_port_due() {
+    local port="$1"
+    port_has_auto_reset_policy "$port" || return 0
+
+    local today
+    today=$(get_current_date)
+    local next_reset_date
+    next_reset_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
+
+    if [ -z "$next_reset_date" ] || ! is_valid_date "$next_reset_date"; then
+        return 0
+    fi
+
+    if date_le "$next_reset_date" "$today"; then
+        auto_reset_port "$port"
+        advance_port_next_reset_date "$port" "$today"
+    fi
+}
+
+check_scheduled_resets() {
+    local active_ports=($(get_active_ports 2>/dev/null || true))
+    for port in "${active_ports[@]}"; do
+        check_reset_port_due "$port" >/dev/null 2>&1 || true
+    done
 }
 
 # 重置端口nftables计数器和配额
@@ -3002,7 +3650,8 @@ remove_all_port_auto_reset_cron() {
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | \
         grep -v "端口流量狗自动重置端口" | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' \
         > "$temp_cron" || true
     crontab "$temp_cron"
     rm -f "$temp_cron"
@@ -3050,16 +3699,14 @@ setup_port_auto_reset_cron() {
     local temp_cron=$(mktemp)
 
     # 保留现有任务，移除该端口的旧任务
-    crontab -l 2>/dev/null | grep -v "端口流量狗自动重置端口$port" | grep -v "port-traffic-dog.*--reset-port $port" > "$temp_cron" || true
+    crontab -l 2>/dev/null | \
+        grep -v "端口流量狗自动重置端口$port" | \
+        grep -v "port-traffic-dog.*--reset-port $port" | \
+        grep -v "port-traffic-dog.*--check-reset-port $port" > "$temp_cron" || true
 
-    local quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE")
-    local monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
-    local reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_day" "$CONFIG_FILE")
-    
-    # 只有quota启用、monthly_limit不是unlimited、且reset_day存在时才添加cron任务
-    if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ] && [ "$reset_day_raw" != "null" ]; then
-        local reset_day="${reset_day_raw:-1}"
-        echo "5 0 $reset_day * * $script_path --reset-port $port >/dev/null 2>&1  # 端口流量狗自动重置端口$port" >> "$temp_cron"
+    if port_has_auto_reset_policy "$port"; then
+        ensure_port_next_reset_date "$port" >/dev/null 2>&1 || true
+        echo "5 0 * * * $script_path --check-reset-port $port >/dev/null 2>&1  # 端口流量狗自动重置端口$port" >> "$temp_cron"
     fi
 
     crontab "$temp_cron"
@@ -3070,7 +3717,10 @@ remove_port_auto_reset_cron() {
     local port="$1"
     local temp_cron=$(mktemp)
 
-    crontab -l 2>/dev/null | grep -v "端口流量狗自动重置端口$port" | grep -v "port-traffic-dog.*--reset-port $port" > "$temp_cron" || true
+    crontab -l 2>/dev/null | \
+        grep -v "端口流量狗自动重置端口$port" | \
+        grep -v "port-traffic-dog.*--reset-port $port" | \
+        grep -v "port-traffic-dog.*--check-reset-port $port" > "$temp_cron" || true
 
     crontab "$temp_cron"
     rm -f "$temp_cron"
@@ -3306,6 +3956,18 @@ main() {
                 auto_reset_port "$2"
                 exit 0
                 ;;
+            --check-reset-port)
+                if [ $# -lt 2 ]; then
+                    echo -e "${RED}错误：--check-reset-port 需要指定端口号${NC}"
+                    exit 1
+                fi
+                check_reset_port_due "$2"
+                exit 0
+                ;;
+            --check-scheduled-resets)
+                check_scheduled_resets
+                exit 0
+                ;;
             --send-telegram-status)
                 if load_telegram_module; then
                     telegram_send_status_notification
@@ -3384,6 +4046,8 @@ main() {
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
                 echo "  --reset-port PORT         重置指定端口流量"
+                echo "  --check-reset-port PORT   检查指定端口是否到期重置"
+                echo "  --check-scheduled-resets  检查所有端口是否到期重置"
                 echo
                 echo -e "${GREEN}快捷命令: $SHORTCUT_COMMAND${NC}"
                 exit 1
