@@ -21,6 +21,7 @@
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
 10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
 11. 修正双向统计重复计数导致的流量偏多问题，并提供 `dog --repair-traffic-rules` 修复已安装的重复规则。
+12. 流量展示与配额周期用量改为按北京时间自然日快照累计，降低 nftables 原始计数器重复规则、重建规则、重置基线导致的偏差。
 
 ## 下载方式说明
 
@@ -118,6 +119,7 @@ sudo dog --self-check
 sudo dog --sync-notification-modules
 sudo dog --refresh-notification-cron
 sudo dog --repair-traffic-rules
+sudo dog --snapshot-traffic
 sudo dog --uninstall
 ```
 
@@ -125,7 +127,8 @@ sudo dog --uninstall
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
 - `--repair-traffic-rules`: 检查并修复旧版本重复插入的流量计数规则；发现重复规则时会按重复倍数折算当前计数并重建规则。
-- `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron 和端口自动重置 cron。
+- `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每 5 分钟执行一次。
+- `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
 
 ## 5) 流量配额自动重置
 
@@ -150,7 +153,20 @@ sudo dog --uninstall
 - 自动任务每天 00:05 检查是否到期，只有到期端口才会真正重置。
 - 手动“立即重置”只清零当前流量，不会自动改变下一次到期日期。
 
-## 6) 单独下载通知脚本
+## 6) 流量统计口径
+
+脚本现在把 nftables counter 当作原始采样源，业务展示和配额周期用量不再直接读取原始 counter，而是写入 `/etc/port-traffic-dog/traffic_stats.json` 后再汇总：
+
+- `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
+- `daily`: 按北京时间自然日保存每日入站/出站增量。
+- 主菜单、通知消息和配额进度会先写入一次快照，再按当前重置周期逐日累加。
+- 每 5 分钟会自动执行 `dog --snapshot-traffic`；如果 cron 停止很久，下一次快照会把这段时间的增量计入执行当天。
+- `traffic_data.json` 仍用于异常退出/规则恢复时保留 nftables counter，不等同于自然日统计文件。
+- 首次生成 `traffic_stats.json` 时只建立当前 nftables counter 基线，不把升级前的历史 counter 直接计入当天，避免旧偏差继续污染新统计。
+- 重置端口前会先写入快照并记录重置历史，重置后会清空当前周期统计段并刷新该端口基线，避免清零 counter 后下一次采样重复计算。
+- 从旧配置升级时，原来的 `quota.reset_day` 仍按“每月几号重置”继承；自然日统计文件会从升级后的第一次快照开始累计。
+
+## 7) 单独下载通知脚本
 
 ### telegram.sh
 
@@ -180,11 +196,11 @@ wget -O wecom.sh https://raw.githubusercontent.com/duya07/port-traffic-dog/main/
 wget -O wecom.sh https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/port-traffic-dog/main/wecom.sh
 ```
 
-## 7) 限速规则核查与清理（nft/tc）
+## 8) 限速规则核查与清理（nft/tc）
 
 用于检查旧 VPS 上是否还有残留规则，并做兜底清理。
 
-### 7.1 先查（不改系统）
+### 8.1 先查（不改系统）
 
 ```bash
 sudo nft list tables | grep -E 'port_traffic_monitor|table inet port_traffic_monitor' || echo "nft table not found"
@@ -196,10 +212,10 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' || echo "no related cron"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "no related cron"
 ```
 
-### 7.2 再清（卸载后兜底）
+### 8.2 再清（卸载后兜底）
 
 建议先执行:
 
@@ -217,10 +233,10 @@ if sudo tc qdisc show dev "${IFACE}" | grep -q 'htb 1:'; then
   sudo tc qdisc del dev "${IFACE}" root
 fi
 
-sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' | sudo crontab -
+sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' | sudo crontab -
 ```
 
-### 7.3 复查（确认清理完成）
+### 8.3 复查（确认清理完成）
 
 ```bash
 sudo nft list table inet port_traffic_monitor 2>/dev/null && echo "still exists" || echo "nft table removed"
@@ -230,7 +246,7 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--reset-port|--check-reset-port' || echo "cron clean"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "cron clean"
 ```
 
 ## 目录结构
