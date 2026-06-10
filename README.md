@@ -127,7 +127,7 @@ sudo dog --uninstall
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
 - `--repair-traffic-rules`: 检查并修复旧版本重复插入的流量计数规则；发现重复规则时会按重复倍数折算当前计数并重建规则。
-- `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每 5 分钟执行一次。
+- `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
 
 ## 5) 流量配额自动重置
@@ -160,7 +160,7 @@ sudo dog --uninstall
 - `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
 - `daily`: 按北京时间自然日保存每日入站/出站增量。
 - 主菜单、通知消息和配额进度会先写入一次快照，再按当前重置周期逐日累加。
-- 每 5 分钟会自动执行 `dog --snapshot-traffic`；如果 cron 停止很久，下一次快照会把这段时间的增量计入执行当天。
+- 每分钟会自动执行 `dog --snapshot-traffic`；如果 cron 停止很久，下一次快照会把这段时间的增量计入执行当天。
 - `traffic_data.json` 仍用于异常退出/规则恢复时保留 nftables counter，不等同于自然日统计文件。
 - 首次生成 `traffic_stats.json` 时只建立当前 nftables counter 基线，不把升级前的历史 counter 直接计入当天，避免旧偏差继续污染新统计。
 - 重置端口前会先写入快照并记录重置历史，重置后会清空当前周期统计段并刷新该端口基线，避免清零 counter 后下一次采样重复计算。

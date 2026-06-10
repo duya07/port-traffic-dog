@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.4"
+readonly SCRIPT_VERSION="1.3.5"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -4188,7 +4188,7 @@ setup_traffic_snapshot_cron() {
         grep -v "# port-traffic-dog traffic snapshot" | \
         grep -v "port-traffic-dog.*--snapshot-traffic" > "$temp_cron" || true
 
-    echo "*/5 * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
+    echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
     crontab "$temp_cron"
     rm -f "$temp_cron"
     ensure_cron_service_running
