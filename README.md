@@ -20,6 +20,7 @@
 8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
 10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
+11. 修正双向统计重复计数导致的流量偏多问题，并提供 `dog --repair-traffic-rules` 修复已安装的重复规则。
 
 ## 下载方式说明
 
@@ -116,12 +117,14 @@ sudo dog --self-check
 sudo dog --self-check
 sudo dog --sync-notification-modules
 sudo dog --refresh-notification-cron
+sudo dog --repair-traffic-rules
 sudo dog --uninstall
 ```
 
 - `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
+- `--repair-traffic-rules`: 检查并修复旧版本重复插入的流量计数规则；发现重复规则时会按重复倍数折算当前计数并重建规则。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron 和端口自动重置 cron。
 
 ## 5) 流量配额自动重置
@@ -140,6 +143,8 @@ sudo dog --uninstall
 
 - 旧配置里的 `quota.reset_day` 会自动继承为“每月几号重置”，例如原来设置每月 2 日重置，会继续按每月 2 日执行。
 - 新增或修改周期型策略时，下一次自动重置会从未来日期开始计算，避免刚添加端口就被当天任务重置。
+- 第一次批量添加多个有限配额端口时，可选择为每个端口分别设置自动重置策略。
+- 指定到期日期为当天时，脚本会询问是否立即重置当前流量；不立即重置则等待下一次每日检查。
 - 31 号遇到没有 31 号的月份，会按该月最后一天处理。
 - 2 月 29 日遇到非闰年，会按 2 月 28 日处理。
 - 自动任务每天 00:05 检查是否到期，只有到期端口才会真正重置。
