@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.6"
+readonly SCRIPT_VERSION="1.3.7"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -639,29 +639,67 @@ record_traffic_snapshot() {
         local traffic_data=($(get_nftables_counter_data "$port"))
         local current_input=${traffic_data[0]:-0}
         local current_output=${traffic_data[1]:-0}
-        local has_last_snapshot
-        has_last_snapshot=$(jq -r --arg port "$port" '.last_snapshot | has($port)' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo false)
+
+        local state_date
+        state_date=$(jq -r --arg port "$port" '.state[$port].date // empty' "$TRAFFIC_STATS_FILE" 2>/dev/null || true)
+        local has_state=false
+        if [ "$state_date" = "$snapshot_date" ]; then
+            has_state=true
+        fi
+        local input_base
+        input_base=$(jq -r --arg port "$port" '.state[$port].input_base // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        local output_base
+        output_base=$(jq -r --arg port "$port" '.state[$port].output_base // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        local input_offset
+        input_offset=$(jq -r --arg port "$port" '.state[$port].input_offset // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        local output_offset
+        output_offset=$(jq -r --arg port "$port" '.state[$port].output_offset // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
         local last_input
-        last_input=$(jq -r --arg port "$port" '.last_snapshot[$port].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        last_input=$(jq -r --arg port "$port" '.state[$port].last_input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
         local last_output
-        last_output=$(jq -r --arg port "$port" '.last_snapshot[$port].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        last_output=$(jq -r --arg port "$port" '.state[$port].last_output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        local existing_input
+        existing_input=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+        local existing_output
+        existing_output=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
 
-        [[ "$last_input" =~ ^[0-9]+$ ]] || last_input=0
-        [[ "$last_output" =~ ^[0-9]+$ ]] || last_output=0
+        for value_name in input_base output_base input_offset output_offset last_input last_output existing_input existing_output current_input current_output; do
+            local value="${!value_name}"
+            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+                printf -v "$value_name" '%s' 0
+            fi
+        done
 
-        local delta_input=0
-        local delta_output=0
-        if [ "$has_last_snapshot" = "true" ]; then
-            if [ "$current_input" -ge "$last_input" ]; then
-                delta_input=$((current_input - last_input))
-            else
-                delta_input="$current_input"
-            fi
-            if [ "$current_output" -ge "$last_output" ]; then
-                delta_output=$((current_output - last_output))
-            else
-                delta_output="$current_output"
-            fi
+        if [ "$has_state" != "true" ]; then
+            input_base="$current_input"
+            output_base="$current_output"
+            input_offset=0
+            output_offset=0
+            last_input="$current_input"
+            last_output="$current_output"
+            existing_input=0
+            existing_output=0
+        elif [ "$current_input" -lt "$last_input" ]; then
+            input_offset="$existing_input"
+            input_base=0
+        fi
+        if [ "$has_state" = "true" ] && [ "$current_output" -lt "$last_output" ]; then
+            output_offset="$existing_output"
+            output_base=0
+        fi
+
+        local total_input
+        if [ "$current_input" -ge "$input_base" ]; then
+            total_input=$((input_offset + current_input - input_base))
+        else
+            total_input=$((input_offset + current_input))
+        fi
+
+        local total_output
+        if [ "$current_output" -ge "$output_base" ]; then
+            total_output=$((output_offset + current_output - output_base))
+        else
+            total_output=$((output_offset + current_output))
         fi
 
         local temp_file
@@ -670,17 +708,34 @@ record_traffic_snapshot() {
             --arg port "$port" \
             --arg date "$snapshot_date" \
             --arg time "$snapshot_time" \
-            --argjson din "$delta_input" \
-            --argjson dout "$delta_output" \
             --argjson cin "$current_input" \
             --argjson cout "$current_output" \
+            --argjson ibase "$input_base" \
+            --argjson obase "$output_base" \
+            --argjson ioffset "$input_offset" \
+            --argjson ooffset "$output_offset" \
+            --argjson tin "$total_input" \
+            --argjson tout "$total_output" \
             '
             .last_snapshot = (.last_snapshot // {}) |
+            .state = (.state // {}) |
             .daily = (.daily // {}) |
             .daily[$port] = (.daily[$port] // {}) |
-            .daily[$port][$date] = (.daily[$port][$date] // {"input":0,"output":0}) |
-            .daily[$port][$date].input = ((.daily[$port][$date].input // 0) + $din) |
-            .daily[$port][$date].output = ((.daily[$port][$date].output // 0) + $dout) |
+            .daily[$port][$date] = {
+                "input": $tin,
+                "output": $tout,
+                "time": $time
+            } |
+            .state[$port] = {
+                "date": $date,
+                "input_base": $ibase,
+                "output_base": $obase,
+                "input_offset": $ioffset,
+                "output_offset": $ooffset,
+                "last_input": $cin,
+                "last_output": $cout,
+                "time": $time
+            } |
             .last_snapshot[$port] = {
                 "input": $cin,
                 "output": $cout,
@@ -701,6 +756,7 @@ record_traffic_snapshot() {
 
 update_traffic_snapshot_baseline() {
     local port="$1"
+    local mode="${2:-preserve_today}"
     [ -f "$CONFIG_FILE" ] || return 0
 
     acquire_traffic_stats_lock || return 1
@@ -716,6 +772,17 @@ update_traffic_snapshot_baseline() {
     snapshot_date=$(get_current_date)
     local snapshot_time
     snapshot_time=$(get_beijing_time -Iseconds)
+    local existing_input
+    existing_input=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+    local existing_output
+    existing_output=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+    [[ "$existing_input" =~ ^[0-9]+$ ]] || existing_input=0
+    [[ "$existing_output" =~ ^[0-9]+$ ]] || existing_output=0
+    if [ "$mode" = "reset_today" ]; then
+        existing_input=0
+        existing_output=0
+    fi
+
     local temp_file
     temp_file=$(mktemp)
 
@@ -725,9 +792,28 @@ update_traffic_snapshot_baseline() {
         --arg time "$snapshot_time" \
         --argjson cin "$current_input" \
         --argjson cout "$current_output" \
+        --argjson ein "$existing_input" \
+        --argjson eout "$existing_output" \
         '
         .last_snapshot = (.last_snapshot // {}) |
+        .state = (.state // {}) |
         .daily = (.daily // {}) |
+        .daily[$port] = (.daily[$port] // {}) |
+        .daily[$port][$date] = {
+            "input": $ein,
+            "output": $eout,
+            "time": $time
+        } |
+        .state[$port] = {
+            "date": $date,
+            "input_base": $cin,
+            "output_base": $cout,
+            "input_offset": $ein,
+            "output_offset": $eout,
+            "last_input": $cin,
+            "last_output": $cout,
+            "time": $time
+        } |
         .last_snapshot[$port] = {
             "input": $cin,
             "output": $cout,
@@ -938,6 +1024,54 @@ count_quota_rules() {
         grep -F "quota name \"$quota_name\"" | wc -l | awk '{print $1}'
 }
 
+remove_nftables_counter_rules() {
+    local port="$1"
+    local table_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    local family
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local counter_prefix
+    counter_prefix=$(get_port_counter_prefix "$port")
+
+    local deleted_count=0
+    while true; do
+        local match_line
+        match_line=$(nft -a list table "$family" "$table_name" 2>/dev/null | awk -v prefix="$counter_prefix" '
+            /^[[:space:]]*chain[[:space:]]+/ {
+                chain = $2
+                next
+            }
+            index($0, "counter name \"" prefix "_") && $0 ~ /# handle [0-9]+/ {
+                handle = $0
+                sub(/^.*# handle /, "", handle)
+                sub(/[^0-9].*$/, "", handle)
+                print chain " " handle
+                exit
+            }
+        ')
+
+        if [ -z "$match_line" ]; then
+            break
+        fi
+
+        local chain="${match_line%% *}"
+        local handle="${match_line##* }"
+        if [ -z "$chain" ] || [ -z "$handle" ]; then
+            break
+        fi
+
+        if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
+            deleted_count=$((deleted_count + 1))
+        else
+            break
+        fi
+
+        if [ "$deleted_count" -ge 150 ]; then
+            break
+        fi
+    done
+}
+
 get_counter_repair_factor() {
     local rule_count="${1:-0}"
     local expected_count="${2:-4}"
@@ -952,20 +1086,22 @@ repair_port_traffic_rules() {
     local port="$1"
     local billing_mode
     billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-    local expected_count=4
-
-    local in_rule_count=0
+    local expected_in_count=0
+    local expected_out_count=4
     if [ "$billing_mode" = "double" ]; then
-        in_rule_count=$(count_counter_rules "$port" "in")
+        expected_in_count=4
     fi
+
+    local in_rule_count
+    in_rule_count=$(count_counter_rules "$port" "in")
     local out_rule_count
     out_rule_count=$(count_counter_rules "$port" "out")
 
     local needs_rebuild=false
-    if [ "$billing_mode" = "double" ] && [ "$in_rule_count" -gt "$expected_count" ]; then
+    if [ "$in_rule_count" -ne "$expected_in_count" ]; then
         needs_rebuild=true
     fi
-    if [ "$out_rule_count" -gt "$expected_count" ]; then
+    if [ "$out_rule_count" -ne "$expected_out_count" ]; then
         needs_rebuild=true
     fi
 
@@ -975,11 +1111,11 @@ repair_port_traffic_rules() {
     local current_input=${traffic_data[0]:-0}
     local current_output=${traffic_data[1]:-0}
     local input_factor=1
-    if [ "$billing_mode" = "double" ]; then
-        input_factor=$(get_counter_repair_factor "$in_rule_count" "$expected_count")
+    if [ "$expected_in_count" -gt 0 ]; then
+        input_factor=$(get_counter_repair_factor "$in_rule_count" "$expected_in_count")
     fi
     local output_factor
-    output_factor=$(get_counter_repair_factor "$out_rule_count" "$expected_count")
+    output_factor=$(get_counter_repair_factor "$out_rule_count" "$expected_out_count")
 
     local repaired_input=$((current_input / input_factor))
     local repaired_output=$((current_output / output_factor))
@@ -988,7 +1124,11 @@ repair_port_traffic_rules() {
     remove_nftables_rules "$port"
     restore_counter_value "$port" "$repaired_input" "$repaired_output"
     add_nftables_rules "$port"
-    update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
+    local baseline_mode="preserve_today"
+    if [ "$in_rule_count" -gt "$expected_in_count" ] || [ "$out_rule_count" -gt "$expected_out_count" ]; then
+        baseline_mode="reset_today"
+    fi
+    update_traffic_snapshot_baseline "$port" "$baseline_mode" >/dev/null 2>&1 || true
 
     local quota_enabled
     quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // false" "$CONFIG_FILE")
@@ -998,7 +1138,7 @@ repair_port_traffic_rules() {
         apply_nftables_quota "$port" "$monthly_limit"
     fi
 
-    log_notification "端口 $port 重复流量规则已修复：in规则=$in_rule_count, out规则=$out_rule_count, in修正=$input_factor, out修正=$output_factor"
+    log_notification "port $port traffic rules rebuilt: in_rules=$in_rule_count/$expected_in_count, out_rules=$out_rule_count/$expected_out_count, in_factor=$input_factor, out_factor=$output_factor"
     return 0
 }
 
@@ -1435,13 +1575,10 @@ generate_tc_class_id() {
 }
 
 get_daily_total_traffic() {
-    record_traffic_snapshot >/dev/null 2>&1 || true
     local total_bytes=0
     local ports=($(get_active_ports))
-    local today
-    today=$(get_current_date)
     for port in "${ports[@]}"; do
-        local traffic_data=($(sum_port_traffic_by_dates "$port" "$today" "$today"))
+        local traffic_data=($(get_nftables_counter_data "$port"))
         local input_bytes=${traffic_data[0]}
         local output_bytes=${traffic_data[1]}
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
@@ -2539,6 +2676,8 @@ add_nftables_rules() {
     local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
 
+    remove_nftables_counter_rules "$port" >/dev/null 2>&1 || true
+
     if is_port_range "$port"; then
         local port_safe=$(echo "$port" | tr '-' '_')
         local mark_id=$(generate_port_range_mark "$port")
@@ -2986,6 +3125,7 @@ change_port_billing_mode() {
     if [ "$quota_enabled" = "true" ] && [ -n "$quota_limit" ] && [ "$quota_limit" != "null" ] && [ "$quota_limit" != "unlimited" ]; then
         apply_nftables_quota "$target_port" "$quota_limit"
     fi
+    update_traffic_snapshot_baseline "$target_port" >/dev/null 2>&1 || true
     
     echo -e "${GREEN}✓ 已应用 $new_display 模式，流量数据已保留${NC}"
     sleep 2
