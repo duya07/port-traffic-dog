@@ -20,7 +20,7 @@
 8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
 10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
-11. 修正双向统计重复计数和重复配额规则导致的流量/限额偏多问题，并提供 `dog --repair-traffic-rules` 修复已安装的重复规则。
+11. 修正双向统计重复/缺失计数规则和重复配额规则导致的流量/限额偏多或规则异常问题，并提供 `dog --repair-traffic-rules` 修复已安装规则。
 12. 当前周期流量、配额进度和限额初始化沿用原脚本的 nftables counter 口径；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
 
 ## 下载方式说明
@@ -126,7 +126,7 @@ sudo dog --uninstall
 - `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
-- `--repair-traffic-rules`: 检查并修复旧版本重复插入的流量计数规则和配额规则；计数规则会按重复倍数折算当前 counter，配额规则会按当前 counter 重建，避免重复 quota 规则导致限额倍增。
+- `--repair-traffic-rules`: 检查并修复旧版本重复/缺失的流量计数规则和异常配额规则；重复计数规则会按重复倍数折算当前 counter，配额规则会按当前 counter 重建，避免重复 quota 规则导致限额倍增。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
 
@@ -159,7 +159,7 @@ sudo dog --uninstall
 
 - `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
 - `daily`: 按北京时间自然日保存每日入站/出站增量。
-- 主菜单、通知消息和配额进度读取当前 nftables counter；自然日总量通过快照文件按日累加。
+- 主菜单端口总量、通知消息和配额进度读取当前 nftables counter；自然日快照文件只用于独立日统计，不参与主菜单总量叠加。
 - 每分钟会自动执行 `dog --snapshot-traffic`；如果 cron 停止很久，下一次快照会把这段时间的增量计入执行当天。
 - `traffic_data.json` 仍用于异常退出/规则恢复时保留 nftables counter，不等同于自然日统计文件。
 - 首次生成 `traffic_stats.json` 时只建立当前 nftables counter 基线，不把升级前的历史 counter 直接计入当天，避免旧偏差继续污染新统计。
