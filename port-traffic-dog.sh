@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.5"
+readonly SCRIPT_VERSION="1.3.6"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -914,6 +914,30 @@ count_counter_rules() {
         grep -F "counter name \"$counter_name\"" | wc -l | awk '{print $1}'
 }
 
+get_port_quota_name() {
+    local port="$1"
+    if is_port_range "$port"; then
+        local port_safe
+        port_safe=$(echo "$port" | tr '-' '_')
+        echo "port_${port_safe}_quota"
+    else
+        echo "port_${port}_quota"
+    fi
+}
+
+count_quota_rules() {
+    local port="$1"
+    local table_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    local family
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local quota_name
+    quota_name=$(get_port_quota_name "$port")
+
+    nft -a list table "$family" "$table_name" 2>/dev/null | \
+        grep -F "quota name \"$quota_name\"" | wc -l | awk '{print $1}'
+}
+
 get_counter_repair_factor() {
     local rule_count="${1:-0}"
     local expected_count="${2:-4}"
@@ -978,11 +1002,47 @@ repair_port_traffic_rules() {
     return 0
 }
 
+repair_port_quota_rules() {
+    local port="$1"
+    local quota_enabled
+    quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // false" "$CONFIG_FILE")
+    local monthly_limit
+    monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
+    if [ "$quota_enabled" != "true" ] || [ "$monthly_limit" = "unlimited" ]; then
+        remove_nftables_quota "$port" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    local billing_mode
+    billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
+    local expected_count=4
+    if [ "$billing_mode" = "double" ]; then
+        expected_count=8
+    fi
+
+    local quota_rule_count
+    quota_rule_count=$(count_quota_rules "$port")
+    if [ "$quota_rule_count" -eq "$expected_count" ]; then
+        return 1
+    fi
+
+    apply_nftables_quota "$port" "$monthly_limit"
+    log_notification "port $port quota rules rebuilt: quota_rules=$quota_rule_count, expected=$expected_count"
+    return 0
+}
+
 repair_duplicate_traffic_rules() {
     local active_ports=($(get_active_ports 2>/dev/null || true))
     local repaired_count=0
     for port in "${active_ports[@]}"; do
+        local repaired=false
         if repair_port_traffic_rules "$port" >/dev/null 2>&1; then
+            repaired=true
+        fi
+        if repair_port_quota_rules "$port" >/dev/null 2>&1; then
+            repaired=true
+        fi
+        if [ "$repaired" = "true" ]; then
             repaired_count=$((repaired_count + 1))
         fi
     done
@@ -1049,7 +1109,7 @@ get_port_status_label() {
 
 get_port_monthly_usage() {
     local port=$1
-    local traffic_data=($(get_port_cycle_traffic "$port"))
+    local traffic_data=($(get_nftables_counter_data "$port"))
     local input_bytes=${traffic_data[0]}
     local output_bytes=${traffic_data[1]}
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
@@ -1993,7 +2053,7 @@ format_port_list() {
     local index=1
 
     for port in "${active_ports[@]}"; do
-        local traffic_data=($(get_port_cycle_traffic "$port"))
+        local traffic_data=($(get_nftables_counter_data "$port"))
         local input_bytes=${traffic_data[0]}
         local output_bytes=${traffic_data[1]}
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
@@ -2942,19 +3002,19 @@ apply_nftables_quota() {
 
     local quota_bytes=$(parse_size_to_bytes "$quota_limit")
 
-    # Use current-cycle traffic as the quota baseline.
-    record_traffic_snapshot >/dev/null 2>&1 || true
-    local current_traffic=($(get_port_cycle_traffic "$port"))
+    # Use raw nftables counters as the current-cycle baseline.
+    local current_traffic=($(get_nftables_counter_data "$port"))
     local current_input=${current_traffic[0]}
     local current_output=${current_traffic[1]}
     local current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
+
+    remove_nftables_quota "$port"
 
     if is_port_range "$port"; then
         local port_safe=$(echo "$port" | tr '-' '_')
         local quota_name="port_${port_safe}_quota"
 
         # 确保幂等：先删除现有配额对象（如果存在）
-        nft delete quota $family $table_name $quota_name 2>/dev/null || true
         nft add quota $family $table_name $quota_name { over $quota_bytes bytes used $current_total bytes } 2>/dev/null || true
 
         if [ "$billing_mode" = "double" ]; then
@@ -2980,7 +3040,6 @@ apply_nftables_quota() {
         local quota_name="port_${port}_quota"
 
         # 确保幂等：先删除现有配额对象（如果存在）
-        nft delete quota $family $table_name $quota_name 2>/dev/null || true
         nft add quota $family $table_name $quota_name { over $quota_bytes bytes used $current_total bytes } 2>/dev/null || true
 
         if [ "$billing_mode" = "double" ]; then
@@ -3275,7 +3334,7 @@ immediate_reset() {
     echo "将重置以下端口的流量统计:"
     local total_all_traffic=0
     for port in "${ports_to_reset[@]}"; do
-        local traffic_data=($(get_port_cycle_traffic "$port"))
+        local traffic_data=($(get_nftables_counter_data "$port"))
         local input_bytes=${traffic_data[0]}
         local output_bytes=${traffic_data[1]}
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
@@ -3296,14 +3355,13 @@ immediate_reset() {
         for port in "${ports_to_reset[@]}"; do
             # 获取当前流量用于记录
             record_traffic_snapshot >/dev/null 2>&1 || true
-            local traffic_data=($(get_port_cycle_traffic "$port"))
+            local traffic_data=($(get_nftables_counter_data "$port"))
             local input_bytes=${traffic_data[0]}
             local output_bytes=${traffic_data[1]}
             local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
             local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
             reset_port_nftables_counters "$port"
-            clear_current_cycle_traffic_stats "$port" >/dev/null 2>&1 || true
             update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
             record_reset_history "$port" "$total_bytes"
 
@@ -3327,14 +3385,13 @@ auto_reset_port() {
     local port="$1"
 
     record_traffic_snapshot >/dev/null 2>&1 || true
-    local traffic_data=($(get_port_cycle_traffic "$port"))
+    local traffic_data=($(get_nftables_counter_data "$port"))
     local input_bytes=${traffic_data[0]}
     local output_bytes=${traffic_data[1]}
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
     local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
     reset_port_nftables_counters "$port"
-    clear_current_cycle_traffic_stats "$port" >/dev/null 2>&1 || true
     update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
     record_reset_history "$port" "$total_bytes"
 
@@ -4580,7 +4637,7 @@ main() {
                 echo "  --self-check              执行一键自检"
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
-                echo "  --repair-traffic-rules  修复重复流量计数规则"
+                echo "  --repair-traffic-rules  修复重复流量计数/配额规则"
                 echo "  --snapshot-traffic       写入自然日流量快照"
                 echo "  --reset-port PORT         重置指定端口流量"
                 echo "  --check-reset-port PORT   检查指定端口是否到期重置"
