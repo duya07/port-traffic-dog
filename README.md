@@ -249,17 +249,14 @@ sudo tc filter show dev "${IFACE}"
 sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "cron clean"
 ```
 
-## 目录结构
+## 文件路径
 
-```text
-.
-├── PORT_TRAFFIC_DOG_CUSTOM.md
-├── alpine-port-traffic-dog-preinstall.sh
-├── migrate-to-custom.sh
-├── port-traffic-dog.sh
-├── telegram.sh
-└── wecom.sh
-```
+- `PORT_TRAFFIC_DOG_CUSTOM.md`: <https://github.com/duya07/port-traffic-dog/blob/main/PORT_TRAFFIC_DOG_CUSTOM.md>
+- `alpine-port-traffic-dog-preinstall.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/alpine-port-traffic-dog-preinstall.sh>
+- `migrate-to-custom.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/migrate-to-custom.sh>
+- `port-traffic-dog.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/port-traffic-dog.sh>
+- `telegram.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/telegram.sh>
+- `wecom.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/wecom.sh>
 
 ## 注意事项
 
