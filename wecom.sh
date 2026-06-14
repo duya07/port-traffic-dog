@@ -198,10 +198,21 @@ wecom_configure_webhook() {
     fi
 
     # 原子性配置更新：确保配置完整性
-    update_config ".notifications.wecom.webhook_url = \"$webhook_url\" |
-        .notifications.wecom.server_name = \"$server_name\" |
+    local tmp_file
+    tmp_file=$(mktemp)
+    if jq --arg webhook_url "$webhook_url" \
+       --arg server_name "$server_name" \
+       '.notifications.wecom.webhook_url = $webhook_url |
+        .notifications.wecom.server_name = $server_name |
         .notifications.wecom.enabled = true |
-        .notifications.wecom.status_notifications.enabled = true"
+        .notifications.wecom.status_notifications.enabled = true' \
+       "$CONFIG_FILE" > "$tmp_file"; then
+        mv "$tmp_file" "$CONFIG_FILE"
+    else
+        rm -f "$tmp_file"
+        echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
+        return 1
+    fi
 
     echo -e "${GREEN}基本配置保存成功！${NC}"
     echo

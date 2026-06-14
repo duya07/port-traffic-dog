@@ -2506,42 +2506,75 @@ add_port_monitoring() {
             remark=$(echo "${REMARKS[$i]}" | tr -d ' ')
         fi
 
-        local quota_enabled="true"
         local monthly_limit="unlimited"
 
         if [ "$quota" != "0" ] && [ -n "$quota" ]; then
             monthly_limit="$quota"
         fi
 
-        # 只有设置了流量限额时才添加reset_day字段（默认为1）
-        local quota_config
+        local created_at
+        created_at=$(get_beijing_time -Iseconds)
+        local tmp_file
+        tmp_file=$(mktemp)
+        local config_written=false
         if [ "$monthly_limit" != "unlimited" ]; then
-            quota_config="{
-                \"enabled\": $quota_enabled,
-                \"monthly_limit\": \"$monthly_limit\",
-                \"reset_day\": 1
-            }"
+            if jq --arg port "$port" \
+               --arg name "端口$port" \
+               --arg billing "$billing_mode" \
+               --arg monthly "$monthly_limit" \
+               --arg remark "$remark" \
+               --arg created "$created_at" \
+               '.ports[$port] = {
+                   "name": $name,
+                   "enabled": true,
+                   "billing_mode": $billing,
+                   "bandwidth_limit": {
+                       "enabled": false,
+                       "rate": "unlimited"
+                   },
+                   "quota": {
+                       "enabled": true,
+                       "monthly_limit": $monthly,
+                       "reset_day": 1
+                   },
+                   "remark": $remark,
+                   "created_at": $created
+               }' "$CONFIG_FILE" > "$tmp_file"; then
+                config_written=true
+            fi
         else
-            quota_config="{
-                \"enabled\": $quota_enabled,
-                \"monthly_limit\": \"$monthly_limit\"
-            }"
+            if jq --arg port "$port" \
+               --arg name "端口$port" \
+               --arg billing "$billing_mode" \
+               --arg monthly "$monthly_limit" \
+               --arg remark "$remark" \
+               --arg created "$created_at" \
+               '.ports[$port] = {
+                   "name": $name,
+                   "enabled": true,
+                   "billing_mode": $billing,
+                   "bandwidth_limit": {
+                       "enabled": false,
+                       "rate": "unlimited"
+                   },
+                   "quota": {
+                       "enabled": true,
+                       "monthly_limit": $monthly
+                   },
+                   "remark": $remark,
+                   "created_at": $created
+               }' "$CONFIG_FILE" > "$tmp_file"; then
+                config_written=true
+            fi
         fi
 
-        local port_config="{
-            \"name\": \"端口$port\",
-            \"enabled\": true,
-            \"billing_mode\": \"$billing_mode\",
-            \"bandwidth_limit\": {
-                \"enabled\": false,
-                \"rate\": \"unlimited\"
-            },
-            \"quota\": $quota_config,
-            \"remark\": \"$remark\",
-            \"created_at\": \"$(get_beijing_time -Iseconds)\"
-        }"
+        if [ "$config_written" != "true" ]; then
+            rm -f "$tmp_file"
+            echo -e "${RED}端口 $port 配置写入失败，已跳过添加规则${NC}"
+            continue
+        fi
+        mv "$tmp_file" "$CONFIG_FILE"
 
-        update_config ".ports.\"$port\" = $port_config"
         add_nftables_rules "$port"
         update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
 
@@ -3759,6 +3792,13 @@ import_config() {
         import_config
         return
     fi
+    if ! jq empty "$extracted_config/config.json" >/dev/null 2>&1; then
+        echo -e "${RED}错误：配置包中的 config.json 不是有效 JSON${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        import_config
+        return
+    fi
 
     # 显示端口流量狗配置包信息
     echo -e "${GREEN}配置包验证通过${NC}"
@@ -3837,6 +3877,8 @@ import_config() {
                 apply_tc_limit "$port" "$tc_limit"
             fi
         fi
+        setup_port_auto_reset_cron "$port"
+        update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
     done
 
     echo "正在更新通知模块..."
@@ -4209,9 +4251,15 @@ telegram_switch_api_route_fallback() {
             fi
 
             local tmp_file=$(mktemp)
-            jq --arg base "$input_custom" \
+            if jq --arg base "$input_custom" \
                '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
-               "$CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$CONFIG_FILE"
+               "$CONFIG_FILE" > "$tmp_file"; then
+                mv "$tmp_file" "$CONFIG_FILE"
+            else
+                rm -f "$tmp_file"
+                echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
+                return 1
+            fi
 
             echo -e "${GREEN}已切换到自定义线路${NC}"
             echo "当前地址: $input_custom"

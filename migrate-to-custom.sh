@@ -41,7 +41,7 @@ echo "目标仓库: ${REPO}"
 echo "目标分支: ${BRANCH}"
 echo
 
-echo "[1/4] 备份旧配置与通知模块..."
+echo "[1/5] 备份旧配置与通知模块..."
 mkdir -p "${BACKUP_DIR}"
 
 if [ -d "${CONFIG_DIR}" ]; then
@@ -62,7 +62,7 @@ if [ -f "${DOG_PATH}" ]; then
 fi
 
 echo
-echo "[2/4] 下载并覆盖主脚本..."
+echo "[2/5] 下载并覆盖主脚本..."
 tmp_main="$(mktemp)"
 download_to "${SCRIPT_URL}" "${tmp_main}"
 install -m 755 "${tmp_main}" "${INSTALLED_SCRIPT_PATH}"
@@ -70,7 +70,7 @@ rm -f "${tmp_main}"
 echo "已更新: ${INSTALLED_SCRIPT_PATH}"
 
 echo
-echo "[3/4] 下载并覆盖通知模块..."
+echo "[3/5] 下载并覆盖通知模块..."
 mkdir -p "${NOTIFICATIONS_DIR}"
 tmp_tg="$(mktemp)"
 tmp_wc="$(mktemp)"
@@ -92,11 +92,13 @@ chmod +x "${DOG_PATH}"
 echo "已更新: ${DOG_PATH}"
 
 echo
-echo "[5/5] 强制同步通知模块并刷新通知定时任务..."
+echo "[5/5] 强制同步通知模块、刷新定时任务并修复流量规则..."
 bash "${INSTALLED_SCRIPT_PATH}" --sync-notification-modules >/dev/null 2>&1 || true
 bash "${INSTALLED_SCRIPT_PATH}" --refresh-notification-cron >/dev/null 2>&1 || true
+bash "${INSTALLED_SCRIPT_PATH}" --repair-traffic-rules >/dev/null 2>&1 || true
 echo "已执行: --sync-notification-modules"
 echo "已执行: --refresh-notification-cron"
+echo "已执行: --repair-traffic-rules"
 
 echo
 echo "迁移完成。"
