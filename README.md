@@ -249,14 +249,23 @@ sudo tc filter show dev "${IFACE}"
 sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "cron clean"
 ```
 
-## 文件路径
+## VPS 安装后的绝对路径
 
-- `PORT_TRAFFIC_DOG_CUSTOM.md`: <https://github.com/duya07/port-traffic-dog/blob/main/PORT_TRAFFIC_DOG_CUSTOM.md>
-- `alpine-port-traffic-dog-preinstall.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/alpine-port-traffic-dog-preinstall.sh>
-- `migrate-to-custom.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/migrate-to-custom.sh>
-- `port-traffic-dog.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/port-traffic-dog.sh>
-- `telegram.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/telegram.sh>
-- `wecom.sh`: <https://github.com/duya07/port-traffic-dog/blob/main/wecom.sh>
+```text
+/usr/local/bin/port-traffic-dog.sh              # 主脚本
+/usr/local/bin/dog                              # 快捷命令
+/etc/port-traffic-dog/config.json               # 主配置文件
+/etc/port-traffic-dog/traffic_data.json         # 计数器灾备数据
+/etc/port-traffic-dog/traffic_stats.json        # 自然日快照统计
+/etc/port-traffic-dog/reset_history.log         # 流量重置历史
+/etc/port-traffic-dog/logs/traffic.log          # 运行日志
+/etc/port-traffic-dog/logs/notification.log     # 通知日志
+/etc/port-traffic-dog/notifications/telegram.sh # Telegram 通知模块
+/etc/port-traffic-dog/notifications/wecom.sh    # 企业微信通知模块
+/etc/port-traffic-dog-migration-backup/         # 迁移脚本备份目录
+```
+
+`migrate-to-custom.sh` 和 `alpine-port-traffic-dog-preinstall.sh` 是安装/迁移时临时下载执行的辅助脚本，不会默认常驻到固定路径；如果在 `/root` 下下载，路径通常分别是 `/root/migrate-to-custom.sh` 和 `/root/alpine-port-traffic-dog-preinstall.sh`。
 
 ## 注意事项
 
