@@ -1048,7 +1048,7 @@ remove_nftables_counter_rules() {
                 print chain " " handle
                 exit
             }
-        ')
+        ' || true)
 
         if [ -z "$match_line" ]; then
             break
@@ -3799,6 +3799,7 @@ import_config() {
     local current_ports=($(get_active_ports 2>/dev/null || true))
     for port in "${current_ports[@]}"; do
         remove_nftables_rules "$port" 2>/dev/null || true
+        remove_nftables_quota "$port" 2>/dev/null || true
         remove_tc_limit "$port" 2>/dev/null || true
     done
 
@@ -4416,10 +4417,20 @@ setup_port_auto_reset_cron() {
     local temp_cron=$(mktemp)
 
     # 保留现有任务，移除该端口的旧任务
-    crontab -l 2>/dev/null | \
-        grep -v "端口流量狗自动重置端口$port" | \
-        grep -v "port-traffic-dog.*--reset-port $port" | \
-        grep -v "port-traffic-dog.*--check-reset-port $port" > "$temp_cron" || true
+    crontab -l 2>/dev/null | awk -v port="$port" '
+        {
+            for (i = 1; i < NF; i++) {
+                if (($i == "--reset-port" || $i == "--check-reset-port") && $(i + 1) == port) {
+                    next
+                }
+            }
+            marker = "# 端口流量狗自动重置端口" port
+            if (length($0) >= length(marker) && substr($0, length($0) - length(marker) + 1) == marker) {
+                next
+            }
+            print
+        }
+    ' > "$temp_cron" || true
 
     if port_has_auto_reset_policy "$port"; then
         ensure_port_next_reset_date "$port" >/dev/null 2>&1 || true
@@ -4434,10 +4445,20 @@ remove_port_auto_reset_cron() {
     local port="$1"
     local temp_cron=$(mktemp)
 
-    crontab -l 2>/dev/null | \
-        grep -v "端口流量狗自动重置端口$port" | \
-        grep -v "port-traffic-dog.*--reset-port $port" | \
-        grep -v "port-traffic-dog.*--check-reset-port $port" > "$temp_cron" || true
+    crontab -l 2>/dev/null | awk -v port="$port" '
+        {
+            for (i = 1; i < NF; i++) {
+                if (($i == "--reset-port" || $i == "--check-reset-port") && $(i + 1) == port) {
+                    next
+                }
+            }
+            marker = "# 端口流量狗自动重置端口" port
+            if (length($0) >= length(marker) && substr($0, length($0) - length(marker) + 1) == marker) {
+                next
+            }
+            print
+        }
+    ' > "$temp_cron" || true
 
     crontab "$temp_cron"
     rm -f "$temp_cron"
