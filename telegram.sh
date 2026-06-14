@@ -178,7 +178,16 @@ send_telegram_message() {
             migrated_chat_id=$(echo "$curl_output" | jq -r '.parameters.migrate_to_chat_id // empty' 2>/dev/null || true)
             if [ -n "$migrated_chat_id" ]; then
                 chat_id="$migrated_chat_id"
-                update_config ".notifications.telegram.chat_id = \"$migrated_chat_id\""
+                local tmp_file
+                tmp_file=$(mktemp)
+                if jq --arg chat_id "$migrated_chat_id" \
+                    '.notifications.telegram.chat_id = $chat_id' \
+                    "$CONFIG_FILE" > "$tmp_file"; then
+                    mv "$tmp_file" "$CONFIG_FILE"
+                else
+                    rm -f "$tmp_file"
+                    log_notification "Telegram群升级chat_id写入配置失败: ${migrated_chat_id}"
+                fi
                 log_notification "Telegram群已升级为supergroup，已自动更新chat_id为: ${migrated_chat_id}，正在重试"
                 migrated_once=true
                 continue
@@ -390,11 +399,23 @@ telegram_configure_bot() {
     fi
 
     # 原子性配置更新：确保配置完整性
-    update_config ".notifications.telegram.bot_token = \"$bot_token\" |
-        .notifications.telegram.chat_id = \"$chat_id\" |
-        .notifications.telegram.server_name = \"$server_name\" |
+    local tmp_file
+    tmp_file=$(mktemp)
+    if jq --arg bot_token "$bot_token" \
+       --arg chat_id "$chat_id" \
+       --arg server_name "$server_name" \
+       '.notifications.telegram.bot_token = $bot_token |
+        .notifications.telegram.chat_id = $chat_id |
+        .notifications.telegram.server_name = $server_name |
         .notifications.telegram.enabled = true |
-        .notifications.telegram.status_notifications.enabled = true"
+        .notifications.telegram.status_notifications.enabled = true' \
+       "$CONFIG_FILE" > "$tmp_file"; then
+        mv "$tmp_file" "$CONFIG_FILE"
+    else
+        rm -f "$tmp_file"
+        echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
+        return 1
+    fi
 
     echo -e "${GREEN}基本配置保存成功！${NC}"
     echo
@@ -494,9 +515,15 @@ telegram_switch_api_route() {
             fi
 
             local tmp_file=$(mktemp)
-            jq --arg base "$normalized_custom" \
+            if jq --arg base "$normalized_custom" \
                '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
-               "$CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$CONFIG_FILE"
+               "$CONFIG_FILE" > "$tmp_file"; then
+                mv "$tmp_file" "$CONFIG_FILE"
+            else
+                rm -f "$tmp_file"
+                echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
+                return 1
+            fi
 
             echo -e "${GREEN}已切换到自定义线路${NC}"
             echo "当前地址: $normalized_custom"
