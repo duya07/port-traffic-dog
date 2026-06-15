@@ -249,17 +249,35 @@ sudo tc filter show dev "${IFACE}"
 sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "cron clean"
 ```
 
-## 目录结构
+## VPS 安装后的系统文件
 
 ```text
-.
-├── PORT_TRAFFIC_DOG_CUSTOM.md
-├── alpine-port-traffic-dog-preinstall.sh
-├── migrate-to-custom.sh
-├── port-traffic-dog.sh
-├── telegram.sh
-└── wecom.sh
+系统文件
+├── /usr/local/bin/
+│   ├── port-traffic-dog.sh              # 主脚本
+│   └── dog                              # 快捷启动命令
+│
+├── /etc/port-traffic-dog/               # 配置与数据目录
+│   ├── config.json                      # 主配置文件
+│   ├── traffic_data.json                # nftables 计数器灾备数据
+│   ├── traffic_stats.json               # 自然日快照统计
+│   ├── reset_history.log                # 流量重置历史
+│   ├── traffic_stats.lock/              # 快照写入锁目录，运行中临时出现
+│   ├── logs/
+│   │   ├── traffic.log                  # 运行日志
+│   │   └── notification.log             # 通知日志
+│   └── notifications/
+│       ├── telegram.sh                  # Telegram 通知模块
+│       └── wecom.sh                     # 企业微信通知模块
+│
+└── /etc/port-traffic-dog-migration-backup/
+    └── YYYYMMDD-HHMMSS/                 # 迁移脚本自动备份目录
+        ├── port-traffic-dog-config/     # 旧配置备份
+        ├── port-traffic-dog.sh.bak      # 旧主脚本备份
+        └── dog.bak                      # 旧快捷命令备份
 ```
+
+`migrate-to-custom.sh` 和 `alpine-port-traffic-dog-preinstall.sh` 是安装/迁移时临时下载执行的辅助脚本，不会默认常驻到固定系统路径；如果在 `/root` 下下载，路径通常分别是 `/root/migrate-to-custom.sh` 和 `/root/alpine-port-traffic-dog-preinstall.sh`。
 
 ## 注意事项
 
