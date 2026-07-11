@@ -65,16 +65,38 @@ wait "$second_pid"
 jq -e '.concurrency == {first: 1, second: 2}' "$CONFIG_FILE" >/dev/null
 
 update_config_file '
+    .global = {
+        billing_mode: "single",
+        data_retention_days: 30,
+        collection_interval: 60,
+        interface: "auto"
+    } |
     .ports = {
         "3265": {
             enabled: true,
             quota: {enabled: true, monthly_limit: "100GB", reset_day: 2}
+        },
+        "8123": {
+            enabled: true,
+            billing_mode: "double",
+            quota: {enabled: true, monthly_limit: "250GB", reset_day: 1}
         }
-    }
+    } |
+    .notifications.telegram.status_notifications.last_sent = null
 '
 [ "$(get_reset_policy_type 3265)" = "monthly" ]
 ensure_port_next_reset_date 3265 >/dev/null
-jq -e '.ports["3265"].quota.reset_day == 2 and .ports["3265"].quota.reset_policy.type == "monthly"' \
+ensure_port_next_reset_date 8123 >/dev/null
+jq -e '
+    .ports["3265"].quota.reset_day == 2 and
+    .ports["3265"].quota.reset_policy.type == "monthly" and
+    .ports["8123"].quota.reset_day == 1 and
+    .ports["8123"].quota.reset_policy.type == "monthly" and
+    .global.data_retention_days == 30 and
+    .global.collection_interval == 60 and
+    .global.interface == "auto" and
+    .notifications.telegram.status_notifications.last_sent == null
+' \
     "$CONFIG_FILE" >/dev/null
 
 readonly CRON_FILE="$TEST_DIR/crontab"
@@ -92,17 +114,42 @@ ensure_cron_service_running() {
     :
 }
 
+printf '%s\n' \
+    '55 23 * * * /usr/local/bin/port-traffic-dog.sh --send-snapshot >/dev/null 2>&1  # 端口流量狗快照通知' \
+    '0 0 * * * /usr/local/bin/port-traffic-dog.sh --create-snapshot daily >/dev/null 2>&1  # 每日0点创建日快照' \
+    '0 0 * * 1 /usr/local/bin/port-traffic-dog.sh --create-snapshot weekly >/dev/null 2>&1' \
+    '0 0 1 * * /usr/local/bin/port-traffic-dog.sh --create-snapshot monthly >/dev/null 2>&1' \
+    '0 1 * * * /bin/bash -c "find /etc/port-traffic-dog/data/snapshots -type f -delete"' \
+    '5 0 1 * * /usr/local/bin/port-traffic-dog.sh --reset-port 8123 >/dev/null 2>&1' \
+    '0 */12 * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
+    '17 * * * * /usr/local/bin/unrelated-job' \
+    > "$CRON_FILE"
+
+setup_port_auto_reset_cron 8123
+! grep -q -- '--reset-port 8123' "$CRON_FILE"
+[ "$(grep -c -- '--check-reset-port 8123' "$CRON_FILE")" -eq 1 ]
+grep -q -- '--send-snapshot' "$CRON_FILE"
+grep -q -- '--send-telegram-status' "$CRON_FILE"
+grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
+
 update_config_file '.ports = {}'
-setup_telegram_notification_cron
-! grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
+! grep -Eq -- '--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
+grep -q -- '--check-reset-port 8123' "$CRON_FILE"
+grep -q -- '--send-telegram-status' "$CRON_FILE"
+grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
+setup_telegram_notification_cron
+! grep -q -- '--send-telegram-status' "$CRON_FILE"
 
 update_config_file '.ports["2000"] = {enabled: true}'
 setup_telegram_notification_cron
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
-grep -q -- '--snapshot-traffic' "$CRON_FILE"
+setup_traffic_snapshot_cron
+[ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
+grep -q -- '--check-reset-port 8123' "$CRON_FILE"
+grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
 update_config_file '.ports = {}'
 setup_telegram_notification_cron
