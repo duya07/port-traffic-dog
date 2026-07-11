@@ -9,6 +9,23 @@ if [[ -z "${WECOM_MAX_RETRIES:-}" ]]; then
     readonly WECOM_MAX_TIMEOUT=15
 fi
 
+wecom_update_config_file() {
+    if declare -F update_config_file >/dev/null 2>&1; then
+        update_config_file "$@"
+        return
+    fi
+
+    local jq_filter="$1"
+    shift
+    local temp_file
+    temp_file=$(mktemp)
+    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$temp_file" && mv "$temp_file" "$CONFIG_FILE"; then
+        return 0
+    fi
+    rm -f "$temp_file"
+    return 1
+}
+
 wecom_is_enabled() {
     local enabled=$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE")
     [ "$enabled" = "true" ]
@@ -198,18 +215,12 @@ wecom_configure_webhook() {
     fi
 
     # 原子性配置更新：确保配置完整性
-    local tmp_file
-    tmp_file=$(mktemp)
-    if jq --arg webhook_url "$webhook_url" \
-       --arg server_name "$server_name" \
-       '.notifications.wecom.webhook_url = $webhook_url |
+    if ! wecom_update_config_file '.notifications.wecom.webhook_url = $webhook_url |
         .notifications.wecom.server_name = $server_name |
         .notifications.wecom.enabled = true |
         .notifications.wecom.status_notifications.enabled = true' \
-       "$CONFIG_FILE" > "$tmp_file"; then
-        mv "$tmp_file" "$CONFIG_FILE"
-    else
-        rm -f "$tmp_file"
+       --arg webhook_url "$webhook_url" \
+       --arg server_name "$server_name"; then
         echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
         return 1
     fi
