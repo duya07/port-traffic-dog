@@ -24,6 +24,8 @@
 12. 当前周期流量、配额进度和限额初始化沿用原脚本的 nftables counter 口径；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
 13. 通知和自然日快照 cron 只在存在监控端口时运行；删除最后一个端口后会自动清理任务，残留旧任务也会在下次触发时自行退出并移除。
 14. 配置写入使用原子替换和短时锁，避免自动重置、通知配置和带宽 class ID 同时更新时互相覆盖。
+15. 从旧快照版升级时会清理已不再支持的 `--send-snapshot`、`--create-snapshot` 和旧快照清理 cron，但保留原快照文件与配置备份。
+16. 菜单更新会先校验新脚本语法并修正安装权限；更新成功后重新加载已安装版本，避免界面继续运行旧代码。
 
 ## 下载方式说明
 
@@ -84,7 +86,7 @@ Alpine 预装脚本会补齐 `bash/nftables/iproute2/jq/gawk/bc/unzip/dcron/ca-c
 
 ## 3) 旧 VPS 迁移到定制版
 
-迁移脚本会先备份，再覆盖安装。
+迁移脚本会先备份配置、主脚本、快捷命令、root crontab 和现有 nftables 表，再完整下载并校验主脚本及两个通知模块；全部校验通过后才覆盖安装。
 
 直连:
 
@@ -108,7 +110,7 @@ sudo REPO="duya07/port-traffic-dog" BRANCH="main" ./migrate-to-custom.sh
 
 - `/etc/port-traffic-dog-migration-backup/20260530-230000/`
 
-迁移完成后会自动强制同步通知模块、刷新 Telegram / 企业微信状态通知定时任务，并显示当前脚本版本。迁移后建议再执行一次:
+迁移完成后会刷新 Telegram / 企业微信和自然日统计定时任务、修复旧流量规则、核对迁移前后端口清单，并自动执行自检。旧版 `/etc/port-traffic-dog/data/snapshots/` 文件会保留在原配置目录和迁移备份中，但新版不再继续生成旧日/周/月快照。也可以手动复查：
 
 ```bash
 sudo dog --self-check
@@ -278,7 +280,9 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
     └── YYYYMMDD-HHMMSS/                 # 迁移脚本自动备份目录
         ├── port-traffic-dog-config/     # 旧配置备份
         ├── port-traffic-dog.sh.bak      # 旧主脚本备份
-        └── dog.bak                      # 旧快捷命令备份
+        ├── dog.bak                      # 旧快捷命令备份
+        ├── root.crontab.bak             # 迁移前 root 定时任务
+        └── nftables-table.bak           # 迁移前 nftables 表（存在时）
 ```
 
 `migrate-to-custom.sh` 和 `alpine-port-traffic-dog-preinstall.sh` 是安装/迁移时临时下载执行的辅助脚本，不会默认常驻到固定系统路径；如果在 `/root` 下下载，路径通常分别是 `/root/migrate-to-custom.sh` 和 `/root/alpine-port-traffic-dog-preinstall.sh`。

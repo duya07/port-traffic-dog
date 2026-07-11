@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.8"
+readonly SCRIPT_VERSION="1.3.9"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -4375,8 +4375,8 @@ install_update_script() {
 
     if download_with_sources "$SCRIPT_URL" "$temp_file"; then
         if [ -s "$temp_file" ] && grep -q "端口流量狗" "$temp_file" 2>/dev/null && bash -n "$temp_file"; then
+            chmod 755 "$temp_file"
             mv "$temp_file" "$INSTALLED_SCRIPT_PATH"
-            chmod +x "$INSTALLED_SCRIPT_PATH"
 
             create_shortcut_command
 
@@ -4388,6 +4388,9 @@ install_update_script() {
             echo -e "${GREEN}依赖检查完成${NC}"
             echo -e "${GREEN}脚本更新完成${NC}"
             echo -e "${GREEN}通知模块已更新${NC}"
+            echo -e "${YELLOW}正在重新加载新版本...${NC}"
+            sleep 1
+            exec bash "$INSTALLED_SCRIPT_PATH"
         else
             echo -e "${RED} 下载文件验证失败或脚本语法无效，已保留当前版本${NC}"
             rm -f "$temp_file"
@@ -4414,7 +4417,7 @@ create_shortcut_command() {
 #!/bin/bash
 exec bash "$INSTALLED_SCRIPT_PATH" "\$@"
 EOF
-    chmod +x "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
+    chmod 755 "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
     echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
 }
 
@@ -4778,15 +4781,24 @@ refresh_notification_cron_from_config() {
     ensure_cron_service_running
 }
 
+filter_traffic_snapshot_cron_entries() {
+    awk '
+        /# port-traffic-dog traffic snapshot/ { next }
+        /port-traffic-dog.*--snapshot-traffic/ { next }
+        /port-traffic-dog.*--send-snapshot/ { next }
+        /port-traffic-dog.*--create-snapshot/ { next }
+        /\/etc\/port-traffic-dog\/data\/snapshots/ { next }
+        { print }
+    '
+}
+
 setup_traffic_snapshot_cron() {
     local script_path
     script_path=$(get_script_exec_path)
     local temp_cron
     temp_cron=$(mktemp)
 
-    crontab -l 2>/dev/null | \
-        grep -v "# port-traffic-dog traffic snapshot" | \
-        grep -v "port-traffic-dog.*--snapshot-traffic" > "$temp_cron" || true
+    crontab -l 2>/dev/null | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
 
     if has_active_ports; then
         echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
@@ -4800,9 +4812,7 @@ remove_traffic_snapshot_cron() {
     local temp_cron
     temp_cron=$(mktemp)
 
-    crontab -l 2>/dev/null | \
-        grep -v "# port-traffic-dog traffic snapshot" | \
-        grep -v "port-traffic-dog.*--snapshot-traffic" > "$temp_cron" || true
+    crontab -l 2>/dev/null | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
 
     crontab "$temp_cron"
     rm -f "$temp_cron"
