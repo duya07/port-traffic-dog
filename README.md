@@ -22,6 +22,8 @@
 10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
 11. 修正双向统计重复/缺失计数规则和重复配额规则导致的流量/限额偏多或规则异常问题，并提供 `dog --repair-traffic-rules` 修复已安装规则。
 12. 当前周期流量、配额进度和限额初始化沿用原脚本的 nftables counter 口径；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
+13. 通知和自然日快照 cron 只在存在监控端口时运行；删除最后一个端口后会自动清理任务，残留旧任务也会在下次触发时自行退出并移除。
+14. 配置写入使用原子替换和短时锁，避免自动重置、通知配置和带宽 class ID 同时更新时互相覆盖。
 
 ## 下载方式说明
 
@@ -125,7 +127,7 @@ sudo dog --uninstall
 
 - `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
-- `--refresh-notification-cron`: 根据当前配置重建通知定时任务，并尝试启动 `cron` / `crond`。
+- `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
 - `--repair-traffic-rules`: 检查并修复旧版本重复/缺失的流量计数规则和异常配额规则；重复计数规则会按重复倍数折算当前 counter，配额规则会按当前 counter 重建，避免重复 quota 规则导致限额倍增。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
@@ -160,8 +162,9 @@ sudo dog --uninstall
 - `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
 - `daily`: 按北京时间自然日保存每日入站/出站增量。
 - 主菜单端口总量、通知消息和配额进度读取当前 nftables counter；自然日快照文件只用于独立日统计，不参与主菜单总量叠加。
-- 每分钟会自动执行 `dog --snapshot-traffic`；如果 cron 停止很久，下一次快照会把这段时间的增量计入执行当天。
-- `traffic_data.json` 仍用于异常退出/规则恢复时保留 nftables counter，不等同于自然日统计文件。
+- 存在监控端口时，每分钟会自动执行 `dog --snapshot-traffic`；只有上一条快照在昨天 23:59、当前快照在今天 00:00 时，才会把边界增量补到昨天，避免把午夜后多分钟的流量错记到前一天。
+- 自然日统计依赖 cron 持续运行；若 cron 停止很久或跨日后很久才恢复，脚本会从恢复当天重新建立安全基线，不能把停机期间的流量精确拆回每一天。
+- `traffic_data.json` 仍用于异常退出/规则恢复时保留 nftables counter，不等同于自然日统计文件；恢复时只接受当前配置中仍存在的端口，删除端口或无有效灾备数据时会清除旧条目。
 - 首次生成 `traffic_stats.json` 时只建立当前 nftables counter 基线，不把升级前的历史 counter 直接计入当天，避免旧偏差继续污染新统计。
 - 重置端口前会先写入快照并记录重置历史，重置后只刷新该端口快照基线，不清空当天自然日统计，避免清零 counter 后下一次采样重复计算。
 - 从旧配置升级时，原来的 `quota.reset_day` 仍按“每月几号重置”继承；自然日统计文件会从升级后的第一次快照开始累计。
@@ -262,6 +265,7 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 │   ├── traffic_data.json                # nftables 计数器灾备数据
 │   ├── traffic_stats.json               # 自然日快照统计
 │   ├── reset_history.log                # 流量重置历史
+│   ├── config.lock/                     # 配置写入锁目录，运行中临时出现
 │   ├── traffic_stats.lock/              # 快照写入锁目录，运行中临时出现
 │   ├── logs/
 │   │   ├── traffic.log                  # 运行日志

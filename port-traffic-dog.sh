@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.7"
+readonly SCRIPT_VERSION="1.3.8"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -12,6 +12,7 @@ readonly LOG_FILE="$CONFIG_DIR/logs/traffic.log"
 readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
 readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"
 readonly TRAFFIC_STATS_LOCK_DIR="$CONFIG_DIR/traffic_stats.lock"
+readonly CONFIG_LOCK_DIR="$CONFIG_DIR/config.lock"
 
 readonly RED='\033[0;31m'
 readonly YELLOW='\033[0;33m'
@@ -75,6 +76,7 @@ install_missing_tools() {
             "jq") $pkg_cmd install -y jq ;;
             "awk") $pkg_cmd install -y gawk ;;
             "bc") $pkg_cmd install -y bc ;;
+            "curl") $pkg_cmd install -y curl ;;
             "cron")
                 $pkg_cmd install -y cron
                 systemctl enable cron 2>/dev/null || true
@@ -90,7 +92,7 @@ install_missing_tools() {
 check_dependencies() {
     local silent_mode=${1:-false}
     local missing_tools=()
-    local required_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron")
+    local required_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl")
 
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
@@ -275,8 +277,87 @@ get_beijing_time() {
 
 update_config() {
     local jq_expression="$1"
-    jq "$jq_expression" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
-    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    update_config_file "$jq_expression"
+}
+
+acquire_directory_lock() {
+    local lock_dir="$1"
+    mkdir -p "$CONFIG_DIR"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            if printf '%s %s\n' "${BASHPID:-$$}" "$(date +%s)" > "$lock_dir/owner"; then
+                return 0
+            fi
+            rm -f "$lock_dir/owner" 2>/dev/null || true
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
+
+        local owner_pid=""
+        local owner_time=0
+        local stale_lock=false
+        if read -r owner_pid owner_time 2>/dev/null < "$lock_dir/owner"; then
+            local now
+            now=$(date +%s)
+            if ! [[ "$owner_pid" =~ ^[0-9]+$ ]] || ! [[ "$owner_time" =~ ^[0-9]+$ ]] || \
+               ! kill -0 "$owner_pid" 2>/dev/null || \
+               [ "$now" -lt "$owner_time" ] || [ $((now - owner_time)) -gt 120 ]; then
+                stale_lock=true
+            fi
+        else
+            # 新锁创建后会有极短的 owner 写入窗口，先等待再判断残留锁。
+            sleep 1
+            if [ ! -s "$lock_dir/owner" ]; then
+                stale_lock=true
+            fi
+        fi
+        if [ "$stale_lock" = "true" ]; then
+            rm -f "$lock_dir/owner" 2>/dev/null || true
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+release_directory_lock() {
+    local lock_dir="$1"
+    rm -f "$lock_dir/owner" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+
+acquire_config_lock() {
+    acquire_directory_lock "$CONFIG_LOCK_DIR"
+}
+
+release_config_lock() {
+    release_directory_lock "$CONFIG_LOCK_DIR"
+}
+
+update_config_file() {
+    local jq_filter="$1"
+    shift
+
+    acquire_config_lock || return 1
+    local temp_file
+    if ! temp_file=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX"); then
+        release_config_lock
+        return 1
+    fi
+    local result=1
+    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$temp_file"; then
+        if mv "$temp_file" "$CONFIG_FILE"; then
+            result=0
+        else
+            rm -f "$temp_file"
+        fi
+    else
+        rm -f "$temp_file"
+    fi
+    release_config_lock
+    return "$result"
 }
 
 show_port_list() {
@@ -422,13 +503,14 @@ get_nftables_counter_data() {
 
 
 save_traffic_data() {
-    local temp_file=$(mktemp)
     local active_ports=($(get_active_ports 2>/dev/null || true))
 
     if [ ${#active_ports[@]} -eq 0 ]; then
+        rm -f "$TRAFFIC_DATA_FILE"
         return 0
     fi
 
+    local temp_file=$(mktemp)
     echo '{}' > "$temp_file"
 
     for port in "${active_ports[@]}"; do
@@ -446,7 +528,7 @@ save_traffic_data() {
     if [ -s "$temp_file" ] && [ "$(jq 'keys | length' "$temp_file" 2>/dev/null)" != "0" ]; then
         mv "$temp_file" "$TRAFFIC_DATA_FILE"
     else
-        rm -f "$temp_file"
+        rm -f "$temp_file" "$TRAFFIC_DATA_FILE"
     fi
 }
 
@@ -503,6 +585,9 @@ restore_traffic_data_from_backup() {
     local backup_ports=($(jq -r 'keys[]' "$TRAFFIC_DATA_FILE" 2>/dev/null || true))
 
     for port in "${backup_ports[@]}"; do
+        if ! jq -e --arg port "$port" '.ports[$port] != null' "$CONFIG_FILE" >/dev/null 2>&1; then
+            continue
+        fi
         local backup_input=$(jq -r ".\"$port\".input // 0" "$TRAFFIC_DATA_FILE" 2>/dev/null || echo "0")
         local backup_output=$(jq -r ".\"$port\".output // 0" "$TRAFFIC_DATA_FILE" 2>/dev/null || echo "0")
 
@@ -580,20 +665,43 @@ calculate_total_traffic() {
     esac
 }
 
-acquire_traffic_stats_lock() {
-    mkdir -p "$CONFIG_DIR"
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        if mkdir "$TRAFFIC_STATS_LOCK_DIR" 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
+extract_hour_minute_from_iso() {
+    local time_value="$1"
+    if [[ "$time_value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T([0-9]{2}):([0-9]{2}) ]]; then
+        echo "$((10#${BASH_REMATCH[1]})) $((10#${BASH_REMATCH[2]}))"
+        return 0
+    fi
     return 1
 }
 
+should_carry_cross_day_snapshot_delta() {
+    local state_date="$1"
+    local state_time="$2"
+    local snapshot_date="$3"
+    local snapshot_time="$4"
+
+    is_valid_date "$state_date" || return 1
+    [ "$(add_days_to_date "$snapshot_date" -1 2>/dev/null || true)" = "$state_date" ] || return 1
+    [[ "$state_time" == "$state_date"T* ]] || return 1
+    [[ "$snapshot_time" == "$snapshot_date"T* ]] || return 1
+
+    local last_hm=()
+    local current_hm=()
+    read -r -a last_hm < <(extract_hour_minute_from_iso "$state_time") || return 1
+    read -r -a current_hm < <(extract_hour_minute_from_iso "$snapshot_time") || return 1
+
+    [ "${last_hm[0]}" -eq 23 ] || return 1
+    [ "${last_hm[1]}" -eq 59 ] || return 1
+    [ "${current_hm[0]}" -eq 0 ] || return 1
+    [ "${current_hm[1]}" -eq 0 ] || return 1
+}
+
+acquire_traffic_stats_lock() {
+    acquire_directory_lock "$TRAFFIC_STATS_LOCK_DIR"
+}
+
 release_traffic_stats_lock() {
-    rmdir "$TRAFFIC_STATS_LOCK_DIR" 2>/dev/null || true
+    release_directory_lock "$TRAFFIC_STATS_LOCK_DIR"
 }
 
 ensure_traffic_stats_file() {
@@ -642,6 +750,8 @@ record_traffic_snapshot() {
 
         local state_date
         state_date=$(jq -r --arg port "$port" '.state[$port].date // empty' "$TRAFFIC_STATS_FILE" 2>/dev/null || true)
+        local state_time
+        state_time=$(jq -r --arg port "$port" '.state[$port].time // .last_snapshot[$port].time // empty' "$TRAFFIC_STATS_FILE" 2>/dev/null || true)
         local has_state=false
         if [ "$state_date" = "$snapshot_date" ]; then
             has_state=true
@@ -670,15 +780,39 @@ record_traffic_snapshot() {
             fi
         done
 
+        local rollover_date=""
+        local rollover_input=0
+        local rollover_output=0
+
         if [ "$has_state" != "true" ]; then
+            if should_carry_cross_day_snapshot_delta "$state_date" "$state_time" "$snapshot_date" "$snapshot_time"; then
+                local previous_input
+                previous_input=$(jq -r --arg port "$port" --arg date "$state_date" '.daily[$port][$date].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+                local previous_output
+                previous_output=$(jq -r --arg port "$port" --arg date "$state_date" '.daily[$port][$date].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
+                [[ "$previous_input" =~ ^[0-9]+$ ]] || previous_input=0
+                [[ "$previous_output" =~ ^[0-9]+$ ]] || previous_output=0
+
+                local carry_input=0
+                local carry_output=0
+                if [ "$current_input" -ge "$last_input" ]; then
+                    carry_input=$((current_input - last_input))
+                fi
+                if [ "$current_output" -ge "$last_output" ]; then
+                    carry_output=$((current_output - last_output))
+                fi
+                if [ "$carry_input" -gt 0 ] || [ "$carry_output" -gt 0 ]; then
+                    rollover_date="$state_date"
+                    rollover_input=$((previous_input + carry_input))
+                    rollover_output=$((previous_output + carry_output))
+                fi
+            fi
             input_base="$current_input"
             output_base="$current_output"
-            input_offset=0
-            output_offset=0
+            input_offset="$existing_input"
+            output_offset="$existing_output"
             last_input="$current_input"
             last_output="$current_output"
-            existing_input=0
-            existing_output=0
         elif [ "$current_input" -lt "$last_input" ]; then
             input_offset="$existing_input"
             input_base=0
@@ -708,6 +842,7 @@ record_traffic_snapshot() {
             --arg port "$port" \
             --arg date "$snapshot_date" \
             --arg time "$snapshot_time" \
+            --arg rollover_date "$rollover_date" \
             --argjson cin "$current_input" \
             --argjson cout "$current_output" \
             --argjson ibase "$input_base" \
@@ -716,11 +851,23 @@ record_traffic_snapshot() {
             --argjson ooffset "$output_offset" \
             --argjson tin "$total_input" \
             --argjson tout "$total_output" \
+            --argjson rin "$rollover_input" \
+            --argjson rout "$rollover_output" \
             '
             .last_snapshot = (.last_snapshot // {}) |
             .state = (.state // {}) |
             .daily = (.daily // {}) |
             .daily[$port] = (.daily[$port] // {}) |
+            if $rollover_date != "" then
+                .daily[$port][$rollover_date] = ((.daily[$port][$rollover_date] // {}) + {
+                    "input": $rin,
+                    "output": $rout,
+                    "time": $time,
+                    "closed_by_next_day_snapshot": true
+                })
+            else
+                .
+            end |
             .daily[$port][$date] = {
                 "input": $tin,
                 "output": $tout,
@@ -829,6 +976,43 @@ update_traffic_snapshot_baseline() {
     fi
 
     release_traffic_stats_lock
+}
+
+remove_port_traffic_state() {
+    local port="$1"
+
+    if [ -f "$TRAFFIC_STATS_FILE" ] && jq empty "$TRAFFIC_STATS_FILE" >/dev/null 2>&1; then
+        acquire_traffic_stats_lock || return 1
+        local stats_temp
+        stats_temp=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX")
+        if jq --arg port "$port" '
+            del(.last_snapshot[$port]) |
+            del(.state[$port]) |
+            del(.daily[$port])
+        ' "$TRAFFIC_STATS_FILE" > "$stats_temp"; then
+            mv "$stats_temp" "$TRAFFIC_STATS_FILE"
+        else
+            rm -f "$stats_temp"
+            release_traffic_stats_lock
+            return 1
+        fi
+        release_traffic_stats_lock
+    fi
+
+    if [ -f "$TRAFFIC_DATA_FILE" ] && jq empty "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
+        local backup_temp
+        backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX")
+        if jq --arg port "$port" 'del(.[$port])' "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
+            if [ "$(jq 'keys | length' "$backup_temp" 2>/dev/null || echo 0)" -gt 0 ]; then
+                mv "$backup_temp" "$TRAFFIC_DATA_FILE"
+            else
+                rm -f "$backup_temp" "$TRAFFIC_DATA_FILE"
+            fi
+        else
+            rm -f "$backup_temp"
+            return 1
+        fi
+    fi
 }
 
 get_port_cycle_start_date() {
@@ -1209,24 +1393,29 @@ get_port_status_label() {
     if [ "$quota_enabled" = "true" ]; then
         if [ "$monthly_limit" != "unlimited" ]; then
             local current_usage=$(get_port_monthly_usage "$port")
-            local limit_bytes=$(parse_size_to_bytes "$monthly_limit")
-            local usage_percent=$((current_usage * 100 / limit_bytes))
-
-            local quota_display="$monthly_limit"
-            if [ "$billing_mode" = "double" ]; then
-                status_tags+=("[双向${quota_display}]")
+            local limit_bytes
+            limit_bytes=$(parse_size_to_bytes "$monthly_limit" 2>/dev/null || echo 0)
+            if ! [[ "$limit_bytes" =~ ^[0-9]+$ ]] || [ "$limit_bytes" -le 0 ]; then
+                status_tags+=("[配额配置异常:${monthly_limit}]")
             else
-                status_tags+=("[单向${quota_display}]")
-            fi
-            
-            local next_reset_label
-            next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
-            if [ -n "$next_reset_label" ]; then
-                status_tags+=("[$next_reset_label]")
-            fi
+                local usage_percent=$((current_usage * 100 / limit_bytes))
 
-            if [ $usage_percent -ge 100 ]; then
-                status_tags+=("[已超限]")
+                local quota_display="$monthly_limit"
+                if [ "$billing_mode" = "double" ]; then
+                    status_tags+=("[双向${quota_display}]")
+                else
+                    status_tags+=("[单向${quota_display}]")
+                fi
+
+                local next_reset_label
+                next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
+                if [ -n "$next_reset_label" ]; then
+                    status_tags+=("[$next_reset_label]")
+                fi
+
+                if [ $usage_percent -ge 100 ]; then
+                    status_tags+=("[已超限]")
+                fi
             fi
         else
             if [ "$billing_mode" = "double" ]; then
@@ -1448,14 +1637,14 @@ apply_reset_policy_to_port() {
     local reset_now
     reset_now=$(printf '%s' "$policy_json" | jq -r '.reset_now // false')
 
-    jq --arg port "$port" --argjson policy "$policy_json" '
+    update_config_file '
         .ports[$port].quota.reset_policy = ($policy | del(.reset_now)) |
         if $policy.type == "monthly" then
             .ports[$port].quota.reset_day = $policy.day
         else
             del(.ports[$port].quota.reset_day)
         end
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    ' --arg port "$port" --argjson policy "$policy_json"
 
     if [ "$policy_type" = "fixed_date" ] && [ "$reset_now" = "true" ]; then
         auto_reset_port "$port"
@@ -1471,9 +1660,9 @@ apply_reset_policy_to_port() {
         local next_reset_date
         next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
         if [ -n "$next_reset_date" ]; then
-            jq --arg port "$port" --arg next "$next_reset_date" '
+            update_config_file '
                 .ports[$port].quota.reset_policy.next_reset_date = $next
-            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            ' --arg port "$port" --arg next "$next_reset_date"
         fi
     fi
 }
@@ -1496,6 +1685,13 @@ parse_size_to_bytes() {
 
 get_active_ports() {
     jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | sort -n
+}
+
+has_active_ports() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    [ ${#active_ports[@]} -gt 0 ]
 }
 
 is_port_range() {
@@ -1564,13 +1760,116 @@ convert_bandwidth_to_tc() {
 
 generate_tc_class_id() {
     local port=$1
+
+    local stored_class_id
+    stored_class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    local stored_minor
+    if stored_minor=$(tc_class_id_minor "$stored_class_id" 2>/dev/null); then
+        if ! tc_minor_in_use "$port" "$stored_minor"; then
+            echo "$stored_class_id"
+            return
+        fi
+    fi
+
+    local minor
+    minor=$(generate_tc_minor_base "$port")
+    local attempts=0
+    while [ "$attempts" -lt 65534 ]; do
+        if ! tc_minor_in_use "$port" "$minor"; then
+            local class_id="1:$(printf '%x' "$minor")"
+            if save_tc_class_id "$port" "$class_id"; then
+                echo "$class_id"
+                return
+            fi
+            return 1
+        fi
+
+        minor=$((minor + 1))
+        if [ "$minor" -gt 65535 ]; then
+            minor=2
+        fi
+        attempts=$((attempts + 1))
+    done
+
+    return 1
+}
+
+tc_class_id_minor() {
+    local class_id="$1"
+    [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]] || return 1
+    local minor=$((16#${BASH_REMATCH[1]}))
+    [ "$minor" -ge 2 ] && [ "$minor" -le 65535 ] || return 1
+    echo "$minor"
+}
+
+tc_minor_in_use() {
+    local current_port="$1"
+    local target_minor="$2"
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local other
+    for other in "${active_ports[@]}"; do
+        [ "$other" = "$current_port" ] && continue
+        local class_id
+        class_id=$(jq -r --arg port "$other" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        local other_minor
+        if other_minor=$(tc_class_id_minor "$class_id" 2>/dev/null); then
+            if [ "$other_minor" -eq "$target_minor" ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+save_tc_class_id() {
+    local port="$1"
+    local class_id="$2"
+
+    jq -e --arg port "$port" '.ports[$port] // empty' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
+    update_config_file '
+        if ([.ports | to_entries[] |
+            select(.key != $port and (.value.bandwidth_limit.class_id // "") == $class_id)] | length) == 0 then
+            .ports[$port].bandwidth_limit.class_id = $class_id
+        else
+            error("tc class id collision")
+        end
+    ' \
+        --arg port "$port" \
+        --arg class_id "$class_id"
+}
+
+generate_legacy_tc_class_id() {
+    local port=$1
+    local minor
     if is_port_range "$port"; then
-        # 端口段使用0x2000+标记避免与单端口冲突
-        local mark_id=$(generate_port_range_mark "$port")
-        echo "1:$(printf '%x' $((0x2000 + mark_id)))"
+        local mark_id
+        mark_id=$(generate_port_range_mark "$port")
+        minor=$((0x2000 + mark_id))
     else
-        # 单端口使用0x1000+端口号
-        echo "1:$(printf '%x' $((0x1000 + port)))"
+        minor=$((0x1000 + port))
+    fi
+    echo "1:$(printf '%x' "$minor")"
+}
+
+generate_tc_minor_base() {
+    local port=$1
+    local preferred_minor
+    local fallback_minor
+    if is_port_range "$port"; then
+        local mark_id
+        mark_id=$(generate_port_range_mark "$port")
+        preferred_minor=$((0x2000 + mark_id))
+        fallback_minor=$((0x8000 + (mark_id % 0x7fff)))
+    else
+        preferred_minor=$((0x1000 + port))
+        fallback_minor=$((2 + (((port * 1103515245 + 12345) & 0x7fffffff) % 65534)))
+    fi
+
+    if [ "$preferred_minor" -ge 2 ] && [ "$preferred_minor" -le 65535 ]; then
+        echo "$preferred_minor"
+    else
+        echo "$fallback_minor"
     fi
 }
 
@@ -1986,11 +2285,11 @@ ensure_port_next_reset_date() {
             if ! [[ "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -lt 1 ] || [ "$reset_day" -gt 31 ]; then
                 reset_day=1
             fi
-            jq --arg port "$port" --argjson day "$reset_day" '
+            update_config_file '
                 .ports[$port].quota.reset_policy.type = "monthly" |
                 .ports[$port].quota.reset_policy.day = $day |
                 .ports[$port].quota.reset_day = $day
-            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            ' --arg port "$port" --argjson day "$reset_day"
         fi
     fi
 
@@ -2006,9 +2305,9 @@ ensure_port_next_reset_date() {
         fi
         next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
         [ -n "$next_reset_date" ] || return 1
-        jq --arg port "$port" --arg next "$next_reset_date" '
+        update_config_file '
             .ports[$port].quota.reset_policy.next_reset_date = $next
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        ' --arg port "$port" --arg next "$next_reset_date"
     fi
 
     echo "$next_reset_date"
@@ -2021,10 +2320,10 @@ advance_port_next_reset_date() {
     policy_type=$(get_reset_policy_type "$port")
 
     if [ "$policy_type" = "fixed_date" ]; then
-        jq --arg port "$port" '
+        update_config_file '
             .ports[$port].quota.reset_policy.type = "none" |
             del(.ports[$port].quota.reset_policy.next_reset_date)
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        ' --arg port "$port"
         setup_port_auto_reset_cron "$port"
         return
     fi
@@ -2035,10 +2334,10 @@ advance_port_next_reset_date() {
     next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
     [ -n "$next_reset_date" ] || return 1
 
-    jq --arg port "$port" --arg last "$after_date" --arg next "$next_reset_date" '
+    update_config_file '
         .ports[$port].quota.reset_policy.last_reset_date = $last |
         .ports[$port].quota.reset_policy.next_reset_date = $next
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    ' --arg port "$port" --arg last "$after_date" --arg next "$next_reset_date"
 }
 
 get_port_next_reset_label() {
@@ -2361,7 +2660,11 @@ add_port_monitoring() {
     read -p "请输入要监控的端口号（多端口使用逗号,分隔,端口段使用-分隔）: " port_input
 
     local PORTS=()
-    parse_port_range_input "$port_input" PORTS
+    if ! parse_port_range_input "$port_input" PORTS; then
+        sleep 2
+        add_port_monitoring
+        return
+    fi
     local valid_ports=()
 
     for port in "${PORTS[@]}"; do
@@ -2383,7 +2686,7 @@ add_port_monitoring() {
     echo
     echo -e "${GREEN}说明:${NC}"
     echo "1. 双向流量统计"
-    echo "   总流量 = in*2 + out*2"
+    echo "   总流量 = in + out"
     echo
     echo "2. 单向流量统计"
     echo "   仅统计出站流量，总流量 = out"
@@ -2401,7 +2704,8 @@ add_port_monitoring() {
     esac
 
     echo
-    local port_list=$(IFS=','; echo "${valid_ports[*]}")
+    local port_list
+    port_list=$(IFS=','; echo "${valid_ports[*]}")
     while true; do
         echo "为端口 $port_list 设置流量配额（总量控制）:"
         echo "请输入配额值（0为无限制）（要带单位MB/GB/T）:"
@@ -2514,17 +2818,9 @@ add_port_monitoring() {
 
         local created_at
         created_at=$(get_beijing_time -Iseconds)
-        local tmp_file
-        tmp_file=$(mktemp)
         local config_written=false
         if [ "$monthly_limit" != "unlimited" ]; then
-            if jq --arg port "$port" \
-               --arg name "端口$port" \
-               --arg billing "$billing_mode" \
-               --arg monthly "$monthly_limit" \
-               --arg remark "$remark" \
-               --arg created "$created_at" \
-               '.ports[$port] = {
+            if update_config_file '.ports[$port] = {
                    "name": $name,
                    "enabled": true,
                    "billing_mode": $billing,
@@ -2539,17 +2835,17 @@ add_port_monitoring() {
                    },
                    "remark": $remark,
                    "created_at": $created
-               }' "$CONFIG_FILE" > "$tmp_file"; then
-                config_written=true
-            fi
-        else
-            if jq --arg port "$port" \
+               }' \
+               --arg port "$port" \
                --arg name "端口$port" \
                --arg billing "$billing_mode" \
                --arg monthly "$monthly_limit" \
                --arg remark "$remark" \
-               --arg created "$created_at" \
-               '.ports[$port] = {
+               --arg created "$created_at"; then
+                config_written=true
+            fi
+        else
+            if update_config_file '.ports[$port] = {
                    "name": $name,
                    "enabled": true,
                    "billing_mode": $billing,
@@ -2563,17 +2859,21 @@ add_port_monitoring() {
                    },
                    "remark": $remark,
                    "created_at": $created
-               }' "$CONFIG_FILE" > "$tmp_file"; then
+               }' \
+               --arg port "$port" \
+               --arg name "端口$port" \
+               --arg billing "$billing_mode" \
+               --arg monthly "$monthly_limit" \
+               --arg remark "$remark" \
+               --arg created "$created_at"; then
                 config_written=true
             fi
         fi
 
         if [ "$config_written" != "true" ]; then
-            rm -f "$tmp_file"
             echo -e "${RED}端口 $port 配置写入失败，已跳过添加规则${NC}"
             continue
         fi
-        mv "$tmp_file" "$CONFIG_FILE"
 
         add_nftables_rules "$port"
         update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
@@ -2593,6 +2893,9 @@ add_port_monitoring() {
         setup_port_auto_reset_cron "$port"
         added_count=$((added_count + 1))
     done
+
+    refresh_notification_cron_from_config
+    setup_traffic_snapshot_cron
 
     echo
     echo -e "${GREEN}成功添加 $added_count 个端口监控${NC}"
@@ -2647,6 +2950,7 @@ remove_port_monitoring() {
             remove_nftables_quota "$port"
             remove_tc_limit "$port"
             update_config "del(.ports.\"$port\")"
+            remove_port_traffic_state "$port" >/dev/null 2>&1 || true
 
             # 清理历史记录
             local history_file="$CONFIG_DIR/reset_history.log"
@@ -2695,6 +2999,8 @@ remove_port_monitoring() {
         if [ ${#remaining_ports[@]} -eq 0 ]; then
             echo -e "${YELLOW}所有端口已删除，自动重置功能已停用${NC}"
         fi
+        refresh_notification_cron_from_config
+        setup_traffic_snapshot_cron
     else
         echo "取消删除"
     fi
@@ -2854,7 +3160,8 @@ set_port_bandwidth_limit() {
     fi
 
     echo
-    local port_list=$(IFS=','; echo "${ports_to_limit[*]}")
+    local port_list
+    port_list=$(IFS=','; echo "${ports_to_limit[*]}")
     echo "为端口 $port_list 设置带宽限制（速率控制）:"
     echo "请输入限制值（0为无限制）（要带单位Kbps/Mbps/Gbps）:"
     echo "(多端口排序分别限制使用逗号,分隔)(只输入一个值，应用到所有端口):"
@@ -2941,7 +3248,8 @@ set_port_quota_limit() {
     fi
 
     echo
-    local port_list=$(IFS=','; echo "${ports_to_quota[*]}")
+    local port_list
+    port_list=$(IFS=','; echo "${ports_to_quota[*]}")
     while true; do
         echo "为端口 $port_list 设置流量配额（总量控制）:"
         echo "请输入配额值（0为无限制）（要带单位MB/GB/T）:"
@@ -3005,10 +3313,12 @@ set_port_quota_limit() {
         if [ "$quota" = "0" ] || [ -z "$quota" ]; then
             remove_nftables_quota "$port"
             # 设为无限额时删除自动重置策略并清除定时任务
-            jq ".ports.\"$port\".quota.enabled = true | 
-                .ports.\"$port\".quota.monthly_limit = \"unlimited\" | 
-                del(.ports.\"$port\".quota.reset_day) |
-                del(.ports.\"$port\".quota.reset_policy)" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            update_config_file '
+                .ports[$port].quota.enabled = true |
+                .ports[$port].quota.monthly_limit = "unlimited" |
+                del(.ports[$port].quota.reset_day) |
+                del(.ports[$port].quota.reset_policy)
+            ' --arg port "$port"
             remove_port_auto_reset_cron "$port"
             echo -e "${GREEN}端口 $port 流量配额设置为无限制${NC}"
             success_count=$((success_count + 1))
@@ -3142,9 +3452,10 @@ change_port_billing_mode() {
     remove_nftables_rules "$target_port"
     
     # 更新配置
-    local tmp_file=$(mktemp)
-    jq ".ports.\"$target_port\".billing_mode = \"$new_mode\"" "$CONFIG_FILE" > "$tmp_file"
-    mv "$tmp_file" "$CONFIG_FILE"
+    update_config_file \
+        '.ports[$port].billing_mode = $mode' \
+        --arg port "$target_port" \
+        --arg mode "$new_mode"
     
     # 创建带初始值的计数器（复用灾备恢复函数）
     restore_counter_value "$target_port" "$saved_input" "$saved_output"
@@ -3173,7 +3484,12 @@ apply_nftables_quota() {
     local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
 
-    local quota_bytes=$(parse_size_to_bytes "$quota_limit")
+    local quota_bytes
+    quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
+    if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
+        log_notification "端口 $port 配额值无效，已保留现有限额规则: $quota_limit"
+        return 0
+    fi
 
     # Use raw nftables counters as the current-cycle baseline.
     local current_traffic=($(get_nftables_counter_data "$port"))
@@ -3287,8 +3603,17 @@ apply_tc_limit() {
     tc qdisc add dev $interface root handle 1: htb default 30 2>/dev/null || true
     tc class add dev $interface parent 1: classid 1:1 htb rate 1000mbit 2>/dev/null || true
 
-    local class_id=$(generate_tc_class_id "$port")
+    local class_id
+    if ! class_id=$(generate_tc_class_id "$port"); then
+        log_notification "端口 $port 无法分配TC class ID，已跳过带宽限制"
+        return 1
+    fi
+    local legacy_class_id
+    legacy_class_id=$(generate_legacy_tc_class_id "$port")
     tc class del dev $interface classid $class_id 2>/dev/null || true
+    if [ "$legacy_class_id" != "$class_id" ]; then
+        tc class del dev $interface classid $legacy_class_id 2>/dev/null || true
+    fi
 
     # 计算burst参数以优化性能
     local base_rate=$(parse_tc_rate_to_kbps "$total_limit")
@@ -3325,7 +3650,10 @@ remove_tc_limit() {
     local port=$1
     local interface=$(get_default_interface)
 
-    local class_id=$(generate_tc_class_id "$port")
+    local class_id
+    class_id=$(generate_tc_class_id "$port" 2>/dev/null || true)
+    local legacy_class_id
+    legacy_class_id=$(generate_legacy_tc_class_id "$port")
 
     if is_port_range "$port"; then
         # 端口段：删除基于标记的过滤器
@@ -3351,7 +3679,12 @@ remove_tc_limit() {
             match ip protocol 17 0xff match ip dport $port 0xffff 2>/dev/null || true
     fi
 
-    tc class del dev $interface classid $class_id 2>/dev/null || true
+    if [ -n "$class_id" ]; then
+        tc class del dev $interface classid $class_id 2>/dev/null || true
+    fi
+    if [ "$legacy_class_id" != "$class_id" ]; then
+        tc class del dev $interface classid $legacy_class_id 2>/dev/null || true
+    fi
 }
 
 manage_traffic_reset() {
@@ -3402,7 +3735,8 @@ set_reset_day() {
     fi
 
     echo
-    local port_list=$(IFS=','; echo "${ports_to_set[*]}")
+    local port_list
+    port_list=$(IFS=','; echo "${ports_to_set[*]}")
     echo "为端口 $port_list 设置自动重置策略:"
     local reset_policy_config=""
     local RESET_POLICY_CONFIGS=()
@@ -3438,10 +3772,10 @@ set_reset_day() {
         policy_type=$(printf '%s' "$current_policy_config" | jq -r '.type')
 
         if [ "$policy_type" = "none" ]; then
-            jq --arg port "$port" '
+            update_config_file '
                 del(.ports[$port].quota.reset_day) |
                 del(.ports[$port].quota.reset_policy)
-            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            ' --arg port "$port"
             remove_port_auto_reset_cron "$port"
             echo -e "${GREEN}端口 $port 已取消自动重置${NC}"
         else
@@ -3683,6 +4017,7 @@ export_config() {
 
     # 复制配置目录到临时位置
     cp -r "$CONFIG_DIR" "$package_dir"
+    rm -rf "$package_dir/config.lock" "$package_dir/traffic_stats.lock"
 
     # 生成端口流量狗配置包信息文件
     cat > "$package_dir/package_info.txt" << EOF
@@ -3695,8 +4030,7 @@ export_config() {
 EOF
 
     # 打包配置
-    cd "$temp_dir"
-    tar -czf "$backup_path" port-traffic-dog-config/ 2>/dev/null
+    tar -czf "$backup_path" -C "$temp_dir" port-traffic-dog-config/ 2>/dev/null
 
     # 清理临时目录
     rm -rf "$temp_dir"
@@ -3744,6 +4078,7 @@ import_config() {
         import_config
         return
     fi
+    package_path=$(realpath "$package_path")
 
     # 检查文件格式
     if [[ ! "$package_path" =~ \.tar\.gz$ ]]; then
@@ -3760,7 +4095,6 @@ import_config() {
     local temp_dir=$(mktemp -d)
 
     # 解压到临时目录进行验证
-    cd "$temp_dir"
     if ! tar -tzf "$package_path" >/dev/null 2>&1; then
         echo -e "${RED}错误：配置包文件损坏或格式错误${NC}"
         rm -rf "$temp_dir"
@@ -3769,12 +4103,31 @@ import_config() {
         return
     fi
 
+    if tar -tzf "$package_path" | awk '
+        /^\// || /(^|\/)\.\.(\/|$)/ || !/^port-traffic-dog-config(\/|$)/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    '; then
+        echo -e "${RED}错误：配置包包含不安全或异常路径${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        import_config
+        return
+    fi
+
+    if tar -tvzf "$package_path" | awk 'substr($1, 1, 1) ~ /^[lh]$/ { found=1 } END { exit found ? 0 : 1 }'; then
+        echo -e "${RED}错误：配置包不能包含符号链接或硬链接${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        import_config
+        return
+    fi
+
     # 解压配置包
-    tar -xzf "$package_path" 2>/dev/null
+    tar -xzf "$package_path" -C "$temp_dir" 2>/dev/null
 
     # 验证配置包结构
-    local config_dir_name=$(ls | head -n1)
-    if [ ! -d "$config_dir_name" ]; then
+    local config_dir_name="port-traffic-dog-config"
+    if [ ! -d "$temp_dir/$config_dir_name" ]; then
         echo -e "${RED}错误：配置包结构异常${NC}"
         rm -rf "$temp_dir"
         sleep 2
@@ -3848,6 +4201,7 @@ import_config() {
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     mkdir -p "$(dirname "$CONFIG_DIR")"
     cp -r "$extracted_config" "$CONFIG_DIR"
+    rm -rf "$CONFIG_LOCK_DIR" "$TRAFFIC_STATS_LOCK_DIR"
 
     # 3. 重新应用规则
     echo "正在重新应用监控规则..."
@@ -3883,6 +4237,8 @@ import_config() {
 
     echo "正在更新通知模块..."
     download_notification_modules >/dev/null 2>&1 || true
+    refresh_notification_cron_from_config
+    setup_traffic_snapshot_cron
 
     rm -rf "$temp_dir"
 
@@ -4018,7 +4374,7 @@ install_update_script() {
     local temp_file=$(mktemp)
 
     if download_with_sources "$SCRIPT_URL" "$temp_file"; then
-        if [ -s "$temp_file" ] && grep -q "端口流量狗" "$temp_file" 2>/dev/null; then
+        if [ -s "$temp_file" ] && grep -q "端口流量狗" "$temp_file" 2>/dev/null && bash -n "$temp_file"; then
             mv "$temp_file" "$INSTALLED_SCRIPT_PATH"
             chmod +x "$INSTALLED_SCRIPT_PATH"
 
@@ -4026,12 +4382,14 @@ install_update_script() {
 
             echo -e "${YELLOW}正在更新通知模块...${NC}"
             download_notification_modules "force" >/dev/null 2>&1 || true
+            refresh_notification_cron_from_config
+            setup_traffic_snapshot_cron
 
             echo -e "${GREEN}依赖检查完成${NC}"
             echo -e "${GREEN}脚本更新完成${NC}"
             echo -e "${GREEN}通知模块已更新${NC}"
         else
-            echo -e "${RED} 下载文件验证失败${NC}"
+            echo -e "${RED} 下载文件验证失败或脚本语法无效，已保留当前版本${NC}"
             rm -f "$temp_file"
         fi
     else
@@ -4250,13 +4608,9 @@ telegram_switch_api_route_fallback() {
                 return 1
             fi
 
-            local tmp_file=$(mktemp)
-            if jq --arg base "$input_custom" \
-               '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
-               "$CONFIG_FILE" > "$tmp_file"; then
-                mv "$tmp_file" "$CONFIG_FILE"
-            else
-                rm -f "$tmp_file"
+            if ! update_config_file \
+                '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
+                --arg base "$input_custom"; then
                 echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
                 return 1
             fi
@@ -4301,7 +4655,7 @@ setup_telegram_notification_cron() {
 
     # 检查telegram通知是否启用
     local telegram_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$telegram_enabled" = "true" ]; then
+    if [ "$telegram_enabled" = "true" ] && has_active_ports; then
         local status_interval=$(jq -r '.notifications.telegram.status_notifications.interval' "$CONFIG_FILE")
         case "$status_interval" in
             "1m")  echo "* * * * * $script_path --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知" >> "$temp_cron" ;;
@@ -4327,7 +4681,7 @@ setup_wecom_notification_cron() {
 
     # 检查企业wx 通知是否启用
     local wecom_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$wecom_enabled" = "true" ]; then
+    if [ "$wecom_enabled" = "true" ] && has_active_ports; then
         local wecom_interval=$(jq -r '.notifications.wecom.status_notifications.interval' "$CONFIG_FILE")
         case "$wecom_interval" in
             "1m")  echo "* * * * * $script_path --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知" >> "$temp_cron" ;;
@@ -4434,7 +4788,9 @@ setup_traffic_snapshot_cron() {
         grep -v "# port-traffic-dog traffic snapshot" | \
         grep -v "port-traffic-dog.*--snapshot-traffic" > "$temp_cron" || true
 
-    echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
+    if has_active_ports; then
+        echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
+    fi
     crontab "$temp_cron"
     rm -f "$temp_cron"
     ensure_cron_service_running
@@ -4582,6 +4938,8 @@ log_notification() {
 
 # 通用状态通知发送函数
 send_status_notification() {
+    has_active_ports || return 0
+
     local success_count=0
     local total_count=0
 
@@ -4649,6 +5007,29 @@ self_check() {
         fi
     else
         check_fail "配置文件不存在: $CONFIG_FILE"
+    fi
+
+    local invalid_quota_ports=()
+    local configured_ports=()
+    mapfile -t configured_ports < <(get_active_ports 2>/dev/null || true)
+    local configured_port
+    for configured_port in "${configured_ports[@]}"; do
+        local quota_enabled
+        quota_enabled=$(jq -r --arg port "$configured_port" '.ports[$port].quota.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)
+        local quota_limit
+        quota_limit=$(jq -r --arg port "$configured_port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE" 2>/dev/null || echo unlimited)
+        if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
+            local quota_bytes
+            quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
+            if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
+                invalid_quota_ports+=("$configured_port")
+            fi
+        fi
+    done
+    if [ ${#invalid_quota_ports[@]} -eq 0 ]; then
+        check_ok "端口配额配置有效"
+    else
+        check_fail "端口配额配置无效: ${invalid_quota_ports[*]}"
     fi
 
     if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
@@ -4755,16 +5136,28 @@ main() {
                 exit 0
                 ;;
             --snapshot-traffic)
+                if ! has_active_ports; then
+                    remove_traffic_snapshot_cron >/dev/null 2>&1 || true
+                    exit 0
+                fi
                 record_traffic_snapshot >/dev/null 2>&1 || true
                 exit 0
                 ;;
             --send-telegram-status)
+                if ! has_active_ports; then
+                    remove_telegram_notification_cron >/dev/null 2>&1 || true
+                    exit 0
+                fi
                 if load_telegram_module; then
                     telegram_send_status_notification
                 fi
                 exit 0
                 ;;
             --send-wecom-status)
+                if ! has_active_ports; then
+                    remove_wecom_notification_cron >/dev/null 2>&1 || true
+                    exit 0
+                fi
                 local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
                 if [ -f "$wecom_script" ]; then
                     source "$wecom_script"
@@ -4773,6 +5166,7 @@ main() {
                 exit 0
                 ;;
             --send-status)
+                has_active_ports || exit 0
                 send_status_notification
                 exit 0
                 ;;

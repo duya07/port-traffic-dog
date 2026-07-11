@@ -9,6 +9,23 @@ if [[ -z "${TELEGRAM_MAX_RETRIES:-}" ]]; then
     readonly TELEGRAM_MAX_TIMEOUT=15
 fi
 
+telegram_update_config_file() {
+    if declare -F update_config_file >/dev/null 2>&1; then
+        update_config_file "$@"
+        return
+    fi
+
+    local jq_filter="$1"
+    shift
+    local temp_file
+    temp_file=$(mktemp)
+    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$temp_file" && mv "$temp_file" "$CONFIG_FILE"; then
+        return 0
+    fi
+    rm -f "$temp_file"
+    return 1
+}
+
 telegram_is_enabled() {
     local enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE")
     [ "$enabled" = "true" ]
@@ -178,14 +195,9 @@ send_telegram_message() {
             migrated_chat_id=$(echo "$curl_output" | jq -r '.parameters.migrate_to_chat_id // empty' 2>/dev/null || true)
             if [ -n "$migrated_chat_id" ]; then
                 chat_id="$migrated_chat_id"
-                local tmp_file
-                tmp_file=$(mktemp)
-                if jq --arg chat_id "$migrated_chat_id" \
+                if ! telegram_update_config_file \
                     '.notifications.telegram.chat_id = $chat_id' \
-                    "$CONFIG_FILE" > "$tmp_file"; then
-                    mv "$tmp_file" "$CONFIG_FILE"
-                else
-                    rm -f "$tmp_file"
+                    --arg chat_id "$migrated_chat_id"; then
                     log_notification "Telegram群升级chat_id写入配置失败: ${migrated_chat_id}"
                 fi
                 log_notification "Telegram群已升级为supergroup，已自动更新chat_id为: ${migrated_chat_id}，正在重试"
@@ -399,20 +411,14 @@ telegram_configure_bot() {
     fi
 
     # 原子性配置更新：确保配置完整性
-    local tmp_file
-    tmp_file=$(mktemp)
-    if jq --arg bot_token "$bot_token" \
-       --arg chat_id "$chat_id" \
-       --arg server_name "$server_name" \
-       '.notifications.telegram.bot_token = $bot_token |
+    if ! telegram_update_config_file '.notifications.telegram.bot_token = $bot_token |
         .notifications.telegram.chat_id = $chat_id |
         .notifications.telegram.server_name = $server_name |
         .notifications.telegram.enabled = true |
         .notifications.telegram.status_notifications.enabled = true' \
-       "$CONFIG_FILE" > "$tmp_file"; then
-        mv "$tmp_file" "$CONFIG_FILE"
-    else
-        rm -f "$tmp_file"
+       --arg bot_token "$bot_token" \
+       --arg chat_id "$chat_id" \
+       --arg server_name "$server_name"; then
         echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
         return 1
     fi
@@ -514,13 +520,9 @@ telegram_switch_api_route() {
                 return 1
             fi
 
-            local tmp_file=$(mktemp)
-            if jq --arg base "$normalized_custom" \
-               '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
-               "$CONFIG_FILE" > "$tmp_file"; then
-                mv "$tmp_file" "$CONFIG_FILE"
-            else
-                rm -f "$tmp_file"
+            if ! telegram_update_config_file \
+                '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
+                --arg base "$normalized_custom"; then
                 echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
                 return 1
             fi
