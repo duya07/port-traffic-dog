@@ -317,6 +317,20 @@ grep -q -- '--send-snapshot' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
+migrate_legacy_cron_if_needed
+! grep -Eq -- '--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
+[ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
+grep -q -- '--send-telegram-status' "$CRON_FILE"
+grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
+printf '%s\n' '5 0 * * * /usr/local/bin/port-traffic-dog.sh --check-reset-port 3011 >/dev/null 2>&1  # 端口流量狗自动重置端口3011' >> "$CRON_FILE"
+migrate_legacy_cron_if_needed
+! grep -q -- '--check-reset-port 3011' "$CRON_FILE"
+[ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
+cp "$CRON_FILE" "$TEST_DIR/crontab.before-noop"
+migrate_legacy_cron_if_needed
+cmp -s "$CRON_FILE" "$TEST_DIR/crontab.before-noop"
+
 refresh_port_auto_reset_cron_from_config
 ! grep -q -- '--reset-port' "$CRON_FILE"
 ! grep -q -- '--check-reset-port' "$CRON_FILE"
@@ -519,7 +533,7 @@ self_check >/dev/null
 sed -i '/--snapshot-traffic/d' "$CRON_FILE"
 ! self_check >/dev/null
 
-# 普通启动只能执行轻量初始化，不能重复改 cron、同步模块或修复规则。
+# 普通启动只允许执行轻量初始化，以及检测到旧 cron 时进行一次性迁移。
 readonly STARTUP_TRACE_FILE="$TEST_DIR/startup.trace"
 trace_startup_call() {
     printf '%s\n' "$1" >> "$STARTUP_TRACE_FILE"
@@ -531,10 +545,12 @@ ensure_installation_files() { trace_startup_call ensure_installation_files; }
 create_shortcut_command() { trace_startup_call create_shortcut_command; }
 setup_script_permissions() { trace_startup_call setup_script_permissions; }
 setup_cron_environment() { trace_startup_call setup_cron_environment; }
+migrate_legacy_cron_if_needed() { trace_startup_call migrate_legacy_cron_if_needed; }
 download_notification_modules() { trace_startup_call download_notification_modules; }
 refresh_port_auto_reset_cron_from_config() { trace_startup_call refresh_port_auto_reset_cron_from_config; }
 refresh_notification_cron_from_config() { trace_startup_call refresh_notification_cron_from_config; }
 setup_traffic_snapshot_cron() { trace_startup_call setup_traffic_snapshot_cron; }
+refresh_all_cron_from_config() { trace_startup_call refresh_all_cron_from_config; }
 repair_duplicate_traffic_rules() {
     trace_startup_call repair_duplicate_traffic_rules
     echo 0
@@ -547,16 +563,15 @@ read() { :; }
 
 : > "$STARTUP_TRACE_FILE"
 main
-[ "$(cat "$STARTUP_TRACE_FILE")" = $'check_root\ncheck_dependencies\ninit_config\nensure_installation_files\nshow_main_menu' ]
+[ "$(cat "$STARTUP_TRACE_FILE")" = $'check_root\ncheck_dependencies\ninit_config\nensure_installation_files\nmigrate_legacy_cron_if_needed\nshow_main_menu' ]
 
 : > "$STARTUP_TRACE_FILE"
 (main --version >/dev/null)
 [ "$(cat "$STARTUP_TRACE_FILE")" = "check_root" ]
 
-grep -q -- '--refresh-port-reset-cron' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -q -- '--refresh-all-cron' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
-grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-port-reset-cron' "$SCRIPT_FILE"
-grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-notification-cron' "$SCRIPT_FILE"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
 
 : > "$STARTUP_TRACE_FILE"
@@ -564,8 +579,7 @@ system_check_and_repair >/dev/null
 for expected_call in \
     check_dependencies init_config setup_script_permissions setup_cron_environment \
     create_shortcut_command download_notification_modules \
-    refresh_port_auto_reset_cron_from_config refresh_notification_cron_from_config \
-    setup_traffic_snapshot_cron repair_duplicate_traffic_rules \
+    refresh_all_cron_from_config repair_duplicate_traffic_rules \
     record_traffic_snapshot self_check show_main_menu; do
     [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
 done

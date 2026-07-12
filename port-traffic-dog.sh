@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.4.3"
+readonly SCRIPT_VERSION="1.4.4"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -4732,10 +4732,8 @@ install_update_script() {
             download_notification_modules "force" >/dev/null 2>&1 || true
             # 必须启动新脚本执行迁移；当前进程仍保留更新前的函数定义。
             local post_update_ok=true
-            bash "$INSTALLED_SCRIPT_PATH" --refresh-port-reset-cron >/dev/null || post_update_ok=false
-            bash "$INSTALLED_SCRIPT_PATH" --refresh-notification-cron >/dev/null || post_update_ok=false
+            bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron >/dev/null || post_update_ok=false
             bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules >/dev/null || post_update_ok=false
-            setup_traffic_snapshot_cron
 
             if [ "$post_update_ok" != "true" ]; then
                 echo -e "${YELLOW}脚本已更新，但部分维护步骤失败，请运行 dog --self-check 检查${NC}"
@@ -5236,6 +5234,25 @@ refresh_port_auto_reset_cron_from_config() {
     setup_auto_reset_cron
 }
 
+refresh_all_cron_from_config() {
+    setup_cron_environment
+    refresh_port_auto_reset_cron_from_config
+    refresh_notification_cron_from_config
+    setup_traffic_snapshot_cron
+}
+
+legacy_cron_needs_migration() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -Eq \
+        'port-traffic-dog(\.sh)?.*--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'
+}
+
+migrate_legacy_cron_if_needed() {
+    if legacy_cron_needs_migration; then
+        refresh_all_cron_from_config
+    fi
+}
+
 remove_port_auto_reset_cron() {
     setup_auto_reset_cron
 }
@@ -5495,7 +5512,7 @@ self_check() {
         if [ "$cron_matches_config" = "true" ]; then
             check_ok "定时任务与当前配置一致"
         else
-            check_fail "定时任务与当前端口、重置或通知配置不一致"
+            check_fail "定时任务与当前配置不一致（重置 ${actual_reset_count}/${expected_reset_count}，快照 ${actual_snapshot_count}/${expected_snapshot_count}，Telegram ${actual_telegram_count}/${expected_telegram_count}，企业微信 ${actual_wecom_count}/${expected_wecom_count}）"
         fi
     else
         check_warn "crontab 命令不可用，跳过定时任务核对"
@@ -5599,9 +5616,7 @@ system_check_and_repair() {
     fi
 
     echo -e "${YELLOW}[3/6] 重建端口重置和通知定时任务...${NC}"
-    refresh_port_auto_reset_cron_from_config
-    refresh_notification_cron_from_config
-    setup_traffic_snapshot_cron
+    refresh_all_cron_from_config
     echo -e "${GREEN}定时任务已按当前配置刷新${NC}"
 
     echo -e "${YELLOW}[4/6] 检查并修复流量与配额规则...${NC}"
@@ -5744,6 +5759,13 @@ main() {
                 echo -e "${GREEN}端口自动重置定时任务已刷新${NC}"
                 exit 0
                 ;;
+            --refresh-all-cron)
+                check_dependencies true
+                init_config
+                refresh_all_cron_from_config
+                echo -e "${GREEN}全部定时任务已按当前配置刷新${NC}"
+                exit 0
+                ;;
             --repair-traffic-rules)
                 check_dependencies true
                 init_config
@@ -5770,6 +5792,7 @@ main() {
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
                 echo "  --refresh-port-reset-cron    刷新端口自动重置定时任务"
+                echo "  --refresh-all-cron           刷新全部定时任务并清理旧任务"
                 echo "  --repair-traffic-rules  按计费模式修复流量计数/配额规则"
                 echo "  --snapshot-traffic       写入自然日流量快照"
                 echo "  --reset-port PORT         重置指定端口流量"
@@ -5786,6 +5809,7 @@ main() {
     check_dependencies true
     init_config
     ensure_installation_files
+    migrate_legacy_cron_if_needed
     show_main_menu
 }
 

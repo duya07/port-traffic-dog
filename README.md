@@ -32,6 +32,7 @@
 20. 新增端口或端口段会拒绝与现有监控范围重叠，避免同一连接被多组 counter/quota 重复统计。
 21. 配置文件和导出包默认限制为 root 可读写；导入配置会拒绝特殊文件，并在复制失败时恢复旧配置、规则和定时任务。
 22. 带宽限制仅在 TC 分类和过滤器完整创建后写入配置；网卡已有不兼容的根队列时明确报错，不再显示伪成功。
+23. 直接覆盖旧脚本后，首次打开 `dog` 会轻量检测并迁移旧版单端口重置/快照 cron；菜单更新和迁移脚本统一由新版本刷新全部定时任务。
 
 ## 下载方式说明
 
@@ -129,6 +130,7 @@ sudo dog --self-check
 sudo dog --sync-notification-modules
 sudo dog --refresh-notification-cron
 sudo dog --refresh-port-reset-cron
+sudo dog --refresh-all-cron
 sudo dog --repair-traffic-rules
 sudo dog --snapshot-traffic
 sudo dog --uninstall
@@ -138,6 +140,7 @@ sudo dog --uninstall
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
 - `--refresh-port-reset-cron`: 根据当前端口重置策略重建自动重置任务，并清理旧版 `--reset-port` 和失效端口残留任务。
+- `--refresh-all-cron`: 按当前端口、重置和通知配置刷新全部定时任务，同时清理旧版单端口重置及旧快照任务。
 - `--repair-traffic-rules`: 按当前计费模式检查并重建 counter/quota 规则；双向目标为每个方向 8 条 counter 引用、16 条 quota 引用，单向目标为每个方向 4 条 counter 引用、8 条 quota 引用。升级时会按旧规则倍率换算已有 counter，避免已有流量丢失或再次翻倍。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
