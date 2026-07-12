@@ -22,9 +22,9 @@ download_to() {
     local out="$2"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$out"
+        curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$out"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$out" "$url"
+        wget -q -T 60 -O "$out" "$url"
     else
         echo "错误: 需要 curl 或 wget"
         return 1
@@ -53,7 +53,9 @@ mkdir -p "${BACKUP_DIR}"
 if [ -d "${CONFIG_DIR}" ]; then
     cp -a "${CONFIG_DIR}" "${BACKUP_DIR}/port-traffic-dog-config"
     rm -rf "${BACKUP_DIR}/port-traffic-dog-config/config.lock" \
-        "${BACKUP_DIR}/port-traffic-dog-config/traffic_stats.lock"
+        "${BACKUP_DIR}/port-traffic-dog-config/traffic_stats.lock" \
+        "${BACKUP_DIR}/port-traffic-dog-config/reset.lock"
+    chmod 600 "${BACKUP_DIR}/port-traffic-dog-config/config.json" 2>/dev/null || true
     echo "已备份: ${CONFIG_DIR} -> ${BACKUP_DIR}/port-traffic-dog-config"
 else
     echo "未发现配置目录: ${CONFIG_DIR} (跳过)"

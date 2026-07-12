@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.4.2"
+readonly SCRIPT_VERSION="1.4.3"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -198,6 +198,12 @@ init_config() {
 }
 EOF
     fi
+
+    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}错误：配置文件不是有效 JSON: $CONFIG_FILE${NC}"
+        return 1
+    fi
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
     init_nftables
     setup_exit_hooks
@@ -1798,6 +1804,26 @@ is_port_range() {
     [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]
 }
 
+get_port_spec_bounds() {
+    local port_spec="$1"
+    if [[ "$port_spec" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    elif [[ "$port_spec" =~ ^[0-9]+$ ]]; then
+        echo "$port_spec $port_spec"
+    else
+        return 1
+    fi
+}
+
+port_specs_overlap() {
+    local first_bounds=()
+    local second_bounds=()
+    read -r -a first_bounds < <(get_port_spec_bounds "$1") || return 1
+    read -r -a second_bounds < <(get_port_spec_bounds "$2") || return 1
+    [ "${first_bounds[0]}" -le "${second_bounds[1]}" ] &&
+        [ "${second_bounds[0]}" -le "${first_bounds[1]}" ]
+}
+
 generate_port_range_mark() {
     local port_range=$1
     local start_port=$(echo "$port_range" | cut -d'-' -f1)
@@ -2775,6 +2801,27 @@ add_port_monitoring() {
             continue
         fi
 
+        local overlap_port=""
+        local configured_port
+        while IFS= read -r configured_port; do
+            if port_specs_overlap "$port" "$configured_port"; then
+                overlap_port="$configured_port"
+                break
+            fi
+        done < <(jq -r '.ports // {} | keys[]' "$CONFIG_FILE" 2>/dev/null || true)
+        if [ -z "$overlap_port" ]; then
+            for configured_port in "${valid_ports[@]}"; do
+                if port_specs_overlap "$port" "$configured_port"; then
+                    overlap_port="$configured_port"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$overlap_port" ]; then
+            echo -e "${YELLOW}端口 $port 与已选或已配置的 $overlap_port 重叠，跳过以避免重复计量${NC}"
+            continue
+        fi
+
         valid_ports+=("$port")
     done
 
@@ -3322,8 +3369,6 @@ set_port_bandwidth_limit() {
             continue
         fi
 
-        remove_tc_limit "$port"
-
         if ! validate_bandwidth "$limit"; then
             echo -e "${RED}端口 $port 格式错误，请使用如：500Kbps, 100Mbps, 1Gbps${NC}"
             continue
@@ -3331,14 +3376,25 @@ set_port_bandwidth_limit() {
 
         # 转换为TC格式
         local tc_limit=$(convert_bandwidth_to_tc "$limit")
+        local old_limit_enabled
+        old_limit_enabled=$(jq -r ".ports.\"$port\".bandwidth_limit.enabled // false" "$CONFIG_FILE")
+        local old_rate_limit
+        old_rate_limit=$(jq -r ".ports.\"$port\".bandwidth_limit.rate // \"unlimited\"" "$CONFIG_FILE")
 
-        apply_tc_limit "$port" "$tc_limit"
-
-        update_config ".ports.\"$port\".bandwidth_limit.enabled = true |
-            .ports.\"$port\".bandwidth_limit.rate = \"$limit\""
-
-        echo -e "${GREEN}端口 $port 带宽限制设置成功: $limit${NC}"
-        success_count=$((success_count + 1))
+        remove_tc_limit "$port"
+        if apply_tc_limit "$port" "$tc_limit"; then
+            update_config ".ports.\"$port\".bandwidth_limit.enabled = true |
+                .ports.\"$port\".bandwidth_limit.rate = \"$limit\""
+            echo -e "${GREEN}端口 $port 带宽限制设置成功: $limit${NC}"
+            success_count=$((success_count + 1))
+        else
+            if [ "$old_limit_enabled" = "true" ] && [ "$old_rate_limit" != "unlimited" ]; then
+                local old_tc_limit
+                old_tc_limit=$(convert_bandwidth_to_tc "$old_rate_limit")
+                [ -n "$old_tc_limit" ] && apply_tc_limit "$port" "$old_tc_limit" >/dev/null 2>&1 || true
+            fi
+            echo -e "${RED}端口 $port 带宽限制应用失败，配置未修改${NC}"
+        fi
     done
 
     echo
@@ -3762,8 +3818,23 @@ apply_tc_limit() {
     local total_limit=$2
     local interface=$(get_default_interface)
 
-    tc qdisc add dev $interface root handle 1: htb default 30 2>/dev/null || true
-    tc class add dev $interface parent 1: classid 1:1 htb rate 1000mbit 2>/dev/null || true
+    if [ -z "$interface" ]; then
+        log_notification "端口 $port 无法确定默认网卡，已跳过带宽限制"
+        return 1
+    fi
+
+    if ! tc qdisc show dev "$interface" 2>/dev/null | grep -Eq '^qdisc htb 1:'; then
+        if ! tc qdisc add dev "$interface" root handle 1: htb default 30 2>/dev/null; then
+            log_notification "端口 $port 无法创建HTB根队列，网卡可能已有其他根qdisc: $interface"
+            return 1
+        fi
+    fi
+    if ! tc class show dev "$interface" 2>/dev/null | grep -Eq '^class htb 1:1([[:space:]]|$)'; then
+        if ! tc class add dev "$interface" parent 1: classid 1:1 htb rate 1000mbit 2>/dev/null; then
+            log_notification "端口 $port 无法创建HTB根分类: $interface"
+            return 1
+        fi
+    fi
 
     local class_id
     if ! class_id=$(generate_tc_class_id "$port"); then
@@ -3782,29 +3853,40 @@ apply_tc_limit() {
     local burst_bytes=$(calculate_tc_burst "$base_rate")
     local burst_size=$(format_tc_burst "$burst_bytes")
 
-    tc class add dev $interface parent 1:1 classid $class_id htb rate $total_limit ceil $total_limit burst $burst_size
+    if ! tc class add dev "$interface" parent 1:1 classid "$class_id" htb rate "$total_limit" ceil "$total_limit" burst "$burst_size" 2>/dev/null; then
+        log_notification "端口 $port 无法创建TC限速分类: $class_id"
+        return 1
+    fi
 
     if is_port_range "$port"; then
         # 端口段：使用fw分类器根据标记分类
         local mark_id=$(generate_port_range_mark "$port")
-        tc filter add dev $interface protocol ip parent 1:0 prio 1 handle $mark_id fw flowid $class_id 2>/dev/null || true
+        if ! tc filter add dev "$interface" protocol ip parent 1:0 prio 1 handle "$mark_id" fw flowid "$class_id" 2>/dev/null; then
+            tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
+            log_notification "端口段 $port 无法创建TC过滤器"
+            return 1
+        fi
 
     else
         # 单端口：使用u32精确匹配，避免优先级冲突
         local filter_prio=$((port % 1000 + 1))
 
         # TCP协议过滤器
-        tc filter add dev $interface protocol ip parent 1:0 prio $filter_prio u32 \
-            match ip protocol 6 0xff match ip sport $port 0xffff flowid $class_id 2>/dev/null || true
-        tc filter add dev $interface protocol ip parent 1:0 prio $filter_prio u32 \
-            match ip protocol 6 0xff match ip dport $port 0xffff flowid $class_id 2>/dev/null || true
-
-        # UDP协议过滤器
-        tc filter add dev $interface protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
-            match ip protocol 17 0xff match ip sport $port 0xffff flowid $class_id 2>/dev/null || true
-        tc filter add dev $interface protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
-            match ip protocol 17 0xff match ip dport $port 0xffff flowid $class_id 2>/dev/null || true
+        if ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
+           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol 6 0xff match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
+           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
+            match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
+           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
+            match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null; then
+            remove_tc_limit "$port" >/dev/null 2>&1 || true
+            log_notification "端口 $port 无法创建完整TC过滤器"
+            return 1
+        fi
     fi
+
+    tc class show dev "$interface" 2>/dev/null | grep -Fq "class htb $class_id "
 }
 
 # 删除TC带宽限制
@@ -4257,7 +4339,7 @@ export_config() {
 
     # 复制配置目录到临时位置
     cp -r "$CONFIG_DIR" "$package_dir"
-    rm -rf "$package_dir/config.lock" "$package_dir/traffic_stats.lock"
+    rm -rf "$package_dir/config.lock" "$package_dir/traffic_stats.lock" "$package_dir/reset.lock"
 
     # 生成端口流量狗配置包信息文件
     cat > "$package_dir/package_info.txt" << EOF
@@ -4271,6 +4353,7 @@ EOF
 
     # 打包配置
     tar -czf "$backup_path" -C "$temp_dir" port-traffic-dog-config/ 2>/dev/null
+    chmod 600 "$backup_path" 2>/dev/null || true
 
     # 清理临时目录
     rm -rf "$temp_dir"
@@ -4354,8 +4437,8 @@ import_config() {
         return
     fi
 
-    if tar -tvzf "$package_path" | awk 'substr($1, 1, 1) ~ /^[lh]$/ { found=1 } END { exit found ? 0 : 1 }'; then
-        echo -e "${RED}错误：配置包不能包含符号链接或硬链接${NC}"
+    if tar -tvzf "$package_path" | awk 'substr($1, 1, 1) !~ /^[-d]$/ { found=1 } END { exit found ? 0 : 1 }'; then
+        echo -e "${RED}错误：配置包只能包含普通文件和目录${NC}"
         rm -rf "$temp_dir"
         sleep 2
         import_config
@@ -4436,12 +4519,35 @@ import_config() {
         remove_tc_limit "$port" 2>/dev/null || true
     done
 
-    # 2. 替换配置
+    # 2. 替换配置；保留同文件系统备份，复制失败时可立即恢复。
     echo "正在导入新配置..."
-    rm -rf "$CONFIG_DIR" 2>/dev/null || true
-    mkdir -p "$(dirname "$CONFIG_DIR")"
-    cp -r "$extracted_config" "$CONFIG_DIR"
-    rm -rf "$CONFIG_LOCK_DIR" "$TRAFFIC_STATS_LOCK_DIR"
+    local previous_config_dir="${CONFIG_DIR}.import-backup.$$"
+    rm -rf "$previous_config_dir" 2>/dev/null || true
+    if [ -d "$CONFIG_DIR" ] && ! mv "$CONFIG_DIR" "$previous_config_dir"; then
+        echo -e "${RED}错误：无法备份当前配置，已停止导入${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        manage_configuration
+        return
+    fi
+    if ! cp -r "$extracted_config" "$CONFIG_DIR"; then
+        rm -rf "$CONFIG_DIR" 2>/dev/null || true
+        if [ -d "$previous_config_dir" ]; then
+            mv "$previous_config_dir" "$CONFIG_DIR" 2>/dev/null || true
+            init_nftables
+            restore_all_monitoring_rules >/dev/null 2>&1 || true
+            refresh_port_auto_reset_cron_from_config >/dev/null 2>&1 || true
+            refresh_notification_cron_from_config >/dev/null 2>&1 || true
+            setup_traffic_snapshot_cron >/dev/null 2>&1 || true
+        fi
+        echo -e "${RED}错误：复制新配置失败，已恢复原配置${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        manage_configuration
+        return
+    fi
+    rm -rf "$CONFIG_LOCK_DIR" "$TRAFFIC_STATS_LOCK_DIR" "$RESET_LOCK_DIR"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
     # 3. 重新应用规则
     echo "正在重新应用监控规则..."
@@ -4480,6 +4586,7 @@ import_config() {
     refresh_notification_cron_from_config
     setup_traffic_snapshot_cron
 
+    rm -rf "$previous_config_dir" 2>/dev/null || true
     rm -rf "$temp_dir"
 
     echo
@@ -4623,9 +4730,16 @@ install_update_script() {
 
             echo -e "${YELLOW}正在更新通知模块...${NC}"
             download_notification_modules "force" >/dev/null 2>&1 || true
-            refresh_port_auto_reset_cron_from_config
-            refresh_notification_cron_from_config
+            # 必须启动新脚本执行迁移；当前进程仍保留更新前的函数定义。
+            local post_update_ok=true
+            bash "$INSTALLED_SCRIPT_PATH" --refresh-port-reset-cron >/dev/null || post_update_ok=false
+            bash "$INSTALLED_SCRIPT_PATH" --refresh-notification-cron >/dev/null || post_update_ok=false
+            bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules >/dev/null || post_update_ok=false
             setup_traffic_snapshot_cron
+
+            if [ "$post_update_ok" != "true" ]; then
+                echo -e "${YELLOW}脚本已更新，但部分维护步骤失败，请运行 dog --self-check 检查${NC}"
+            fi
 
             echo -e "${GREEN}依赖检查完成${NC}"
             echo -e "${GREEN}脚本更新完成${NC}"
@@ -4909,9 +5023,10 @@ setup_telegram_notification_cron() {
 
     crontab -l 2>/dev/null | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
 
-    # 检查telegram通知是否启用
-    local telegram_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$telegram_enabled" = "true" ] && has_active_ports; then
+    # 通道总开关和状态通知开关必须同时启用。
+    local telegram_channel_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE")
+    local telegram_status_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
+    if [ "$telegram_channel_enabled" = "true" ] && [ "$telegram_status_enabled" = "true" ] && has_active_ports; then
         local status_interval=$(jq -r '.notifications.telegram.status_notifications.interval' "$CONFIG_FILE")
         case "$status_interval" in
             "1m")  echo "* * * * * $script_path --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知" >> "$temp_cron" ;;
@@ -4935,9 +5050,10 @@ setup_wecom_notification_cron() {
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
 
-    # 检查企业wx 通知是否启用
-    local wecom_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$wecom_enabled" = "true" ] && has_active_ports; then
+    # 通道总开关和状态通知开关必须同时启用。
+    local wecom_channel_enabled=$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE")
+    local wecom_status_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
+    if [ "$wecom_channel_enabled" = "true" ] && [ "$wecom_status_enabled" = "true" ] && has_active_ports; then
         local wecom_interval=$(jq -r '.notifications.wecom.status_notifications.interval' "$CONFIG_FILE")
         case "$wecom_interval" in
             "1m")  echo "* * * * * $script_path --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知" >> "$temp_cron" ;;
@@ -5359,10 +5475,12 @@ self_check() {
         local expected_wecom_count=0
         if [ ${#configured_ports[@]} -gt 0 ]; then
             expected_snapshot_count=1
-            if [ "$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
+            if [ "$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
+               [ "$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
                 expected_telegram_count=1
             fi
-            if [ "$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
+            if [ "$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
+               [ "$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
                 expected_wecom_count=1
             fi
         fi

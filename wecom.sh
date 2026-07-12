@@ -41,22 +41,25 @@ send_wecom_message() {
         return 1
     fi
 
-    # 处理换行符和特殊字符：企业wx 要求JSON中使用\n而不是真实换行
-    local encoded_message=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/g' | tr -d '\n' | sed 's/\\n$//')
-
-    local json_data="{\"msgtype\": \"text\", \"text\": {\"content\": \"$encoded_message\"}}"
+    local json_data
+    if ! json_data=$(jq -n --arg content "$message" '{msgtype:"text", text:{content:$content}}'); then
+        log_notification "企业wx 消息编码失败"
+        return 1
+    fi
 
     local retry_count=0
 
     # 重试机制
     while [ $retry_count -le $WECOM_MAX_RETRIES ]; do
-        local response=$(curl -s --connect-timeout $WECOM_CONNECT_TIMEOUT --max-time $WECOM_MAX_TIMEOUT \
+        local response
+        local curl_exit=0
+        response=$(curl -sS --connect-timeout $WECOM_CONNECT_TIMEOUT --max-time $WECOM_MAX_TIMEOUT \
             -H "Content-Type: application/json" \
             -d "$json_data" \
-            "$webhook_url" 2>/dev/null)
+            "$webhook_url" 2>&1) || curl_exit=$?
 
         # 企业wx API成功响应的标准判断
-        if echo "$response" | grep -q '"errcode":0'; then
+        if [ "$curl_exit" -eq 0 ] && echo "$response" | grep -q '"errcode":0'; then
             if [ $retry_count -gt 0 ]; then
                 log_notification "企业wx 消息发送成功 (重试第${retry_count}次后成功)"
             else
@@ -77,6 +80,11 @@ send_wecom_message() {
 
 # 标准通知接口：主脚本通过此函数调用企业wx 通知
 wecom_send_status_notification() {
+    if ! wecom_is_enabled; then
+        log_notification "企业wx 通知未启用"
+        return 1
+    fi
+
     local status_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
     if [ "$status_enabled" != "true" ]; then
         log_notification "企业wx 状态通知未启用"
