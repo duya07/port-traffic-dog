@@ -55,6 +55,11 @@ should_carry_cross_day_snapshot_delta \
 [ "$(calculate_monthly_next_date 31 2025-02-01)" = "2025-02-28" ]
 [ "$(calculate_interval_months_next_date 2025-01-31 1 31 2025-03-01)" = "2025-03-31" ]
 [ "$(calculate_yearly_next_date 2 29 2025-01-01)" = "2025-02-28" ]
+[ "$(get_port_spec_bounds 3265)" = "3265 3265" ]
+[ "$(get_port_spec_bounds 3000-4000)" = "3000 4000" ]
+port_specs_overlap 3265 3000-4000
+port_specs_overlap 3000-4000 3500-4500
+! port_specs_overlap 3265 4000-5000
 [ "$(get_expected_counter_rule_count double)" -eq 8 ]
 [ "$(get_expected_counter_rule_count single)" -eq 4 ]
 [ "$(get_expected_quota_rule_count double)" -eq 16 ]
@@ -331,6 +336,20 @@ setup_telegram_notification_cron
 update_config_file '.ports["2000"] = {enabled: true}'
 setup_telegram_notification_cron
 grep -q -- '--send-telegram-status' "$CRON_FILE"
+setup_wecom_notification_cron
+grep -q -- '--send-wecom-status' "$CRON_FILE"
+update_config_file '
+    .notifications.telegram.enabled = false |
+    .notifications.wecom.enabled = false
+'
+setup_telegram_notification_cron
+setup_wecom_notification_cron
+! grep -q -- '--send-telegram-status' "$CRON_FILE"
+! grep -q -- '--send-wecom-status' "$CRON_FILE"
+update_config_file '
+    .notifications.telegram.enabled = true |
+    .notifications.wecom.enabled = true
+'
 setup_traffic_snapshot_cron
 setup_traffic_snapshot_cron
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
@@ -402,6 +421,37 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     "$CONFIG_FILE" >/dev/null
 
 (
+    get_default_interface() { echo eth0; }
+    tc_class_added=false
+    tc() {
+        if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
+            echo 'qdisc htb 1: root refcnt 2'
+        elif [ "$1" = "class" ] && [ "$2" = "show" ]; then
+            echo 'class htb 1:1 root rate 1000Mbit'
+            [ "$tc_class_added" = "true" ] && echo "class htb $class_id parent 1:1 rate 1Mbit"
+        elif [ "$1" = "class" ] && [ "$2" = "add" ]; then
+            tc_class_added=true
+        fi
+        return 0
+    }
+    apply_tc_limit 65535 1mbit
+)
+(
+    get_default_interface() { echo eth0; }
+    tc() {
+        if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
+            echo 'qdisc fq_codel 0: root refcnt 2'
+            return 0
+        fi
+        if [ "$1" = "qdisc" ] && [ "$2" = "add" ]; then
+            return 1
+        fi
+        return 0
+    }
+    ! apply_tc_limit 65535 1mbit
+)
+
+(
     unset -f update_config_file
     source "$PROJECT_DIR/telegram.sh"
     telegram_update_config_file '.compat.telegram = true'
@@ -412,6 +462,29 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     wecom_update_config_file '.compat.wecom = true'
 )
 jq -e '.compat == {telegram: true, wecom: true}' "$CONFIG_FILE" >/dev/null
+
+readonly WECOM_PAYLOAD_CAPTURE="$TEST_DIR/wecom-payload.json"
+update_config_file '
+    .notifications.wecom.enabled = true |
+    .notifications.wecom.webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+'
+(
+    source "$PROJECT_DIR/wecom.sh"
+    curl() {
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-d" ]; then
+                printf '%s' "$2" > "$WECOM_PAYLOAD_CAPTURE"
+                shift 2
+                continue
+            fi
+            shift
+        done
+        echo '{"errcode":0}'
+    }
+    send_wecom_message $'引号" 换行\n反斜线\\ 制表\t结束'
+)
+jq -e '.msgtype == "text" and .text.content == "引号\" 换行\n反斜线\\ 制表\t结束"' \
+    "$WECOM_PAYLOAD_CAPTURE" >/dev/null
 
 # 自检必须核对流量规则和 cron，而不是只检查配置文件格式。
 update_config_file '
@@ -481,6 +554,10 @@ main
 [ "$(cat "$STARTUP_TRACE_FILE")" = "check_root" ]
 
 grep -q -- '--refresh-port-reset-cron' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-port-reset-cron' "$SCRIPT_FILE"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-notification-cron' "$SCRIPT_FILE"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
 
 : > "$STARTUP_TRACE_FILE"
 system_check_and_repair >/dev/null

@@ -257,6 +257,11 @@ send_telegram_message() {
 
 # 标准通知接口：主脚本通过此函数调用Telegram通知
 telegram_send_status_notification() {
+    if ! telegram_is_enabled; then
+        log_notification "Telegram通知未启用"
+        return 1
+    fi
+
     local status_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
     if [ "$status_enabled" != "true" ]; then
         log_notification "Telegram状态通知未启用"
