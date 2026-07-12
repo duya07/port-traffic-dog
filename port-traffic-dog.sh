@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.4.1"
+readonly SCRIPT_VERSION="1.4.2"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -13,6 +13,7 @@ readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
 readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"
 readonly TRAFFIC_STATS_LOCK_DIR="$CONFIG_DIR/traffic_stats.lock"
 readonly CONFIG_LOCK_DIR="$CONFIG_DIR/config.lock"
+readonly RESET_LOCK_DIR="$CONFIG_DIR/reset.lock"
 readonly TRAFFIC_ACCOUNTING_MODEL="upstream-weighted-v1"
 
 readonly RED='\033[0;31m'
@@ -326,6 +327,14 @@ acquire_config_lock() {
 
 release_config_lock() {
     release_directory_lock "$CONFIG_LOCK_DIR"
+}
+
+acquire_reset_lock() {
+    acquire_directory_lock "$RESET_LOCK_DIR"
+}
+
+release_reset_lock() {
+    release_directory_lock "$RESET_LOCK_DIR"
 }
 
 update_config_file() {
@@ -1112,7 +1121,9 @@ get_port_cycle_start_date() {
     local start_year
     local start_month
 
-    if [ "$current_day" -ge "$reset_day" ]; then
+    local current_reset_day
+    current_reset_day=$(clamp_day_to_month "$current_year" "$current_month" "$reset_day")
+    if [ "$current_day" -ge "$current_reset_day" ]; then
         start_year="$current_year"
         start_month="$current_month"
     else
@@ -1699,7 +1710,7 @@ prompt_reset_policy() {
                     if [[ "$reset_now_choice" =~ ^[Yy]$ ]]; then
                         reset_now="true"
                     else
-                        echo -e "${YELLOW}未立即重置，将在下一次每日检查时执行${NC}"
+                        echo -e "${YELLOW}未立即重置，将在下一次周期检查时执行${NC}"
                     fi
                 fi
                 RESET_POLICY_CONFIG=$(build_reset_policy_json "fixed_date" "$fixed_date" "$reset_now")
@@ -1736,9 +1747,8 @@ apply_reset_policy_to_port() {
     ' --arg port "$port" --argjson policy "$policy_json"
 
     if [ "$policy_type" = "fixed_date" ] && [ "$reset_now" = "true" ]; then
-        auto_reset_port "$port"
-        advance_port_next_reset_date "$port" "$current_date"
-        return
+        check_reset_port_due "$port"
+        return $?
     fi
 
     if [ "$policy_type" != "none" ]; then
@@ -2504,7 +2514,9 @@ get_port_cycle_range() {
 
     local start_year
     local start_month
-    if [ "$current_day" -ge "$reset_day" ]; then
+    local current_reset_day
+    current_reset_day=$(clamp_day_to_month "$current_year" "$current_month" "$reset_day")
+    if [ "$current_day" -ge "$current_reset_day" ]; then
         start_year="$current_year"
         start_month="$current_month"
     else
@@ -4008,7 +4020,15 @@ immediate_reset() {
     read -p "确认重置选定端口的流量统计? [y/N]: " confirm
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if ! acquire_reset_lock; then
+            echo -e "${RED}流量重置任务正在运行，请稍后重试${NC}"
+            sleep 2
+            manage_traffic_reset
+            return
+        fi
+
         local reset_count=0
+        local failed_count=0
         for port in "${ports_to_reset[@]}"; do
             # 获取当前流量用于记录
             record_traffic_snapshot >/dev/null 2>&1 || true
@@ -4018,16 +4038,23 @@ immediate_reset() {
             local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
             local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
-            reset_port_nftables_counters "$port"
-            update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
-            record_reset_history "$port" "$total_bytes"
-
-            echo -e "${GREEN}端口 $port 流量统计重置成功${NC}"
-            reset_count=$((reset_count + 1))
+            if reset_port_nftables_counters "$port"; then
+                update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
+                record_reset_history "$port" "$total_bytes"
+                echo -e "${GREEN}端口 $port 流量统计重置成功${NC}"
+                reset_count=$((reset_count + 1))
+            else
+                echo -e "${RED}端口 $port 流量统计重置失败，原重置策略未改变${NC}"
+                failed_count=$((failed_count + 1))
+            fi
         done
+        release_reset_lock
 
         echo
         echo -e "${GREEN}成功重置 $reset_count 个端口的流量统计${NC}"
+        if [ "$failed_count" -gt 0 ]; then
+            echo -e "${RED}失败 $failed_count 个端口，请运行 dog --self-check 检查规则${NC}"
+        fi
         echo "重置前总流量: $(format_bytes $total_all_traffic)"
     else
         echo "取消重置"
@@ -4037,8 +4064,8 @@ immediate_reset() {
     manage_traffic_reset
 }
 
-# 自动重置指定端口的流量
-auto_reset_port() {
+# 在已持有重置锁时重置指定端口。
+perform_auto_reset_port() {
     local port="$1"
 
     record_traffic_snapshot >/dev/null 2>&1 || true
@@ -4048,7 +4075,10 @@ auto_reset_port() {
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
     local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
-    reset_port_nftables_counters "$port"
+    if ! reset_port_nftables_counters "$port"; then
+        log_notification "端口 $port 自动重置失败，counter/quota 未全部清零，将保留到期日期等待重试"
+        return 1
+    fi
     update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
     record_reset_history "$port" "$total_bytes"
 
@@ -4057,9 +4087,28 @@ auto_reset_port() {
     echo "端口 $port 自动重置完成"
 }
 
+# 自动重置指定端口的流量
+auto_reset_port() {
+    local port="$1"
+    if ! acquire_reset_lock; then
+        log_notification "端口 $port 自动重置跳过：已有重置任务正在运行"
+        return 1
+    fi
+
+    local result=0
+    perform_auto_reset_port "$port" || result=$?
+    release_reset_lock
+    return "$result"
+}
+
 check_reset_port_due() {
     local port="$1"
     port_has_auto_reset_policy "$port" || return 0
+
+    if ! acquire_reset_lock; then
+        log_notification "端口 $port 到期检查跳过：已有重置任务正在运行"
+        return 1
+    fi
 
     local today
     today=$(get_current_date)
@@ -4067,13 +4116,20 @@ check_reset_port_due() {
     next_reset_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
 
     if [ -z "$next_reset_date" ] || ! is_valid_date "$next_reset_date"; then
+        release_reset_lock
         return 0
     fi
 
+    local result=0
     if date_le "$next_reset_date" "$today"; then
-        auto_reset_port "$port"
-        advance_port_next_reset_date "$port" "$today"
+        if perform_auto_reset_port "$port"; then
+            advance_port_next_reset_date "$port" "$today" || result=$?
+        else
+            result=$?
+        fi
     fi
+    release_reset_lock
+    return "$result"
 }
 
 check_scheduled_resets() {
@@ -4088,16 +4144,50 @@ reset_port_nftables_counters() {
     local port=$1
     local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local object_prefix
+    object_prefix=$(get_port_counter_prefix "$port")
+    local input_counter="${object_prefix}_in"
+    local output_counter="${object_prefix}_out"
+    local quota_name="${object_prefix}_quota"
+    local quota_required=false
+    if [ "$(get_quota_enabled "$port")" = "true" ] && [ "$(get_quota_limit "$port")" != "unlimited" ]; then
+        quota_required=true
+    fi
 
-    if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
-        nft reset counter $family $table_name "port_${port_safe}_in" >/dev/null 2>&1 || true
-        nft reset counter $family $table_name "port_${port_safe}_out" >/dev/null 2>&1 || true
-        nft reset quota $family $table_name "port_${port_safe}_quota" >/dev/null 2>&1 || true
-    else
-        nft reset counter $family $table_name "port_${port}_in" >/dev/null 2>&1 || true
-        nft reset counter $family $table_name "port_${port}_out" >/dev/null 2>&1 || true
-        nft reset quota $family $table_name "port_${port}_quota" >/dev/null 2>&1 || true
+    # 先检查所有对象，避免对象缺失时出现只清零一个方向的部分重置。
+    if ! nft list counter "$family" "$table_name" "$input_counter" >/dev/null 2>&1 ||
+       ! nft list counter "$family" "$table_name" "$output_counter" >/dev/null 2>&1; then
+        log_notification "端口 $port 重置失败：流量 counter 对象缺失"
+        return 1
+    fi
+    if [ "$quota_required" = "true" ] &&
+       ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1; then
+        log_notification "端口 $port 重置失败：quota 对象缺失"
+        return 1
+    fi
+
+    nft reset counter "$family" "$table_name" "$input_counter" >/dev/null 2>&1 || return 1
+    nft reset counter "$family" "$table_name" "$output_counter" >/dev/null 2>&1 || return 1
+    if [ "$quota_required" = "true" ]; then
+        nft reset quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 || return 1
+    fi
+
+    local input_bytes
+    local output_bytes
+    input_bytes=$(nft list counter "$family" "$table_name" "$input_counter" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+    output_bytes=$(nft list counter "$family" "$table_name" "$output_counter" 2>/dev/null | grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
+    if [ "$input_bytes" != "0" ] || [ "$output_bytes" != "0" ]; then
+        log_notification "端口 $port 重置验证失败：counter 未清零 (in=${input_bytes:-unknown}, out=${output_bytes:-unknown})"
+        return 1
+    fi
+
+    if [ "$quota_required" = "true" ]; then
+        local quota_used
+        quota_used=$(nft list quota "$family" "$table_name" "$quota_name" 2>/dev/null | grep -o 'used [0-9]* bytes' | awk '{print $2}' || true)
+        if [ "$quota_used" != "0" ]; then
+            log_notification "端口 $port 重置验证失败：quota 未清零 (used=${quota_used:-unknown})"
+            return 1
+        fi
     fi
 }
 
@@ -4908,8 +4998,10 @@ remove_all_port_auto_reset_cron() {
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | \
         grep -v "端口流量狗自动重置端口" | \
+        grep -v "# port-traffic-dog scheduled reset check" | \
         grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)' \
         > "$temp_cron" || true
     crontab "$temp_cron"
     rm -f "$temp_cron"
@@ -4988,68 +5080,48 @@ export_notification_functions() {
 }
 
 setup_port_auto_reset_cron() {
-    local port="$1"
+    setup_auto_reset_cron
+}
+
+setup_auto_reset_cron() {
     local script_path
     script_path=$(get_script_exec_path)
     local temp_cron=$(mktemp)
 
-    # 保留现有任务，移除该端口的旧任务
-    crontab -l 2>/dev/null | awk -v port="$port" '
-        {
-            for (i = 1; i < NF; i++) {
-                if (($i == "--reset-port" || $i == "--check-reset-port") && $(i + 1) == port) {
-                    next
-                }
-            }
-            marker = "# 端口流量狗自动重置端口" port
-            if (length($0) >= length(marker) && substr($0, length($0) - length(marker) + 1) == marker) {
-                next
-            }
-            print
-        }
-    ' > "$temp_cron" || true
+    crontab -l 2>/dev/null | \
+        grep -v "端口流量狗自动重置端口" | \
+        grep -v "# port-traffic-dog scheduled reset check" | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' | \
+        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)' \
+        > "$temp_cron" || true
 
-    if port_has_auto_reset_policy "$port"; then
-        ensure_port_next_reset_date "$port" >/dev/null 2>&1 || true
-        echo "5 0 * * * $script_path --check-reset-port $port >/dev/null 2>&1  # 端口流量狗自动重置端口$port" >> "$temp_cron"
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local has_reset_policy=false
+    local port
+    for port in "${active_ports[@]}"; do
+        if port_has_auto_reset_policy "$port"; then
+            ensure_port_next_reset_date "$port" >/dev/null 2>&1 || true
+            has_reset_policy=true
+        fi
+    done
+    if [ "$has_reset_policy" = "true" ]; then
+        # 每次都按北京时间日期判断，五分钟轮询不依赖 VPS/cron 自身时区。
+        echo "*/5 * * * * $script_path --check-scheduled-resets >/dev/null 2>&1  # port-traffic-dog scheduled reset check" >> "$temp_cron"
     fi
 
     crontab "$temp_cron"
     rm -f "$temp_cron"
+    ensure_cron_service_running
 }
 
 refresh_port_auto_reset_cron_from_config() {
-    remove_all_port_auto_reset_cron
-
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local port
-    for port in "${active_ports[@]}"; do
-        setup_port_auto_reset_cron "$port"
-    done
+    setup_auto_reset_cron
 }
 
 remove_port_auto_reset_cron() {
-    local port="$1"
-    local temp_cron=$(mktemp)
-
-    crontab -l 2>/dev/null | awk -v port="$port" '
-        {
-            for (i = 1; i < NF; i++) {
-                if (($i == "--reset-port" || $i == "--check-reset-port") && $(i + 1) == port) {
-                    next
-                }
-            }
-            marker = "# 端口流量狗自动重置端口" port
-            if (length($0) >= length(marker) && substr($0, length($0) - length(marker) + 1) == marker) {
-                next
-            }
-            print
-        }
-    ' > "$temp_cron" || true
-
-    crontab "$temp_cron"
-    rm -f "$temp_cron"
+    setup_auto_reset_cron
 }
 
 # 格式化状态消息（HTML格式）
@@ -5259,18 +5331,22 @@ self_check() {
         local cron_content
         cron_content=$(crontab -l 2>/dev/null || true)
         local expected_reset_count=0
+        local has_reset_policy=false
         local cron_matches_config=true
         for configured_port in "${configured_ports[@]}"; do
             if port_has_auto_reset_policy "$configured_port"; then
-                expected_reset_count=$((expected_reset_count + 1))
-                if ! printf '%s\n' "$cron_content" | grep -Fq -- "--check-reset-port $configured_port "; then
-                    cron_matches_config=false
-                fi
+                has_reset_policy=true
             fi
         done
+        if [ "$has_reset_policy" = "true" ]; then
+            expected_reset_count=1
+            if ! printf '%s\n' "$cron_content" | grep -Fq -- "--check-scheduled-resets "; then
+                cron_matches_config=false
+            fi
+        fi
 
         local actual_reset_count
-        actual_reset_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--(check-)?reset-port' || true)
+        actual_reset_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--(reset-port|check-reset-port|check-scheduled-resets)' || true)
         local actual_snapshot_count
         actual_snapshot_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--snapshot-traffic' || true)
         local actual_telegram_count
