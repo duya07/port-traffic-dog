@@ -55,6 +55,25 @@ should_carry_cross_day_snapshot_delta \
 [ "$(calculate_monthly_next_date 31 2025-02-01)" = "2025-02-28" ]
 [ "$(calculate_interval_months_next_date 2025-01-31 1 31 2025-03-01)" = "2025-03-31" ]
 [ "$(calculate_yearly_next_date 2 29 2025-01-01)" = "2025-02-28" ]
+[ "$(get_expected_counter_rule_count double)" -eq 8 ]
+[ "$(get_expected_counter_rule_count single)" -eq 4 ]
+[ "$(get_expected_quota_rule_count double)" -eq 16 ]
+[ "$(get_expected_quota_rule_count single)" -eq 8 ]
+[ "$(scale_counter_for_rule_multiplier 100 1 2)" -eq 200 ]
+[ "$(scale_counter_for_rule_multiplier 200 2 1)" -eq 100 ]
+[ "$(get_counter_rule_multiplier_from_count 7 2)" -eq 2 ]
+[ "$(calculate_total_traffic 100 200 double)" -eq 300 ]
+[ "$(calculate_total_traffic 100 200 single)" -eq 300 ]
+
+today=$(get_current_date)
+jq -n --arg port "3265" --arg date "$today" '
+    {last_snapshot: {}, state: {}, daily: {($port): {($date): {input: 100, output: 200}}}}
+' > "$TRAFFIC_STATS_FILE"
+scale_current_day_traffic_stats 3265 1 2 1 2
+jq -e --arg port "3265" --arg date "$today" \
+    '.daily[$port][$date].input == 200 and .daily[$port][$date].output == 400' \
+    "$TRAFFIC_STATS_FILE" >/dev/null
+rm -f "$TRAFFIC_STATS_FILE"
 
 update_config_file '.concurrency.first = 1' &
 first_pid=$!
@@ -98,6 +117,81 @@ jq -e '
     .notifications.telegram.status_notifications.last_sent == null
 ' \
     "$CONFIG_FILE" >/dev/null
+
+readonly DOUBLE_REPAIR_CAPTURE="$TEST_DIR/double-repair.capture"
+(
+    count_counter_rules() { echo 4; }
+    get_nftables_counter_data() { echo "100 200"; }
+    remove_nftables_quota() { :; }
+    remove_nftables_rules() { :; }
+    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_REPAIR_CAPTURE"; }
+    add_nftables_rules() { :; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { :; }
+    apply_nftables_quota() { :; }
+    log_notification() { :; }
+    repair_port_traffic_rules 8123
+)
+[ "$(cat "$DOUBLE_REPAIR_CAPTURE")" = "200 400" ]
+
+readonly SINGLE_REPAIR_CAPTURE="$TEST_DIR/single-repair.capture"
+update_config_file '.ports["3265"].billing_mode = "single"'
+(
+    count_counter_rules() {
+        if [ "$2" = "in" ]; then echo 0; else echo 4; fi
+    }
+    get_nftables_counter_data() { echo "0 300"; }
+    remove_nftables_quota() { :; }
+    remove_nftables_rules() { :; }
+    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$SINGLE_REPAIR_CAPTURE"; }
+    add_nftables_rules() { :; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { :; }
+    apply_nftables_quota() { :; }
+    log_notification() { :; }
+    repair_port_traffic_rules 3265
+)
+[ "$(cat "$SINGLE_REPAIR_CAPTURE")" = "0 300" ]
+update_config_file '.ports["3265"].billing_mode = "double"'
+
+readonly NFT_COMMAND_LOG="$TEST_DIR/nft-commands.log"
+nft() {
+    printf '%s\n' "$*" >> "$NFT_COMMAND_LOG"
+    if [ "${1:-}" = "list" ] && [ "${2:-}" = "counter" ]; then
+        echo "counter test { packets 1 bytes 100 }"
+    fi
+    return 0
+}
+
+: > "$NFT_COMMAND_LOG"
+update_config_file '.ports["3265"].billing_mode = "double"'
+add_nftables_rules 3265
+[ "$(grep -c 'add rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -c 'add rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -Ec 'add rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'add rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'add rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'add rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+
+: > "$NFT_COMMAND_LOG"
+apply_nftables_quota 3265 100GB
+[ "$(grep -c 'insert rule .*quota name port_3265_quota drop$' "$NFT_COMMAND_LOG")" -eq 16 ]
+
+: > "$NFT_COMMAND_LOG"
+update_config_file '.ports["3265"].billing_mode = "single"'
+add_nftables_rules 3265
+[ "$(grep -c 'add rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'add rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'add rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'add rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'add rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'add rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
+
+: > "$NFT_COMMAND_LOG"
+apply_nftables_quota 3265 100GB
+[ "$(grep -c 'insert rule .*quota name port_3265_quota drop$' "$NFT_COMMAND_LOG")" -eq 8 ]
+update_config_file '.ports["3265"].billing_mode = "double"'
+unset -f nft
 
 readonly CRON_FILE="$TEST_DIR/crontab"
 crontab() {
@@ -256,8 +350,9 @@ printf '%s\n' \
 nft() { :; }
 tc() { :; }
 ss() { :; }
+bc() { :; }
 cron() { :; }
-count_counter_rules() { echo 4; }
+count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
 self_check >/dev/null
 sed -i '/--snapshot-traffic/d' "$CRON_FILE"
