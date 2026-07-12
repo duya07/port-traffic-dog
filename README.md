@@ -20,8 +20,8 @@
 8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
 10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
-11. 修正双向统计重复/缺失计数规则和重复配额规则导致的流量/限额偏多或规则异常问题，并提供 `dog --repair-traffic-rules` 修复已安装规则。
-12. 当前周期流量、配额进度和限额初始化沿用原脚本的 nftables counter 口径；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
+11. 流量计费规则继承上游双向权重：双向为 `入站×2 + 出站×2`；定制单向模式为双向规则减半，即 `入站 + 出站`，修正上游单向只统计 out 的缺口。
+12. 当前周期流量、配额进度和限额初始化沿用 nftables counter 口径，counter 与 quota 使用完全一致的规则倍率；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
 13. 通知和自然日快照 cron 只在存在监控端口时运行；删除最后一个端口后会自动清理任务，残留旧任务也会在下次触发时自行退出并移除。
 14. 配置写入使用原子替换和短时锁，避免自动重置、通知配置和带宽 class ID 同时更新时互相覆盖。
 15. 从旧快照版升级时会清理已不再支持的 `--send-snapshot`、`--create-snapshot` 和旧快照清理 cron，但保留原快照文件与配置备份。
@@ -129,11 +129,11 @@ sudo dog --snapshot-traffic
 sudo dog --uninstall
 ```
 
-- `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
+- `--self-check`: 检查配置文件、计数/配额规则数量、cron、依赖命令、通知模块和 Telegram 连通性。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
 - `--refresh-port-reset-cron`: 根据当前端口重置策略重建自动重置任务，并清理旧版 `--reset-port` 和失效端口残留任务。
-- `--repair-traffic-rules`: 检查并修复旧版本重复/缺失的流量计数规则和异常配额规则；重复计数规则会按重复倍数折算当前 counter，配额规则会按当前 counter 重建，避免重复 quota 规则导致限额倍增。
+- `--repair-traffic-rules`: 按当前计费模式检查并重建 counter/quota 规则；双向目标为每个方向 8 条 counter 引用、16 条 quota 引用，单向目标为每个方向 4 条 counter 引用、8 条 quota 引用。升级时会按旧规则倍率换算已有 counter，避免已有流量丢失或再次翻倍。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
 
@@ -165,6 +165,10 @@ sudo dog --uninstall
 ## 6) 流量统计口径
 
 脚本仍把 nftables counter 作为当前周期流量和配额进度的权威来源；自动重置到期时清零 counter，因此每月、每 N 天、每 N 月、每年和指定到期日都可以沿用原脚本成熟的 counter 逻辑。`/etc/port-traffic-dog/traffic_stats.json` 只作为额外的自然日快照统计文件：
+
+- 双向模式沿用上游的两组规则，计费总量为 `入站×2 + 出站×2`；单向模式保留一组入站和一组出站规则，计费总量为 `入站 + 出站`，不是旧版的“仅 out”。
+- counter 与 quota 引用数量和倍率严格一致，因此界面进度达到配额时，nftables 阻断也按同一口径触发。
+- 从当前单组双向规则版本升级时，已有双向 counter 和当天快照会按权重 1→2 转换；上游原生双组规则按权重 2 识别，不会重复乘 2。旧单向配置无法还原过去未记录的入站流量，升级后入站从 0 开始累计。
 
 - `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
 - `daily`: 按北京时间自然日保存每日入站/出站增量。
