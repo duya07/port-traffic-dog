@@ -143,8 +143,10 @@ echo "已更新: ${DOG_PATH}"
 
 echo
 echo "[5/5] 刷新定时任务、修复流量规则并执行自检..."
+bash "${INSTALLED_SCRIPT_PATH}" --refresh-port-reset-cron >/dev/null
 bash "${INSTALLED_SCRIPT_PATH}" --refresh-notification-cron >/dev/null
 bash "${INSTALLED_SCRIPT_PATH}" --repair-traffic-rules >/dev/null
+echo "已执行: --refresh-port-reset-cron"
 echo "已执行: --refresh-notification-cron"
 echo "已执行: --repair-traffic-rules"
 

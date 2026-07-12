@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.3.9"
+readonly SCRIPT_VERSION="1.4.0"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -121,13 +121,6 @@ check_dependencies() {
         echo -e "${GREEN}依赖检查通过${NC}"
     fi
 
-    setup_script_permissions
-    setup_cron_environment
-    # 重启后恢复定时任务
-    local active_ports=($(get_active_ports 2>/dev/null || true))
-    for port in "${active_ports[@]}"; do
-        setup_port_auto_reset_cron "$port" >/dev/null 2>&1 || true
-    done
 }
 
 setup_script_permissions() {
@@ -161,9 +154,6 @@ check_root() {
 
 init_config() {
     mkdir -p "$CONFIG_DIR" "$(dirname "$LOG_FILE")"
-
-    # 静默下载通知模块，避免影响主流程
-    download_notification_modules >/dev/null 2>&1 || true
 
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" << 'EOF'
@@ -2582,10 +2572,10 @@ show_main_menu() {
     echo -e "${BLUE}1.${NC} 添加/删除端口监控     ${BLUE}2.${NC} 端口限制设置管理"
     echo -e "${BLUE}3.${NC} 流量重置管理          ${BLUE}4.${NC} 一键导出/导入配置"
     echo -e "${BLUE}5.${NC} 安装依赖(更新)脚本    ${BLUE}6.${NC} 卸载脚本"
-    echo -e "${BLUE}7.${NC} 通知管理"
+    echo -e "${BLUE}7.${NC} 通知管理              ${BLUE}8.${NC} 系统自检/修复"
     echo -e "${BLUE}0.${NC} 退出"
     echo
-    read -p "请选择操作 [0-7]: " choice
+    read -p "请选择操作 [0-8]: " choice
 
     case $choice in
         1) manage_port_monitoring ;;
@@ -2595,8 +2585,9 @@ show_main_menu() {
         5) install_update_script ;;
         6) uninstall_script ;;
         7) manage_notifications ;;
+        8) system_check_and_repair ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择，请输入0-7${NC}"; sleep 1; show_main_menu ;;
+        *) echo -e "${RED}无效选择，请输入0-8${NC}"; sleep 1; show_main_menu ;;
     esac
 }
 
@@ -4368,6 +4359,7 @@ install_update_script() {
 
     echo -e "${YELLOW}正在检查系统依赖...${NC}"
     check_dependencies true
+    init_config
 
     echo -e "${YELLOW}正在下载最新版本...${NC}"
 
@@ -4382,6 +4374,7 @@ install_update_script() {
 
             echo -e "${YELLOW}正在更新通知模块...${NC}"
             download_notification_modules "force" >/dev/null 2>&1 || true
+            refresh_port_auto_reset_cron_from_config
             refresh_notification_cron_from_config
             setup_traffic_snapshot_cron
 
@@ -4419,6 +4412,17 @@ exec bash "$INSTALLED_SCRIPT_PATH" "\$@"
 EOF
     chmod 755 "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
     echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
+}
+
+ensure_installation_files() {
+    local shortcut_path="/usr/local/bin/$SHORTCUT_COMMAND"
+    if [ -f "$INSTALLED_SCRIPT_PATH" ] && [ -f "$shortcut_path" ]; then
+        return 0
+    fi
+
+    # 首次直接运行下载脚本时，保留原有的安装与快捷命令行为。
+    create_shortcut_command >/dev/null
+    download_notification_modules >/dev/null 2>&1 || true
 }
 
 # 卸载脚本
@@ -4855,6 +4859,17 @@ setup_port_auto_reset_cron() {
     rm -f "$temp_cron"
 }
 
+refresh_port_auto_reset_cron_from_config() {
+    remove_all_port_auto_reset_cron
+
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local port
+    for port in "${active_ports[@]}"; do
+        setup_port_auto_reset_cron "$port"
+    done
+}
+
 remove_port_auto_reset_cron() {
     local port="$1"
     local temp_cron=$(mktemp)
@@ -5042,6 +5057,103 @@ self_check() {
         check_fail "端口配额配置无效: ${invalid_quota_ports[*]}"
     fi
 
+    if command -v nft >/dev/null 2>&1; then
+        local invalid_rule_ports=()
+        for configured_port in "${configured_ports[@]}"; do
+            local billing_mode
+            billing_mode=$(jq -r --arg port "$configured_port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE" 2>/dev/null || echo double)
+            local expected_in_count=0
+            local expected_out_count=4
+            if [ "$billing_mode" = "double" ]; then
+                expected_in_count=4
+            fi
+
+            local actual_in_count
+            actual_in_count=$(count_counter_rules "$configured_port" in)
+            local actual_out_count
+            actual_out_count=$(count_counter_rules "$configured_port" out)
+            local expected_quota_count=0
+            local quota_enabled
+            quota_enabled=$(jq -r --arg port "$configured_port" '.ports[$port].quota.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)
+            local quota_limit
+            quota_limit=$(jq -r --arg port "$configured_port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE" 2>/dev/null || echo unlimited)
+            if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
+                if [ "$billing_mode" = "double" ]; then
+                    expected_quota_count=8
+                else
+                    expected_quota_count=4
+                fi
+            fi
+            local actual_quota_count
+            actual_quota_count=$(count_quota_rules "$configured_port")
+
+            if [ "$actual_in_count" -ne "$expected_in_count" ] || \
+               [ "$actual_out_count" -ne "$expected_out_count" ] || \
+               [ "$actual_quota_count" -ne "$expected_quota_count" ]; then
+                invalid_rule_ports+=("$configured_port")
+            fi
+        done
+        if [ ${#invalid_rule_ports[@]} -eq 0 ]; then
+            check_ok "流量计数与配额规则完整"
+        else
+            check_fail "流量计数或配额规则异常: ${invalid_rule_ports[*]}"
+        fi
+    else
+        check_warn "nft 命令不可用，跳过流量规则核对"
+    fi
+
+    if command -v crontab >/dev/null 2>&1; then
+        local cron_content
+        cron_content=$(crontab -l 2>/dev/null || true)
+        local expected_reset_count=0
+        local cron_matches_config=true
+        for configured_port in "${configured_ports[@]}"; do
+            if port_has_auto_reset_policy "$configured_port"; then
+                expected_reset_count=$((expected_reset_count + 1))
+                if ! printf '%s\n' "$cron_content" | grep -Fq -- "--check-reset-port $configured_port "; then
+                    cron_matches_config=false
+                fi
+            fi
+        done
+
+        local actual_reset_count
+        actual_reset_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--(check-)?reset-port' || true)
+        local actual_snapshot_count
+        actual_snapshot_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--snapshot-traffic' || true)
+        local actual_telegram_count
+        actual_telegram_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--send-telegram-status' || true)
+        local actual_wecom_count
+        actual_wecom_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--send-wecom-status' || true)
+
+        local expected_snapshot_count=0
+        local expected_telegram_count=0
+        local expected_wecom_count=0
+        if [ ${#configured_ports[@]} -gt 0 ]; then
+            expected_snapshot_count=1
+            if [ "$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
+                expected_telegram_count=1
+            fi
+            if [ "$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
+                expected_wecom_count=1
+            fi
+        fi
+
+        if [ "$actual_reset_count" -ne "$expected_reset_count" ] || \
+           [ "$actual_snapshot_count" -ne "$expected_snapshot_count" ] || \
+           [ "$actual_telegram_count" -ne "$expected_telegram_count" ] || \
+           [ "$actual_wecom_count" -ne "$expected_wecom_count" ]; then
+            cron_matches_config=false
+        fi
+
+        if [ "$cron_matches_config" = "true" ]; then
+            check_ok "定时任务与当前配置一致"
+        else
+            check_fail "定时任务与当前端口、重置或通知配置不一致"
+        fi
+    else
+        check_warn "crontab 命令不可用，跳过定时任务核对"
+    fi
+
     if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
         check_ok "主脚本安装路径存在: $INSTALLED_SCRIPT_PATH"
     else
@@ -5119,12 +5231,67 @@ self_check() {
     return 1
 }
 
+system_check_and_repair() {
+    clear
+    echo -e "${BLUE}=== 系统自检/修复 ===${NC}"
+    echo
+
+    echo -e "${YELLOW}[1/6] 检查依赖、权限和本地配置...${NC}"
+    check_dependencies true
+    init_config
+    setup_script_permissions
+    setup_cron_environment
+    create_shortcut_command >/dev/null
+    echo -e "${GREEN}基础运行环境已就绪${NC}"
+
+    echo -e "${YELLOW}[2/6] 检查通知模块...${NC}"
+    if download_notification_modules >/dev/null 2>&1; then
+        echo -e "${GREEN}通知模块已就绪${NC}"
+    else
+        echo -e "${YELLOW}通知模块补齐失败，将在自检结果中显示${NC}"
+    fi
+
+    echo -e "${YELLOW}[3/6] 重建端口重置和通知定时任务...${NC}"
+    refresh_port_auto_reset_cron_from_config
+    refresh_notification_cron_from_config
+    setup_traffic_snapshot_cron
+    echo -e "${GREEN}定时任务已按当前配置刷新${NC}"
+
+    echo -e "${YELLOW}[4/6] 检查并修复流量与配额规则...${NC}"
+    local repaired_count
+    repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null || echo 0)
+    echo -e "${GREEN}流量规则检查完成，修复端口数: ${repaired_count}${NC}"
+
+    echo -e "${YELLOW}[5/6] 更新自然日流量快照...${NC}"
+    if record_traffic_snapshot >/dev/null 2>&1; then
+        echo -e "${GREEN}流量快照已更新${NC}"
+    else
+        echo -e "${YELLOW}流量快照更新失败，将保留现有统计数据${NC}"
+    fi
+
+    echo
+    echo -e "${YELLOW}[6/6] 执行最终自检...${NC}"
+    if self_check; then
+        echo -e "${GREEN}系统自检/修复完成${NC}"
+    else
+        echo -e "${YELLOW}修复后仍有异常，请根据上方 FAIL/WARN 处理${NC}"
+    fi
+
+    echo
+    read -r -p "按回车键返回主菜单..."
+    show_main_menu
+}
+
 main() {
     check_root
 
     # cron 快速路径：跳过重型初始化（依赖检查、通知模块下载、规则恢复等）
     if [ $# -gt 0 ]; then
         case $1 in
+            --version)
+                echo -e "${BLUE}$SCRIPT_NAME v$SCRIPT_VERSION${NC}"
+                exit 0
+                ;;
             --reset-port)
                 if [ $# -lt 2 ]; then
                     echo -e "${RED}错误：--reset-port 需要指定端口号${NC}"
@@ -5183,21 +5350,10 @@ main() {
         esac
     fi
 
-    # 完整启动流程（交互式菜单和其余命令需要）
-    check_dependencies
-    init_config
-    create_shortcut_command
-    refresh_notification_cron_from_config
-    setup_traffic_snapshot_cron
-
     if [ $# -gt 0 ]; then
         case $1 in
             --check-deps)
-                echo -e "${GREEN}依赖检查通过${NC}"
-                exit 0
-                ;;
-            --version)
-                echo -e "${BLUE}$SCRIPT_NAME v$SCRIPT_VERSION${NC}"
+                check_dependencies
                 exit 0
                 ;;
             --install)
@@ -5205,6 +5361,8 @@ main() {
                 exit 0
                 ;;
             --uninstall)
+                check_dependencies true
+                init_config
                 uninstall_script
                 exit 0
                 ;;
@@ -5213,6 +5371,7 @@ main() {
                 exit $?
                 ;;
             --sync-notification-modules)
+                mkdir -p "$CONFIG_DIR"
                 echo -e "${YELLOW}正在强制同步通知模块...${NC}"
                 if download_notification_modules "force"; then
                     echo -e "${GREEN}通知模块强制同步完成${NC}"
@@ -5223,11 +5382,24 @@ main() {
                 fi
                 ;;
             --refresh-notification-cron)
+                check_dependencies true
+                init_config
                 refresh_notification_cron_from_config
                 echo -e "${GREEN}通知定时任务已刷新${NC}"
                 exit 0
                 ;;
+            --refresh-port-reset-cron)
+                check_dependencies true
+                init_config
+                setup_cron_environment
+                refresh_port_auto_reset_cron_from_config
+                ensure_cron_service_running
+                echo -e "${GREEN}端口自动重置定时任务已刷新${NC}"
+                exit 0
+                ;;
             --repair-traffic-rules)
+                check_dependencies true
+                init_config
                 repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null || echo 0)
                 echo -e "${GREEN}重复流量规则检查完成，修复端口数: ${repaired_count}${NC}"
                 exit 0
@@ -5250,6 +5422,7 @@ main() {
                 echo "  --self-check              执行一键自检"
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
+                echo "  --refresh-port-reset-cron    刷新端口自动重置定时任务"
                 echo "  --repair-traffic-rules  修复重复流量计数/配额规则"
                 echo "  --snapshot-traffic       写入自然日流量快照"
                 echo "  --reset-port PORT         重置指定端口流量"
@@ -5262,8 +5435,10 @@ main() {
         esac
     fi
 
-    repair_duplicate_traffic_rules >/dev/null 2>&1 || true
-    record_traffic_snapshot >/dev/null 2>&1 || true
+    # 普通菜单只做本地轻量初始化；重型修复由菜单 8 主动执行。
+    check_dependencies true
+    init_config
+    ensure_installation_files
     show_main_menu
 }
 

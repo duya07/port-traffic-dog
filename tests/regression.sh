@@ -132,6 +132,12 @@ grep -q -- '--send-snapshot' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
+refresh_port_auto_reset_cron_from_config
+! grep -q -- '--reset-port' "$CRON_FILE"
+[ "$(grep -c -- '--check-reset-port 3265' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--check-reset-port 8123' "$CRON_FILE")" -eq 1 ]
+grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
+
 update_config_file '.ports = {}'
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
@@ -224,5 +230,84 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     wecom_update_config_file '.compat.wecom = true'
 )
 jq -e '.compat == {telegram: true, wecom: true}' "$CONFIG_FILE" >/dev/null
+
+# 自检必须核对流量规则和 cron，而不是只检查配置文件格式。
+update_config_file '
+    .ports = {
+        "2000": {
+            enabled: true,
+            billing_mode: "double",
+            quota: {enabled: false, monthly_limit: "unlimited"}
+        }
+    } |
+    .notifications.telegram.enabled = true |
+    .notifications.telegram.bot_token = "" |
+    .notifications.telegram.status_notifications = {enabled: true, interval: "1m"} |
+    .notifications.wecom.status_notifications = {enabled: true, interval: "1m"}
+'
+mkdir -p "$CONFIG_DIR/notifications"
+cp "$PROJECT_DIR/telegram.sh" "$CONFIG_DIR/notifications/telegram.sh"
+cp "$PROJECT_DIR/wecom.sh" "$CONFIG_DIR/notifications/wecom.sh"
+printf '%s\n' \
+    '* * * * * /usr/local/bin/port-traffic-dog.sh --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot' \
+    '* * * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
+    '* * * * * /usr/local/bin/port-traffic-dog.sh --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知' \
+    > "$CRON_FILE"
+nft() { :; }
+tc() { :; }
+ss() { :; }
+cron() { :; }
+count_counter_rules() { echo 4; }
+count_quota_rules() { echo 0; }
+self_check >/dev/null
+sed -i '/--snapshot-traffic/d' "$CRON_FILE"
+! self_check >/dev/null
+
+# 普通启动只能执行轻量初始化，不能重复改 cron、同步模块或修复规则。
+readonly STARTUP_TRACE_FILE="$TEST_DIR/startup.trace"
+trace_startup_call() {
+    printf '%s\n' "$1" >> "$STARTUP_TRACE_FILE"
+}
+check_root() { trace_startup_call check_root; }
+check_dependencies() { trace_startup_call check_dependencies; }
+init_config() { trace_startup_call init_config; }
+ensure_installation_files() { trace_startup_call ensure_installation_files; }
+create_shortcut_command() { trace_startup_call create_shortcut_command; }
+setup_script_permissions() { trace_startup_call setup_script_permissions; }
+setup_cron_environment() { trace_startup_call setup_cron_environment; }
+download_notification_modules() { trace_startup_call download_notification_modules; }
+refresh_port_auto_reset_cron_from_config() { trace_startup_call refresh_port_auto_reset_cron_from_config; }
+refresh_notification_cron_from_config() { trace_startup_call refresh_notification_cron_from_config; }
+setup_traffic_snapshot_cron() { trace_startup_call setup_traffic_snapshot_cron; }
+repair_duplicate_traffic_rules() {
+    trace_startup_call repair_duplicate_traffic_rules
+    echo 0
+}
+record_traffic_snapshot() { trace_startup_call record_traffic_snapshot; }
+self_check() { trace_startup_call self_check; }
+show_main_menu() { trace_startup_call show_main_menu; }
+clear() { :; }
+read() { :; }
+
+: > "$STARTUP_TRACE_FILE"
+main
+[ "$(cat "$STARTUP_TRACE_FILE")" = $'check_root\ncheck_dependencies\ninit_config\nensure_installation_files\nshow_main_menu' ]
+
+: > "$STARTUP_TRACE_FILE"
+(main --version >/dev/null)
+[ "$(cat "$STARTUP_TRACE_FILE")" = "check_root" ]
+
+grep -q -- '--refresh-port-reset-cron' "$PROJECT_DIR/migrate-to-custom.sh"
+
+: > "$STARTUP_TRACE_FILE"
+system_check_and_repair >/dev/null
+for expected_call in \
+    check_dependencies init_config setup_script_permissions setup_cron_environment \
+    create_shortcut_command download_notification_modules \
+    refresh_port_auto_reset_cron_from_config refresh_notification_cron_from_config \
+    setup_traffic_snapshot_cron repair_duplicate_traffic_rules \
+    record_traffic_snapshot self_check show_main_menu; do
+    [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
+done
 
 echo "regression tests passed"

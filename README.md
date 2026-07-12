@@ -26,6 +26,7 @@
 14. 配置写入使用原子替换和短时锁，避免自动重置、通知配置和带宽 class ID 同时更新时互相覆盖。
 15. 从旧快照版升级时会清理已不再支持的 `--send-snapshot`、`--create-snapshot` 和旧快照清理 cron，但保留原快照文件与配置备份。
 16. 菜单更新会先校验新脚本语法并修正安装权限；更新成功后重新加载已安装版本，避免界面继续运行旧代码。
+17. 普通 `dog` 使用轻量启动，不再重复重写 cron、同步通知模块、全量修复规则或写流量快照；这些维护动作集中到主菜单“系统自检/修复”。首次直接运行下载脚本时仍会自动安装主脚本并创建 `dog`，保持原安装方式兼容。
 
 ## 下载方式说明
 
@@ -122,6 +123,7 @@ sudo dog --self-check
 sudo dog --self-check
 sudo dog --sync-notification-modules
 sudo dog --refresh-notification-cron
+sudo dog --refresh-port-reset-cron
 sudo dog --repair-traffic-rules
 sudo dog --snapshot-traffic
 sudo dog --uninstall
@@ -130,9 +132,12 @@ sudo dog --uninstall
 - `--self-check`: 检查配置文件、依赖命令、通知模块和 Telegram 连通性。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
+- `--refresh-port-reset-cron`: 根据当前端口重置策略重建自动重置任务，并清理旧版 `--reset-port` 和失效端口残留任务。
 - `--repair-traffic-rules`: 检查并修复旧版本重复/缺失的流量计数规则和异常配额规则；重复计数规则会按重复倍数折算当前 counter，配额规则会按当前 counter 重建，避免重复 quota 规则导致限额倍增。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron 和端口自动重置 cron。
+
+主菜单选择 `8. 系统自检/修复`，可主动补齐依赖和通知模块、修正权限与快捷命令、按当前配置重建 cron、检查修复流量/配额规则、更新自然日快照并执行最终自检。普通打开 `dog` 时不会重复执行这些重操作；只有检测到 nftables 监控规则确实缺失时，才会按原配置自动恢复。
 
 ## 5) 流量配额自动重置
 
