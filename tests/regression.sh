@@ -118,6 +118,90 @@ jq -e '
 ' \
     "$CONFIG_FILE" >/dev/null
 
+update_config_file '.ports["9999"] = {
+    enabled: true,
+    billing_mode: "single",
+    quota: {
+        enabled: true,
+        monthly_limit: "10GB",
+        reset_day: 31,
+        reset_policy: {type: "monthly", day: 31}
+    }
+}'
+(
+    get_beijing_month_year() { echo "28 2 2025"; }
+    [ "$(get_port_cycle_start_date 9999)" = "2025-02-28" ]
+    [ "$(get_port_cycle_range 9999)" = "2025/2/28-2025/3/30" ]
+)
+update_config_file 'del(.ports["9999"])'
+
+update_config_file '.ports["3265"].quota.reset_policy = {
+    type: "monthly",
+    day: 2,
+    next_reset_date: "2026-07-12"
+}'
+(
+    get_current_date() { echo "2026-07-12"; }
+    perform_auto_reset_port() { return 1; }
+    ! check_reset_port_due 3265
+)
+jq -e '.ports["3265"].quota.reset_policy.next_reset_date == "2026-07-12"' "$CONFIG_FILE" >/dev/null
+(
+    get_current_date() { echo "2026-07-12"; }
+    perform_auto_reset_port() { return 0; }
+    check_reset_port_due 3265
+)
+jq -e '
+    .ports["3265"].quota.reset_policy.last_reset_date == "2026-07-12" and
+    .ports["3265"].quota.reset_policy.next_reset_date == "2026-08-02"
+' "$CONFIG_FILE" >/dev/null
+
+(
+    test_input=100
+    test_output=200
+    test_quota=300
+    quota_exists=true
+    nft() {
+        local action="${1:-}"
+        local object_type="${2:-}"
+        local object_name="${5:-}"
+        if [ "$action" = "list" ] && [ "$object_type" = "counter" ]; then
+            if [[ "$object_name" == *_in ]]; then
+                echo "counter $object_name { packets 1 bytes $test_input }"
+            else
+                echo "counter $object_name { packets 1 bytes $test_output }"
+            fi
+        elif [ "$action" = "list" ] && [ "$object_type" = "quota" ]; then
+            [ "$quota_exists" = "true" ] || return 1
+            echo "quota $object_name { over 1000 bytes used $test_quota bytes }"
+        elif [ "$action" = "reset" ] && [ "$object_type" = "counter" ]; then
+            if [[ "$object_name" == *_in ]]; then test_input=0; else test_output=0; fi
+        elif [ "$action" = "reset" ] && [ "$object_type" = "quota" ]; then
+            test_quota=0
+        fi
+    }
+
+    reset_port_nftables_counters 3265
+    [ "$test_input" -eq 0 ]
+    [ "$test_output" -eq 0 ]
+    [ "$test_quota" -eq 0 ]
+
+    test_input=100
+    test_output=200
+    quota_exists=false
+    ! reset_port_nftables_counters 3265
+    [ "$test_input" -eq 100 ]
+    [ "$test_output" -eq 200 ]
+)
+
+readonly RESET_LOCK_CAPTURE="$TEST_DIR/reset-lock.capture"
+(
+    acquire_reset_lock() { return 1; }
+    perform_auto_reset_port() { touch "$RESET_LOCK_CAPTURE"; }
+    ! auto_reset_port 3265
+)
+[ ! -e "$RESET_LOCK_CAPTURE" ]
+
 readonly DOUBLE_REPAIR_CAPTURE="$TEST_DIR/double-repair.capture"
 (
     count_counter_rules() { echo 4; }
@@ -221,22 +305,24 @@ printf '%s\n' \
 
 setup_port_auto_reset_cron 8123
 ! grep -q -- '--reset-port 8123' "$CRON_FILE"
-[ "$(grep -c -- '--check-reset-port 8123' "$CRON_FILE")" -eq 1 ]
+! grep -q -- '--check-reset-port' "$CRON_FILE"
+[ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
+grep -Fq -- '*/5 * * * * /usr/local/bin/port-traffic-dog.sh --check-scheduled-resets' "$CRON_FILE"
 grep -q -- '--send-snapshot' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
 refresh_port_auto_reset_cron_from_config
 ! grep -q -- '--reset-port' "$CRON_FILE"
-[ "$(grep -c -- '--check-reset-port 3265' "$CRON_FILE")" -eq 1 ]
-[ "$(grep -c -- '--check-reset-port 8123' "$CRON_FILE")" -eq 1 ]
+! grep -q -- '--check-reset-port' "$CRON_FILE"
+[ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
 update_config_file '.ports = {}'
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
 ! grep -Eq -- '--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
-grep -q -- '--check-reset-port 8123' "$CRON_FILE"
+grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 setup_telegram_notification_cron
@@ -248,7 +334,7 @@ grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
 setup_traffic_snapshot_cron
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
-grep -q -- '--check-reset-port 8123' "$CRON_FILE"
+grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
 update_config_file '.ports = {}'
@@ -256,6 +342,8 @@ setup_telegram_notification_cron
 ! grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
+refresh_port_auto_reset_cron_from_config
+! grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 
 update_config_file '.ports = {"2000": {enabled: true}}'
 jq -n '{

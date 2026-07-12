@@ -156,10 +156,12 @@ sudo dog --uninstall
 - 旧配置里的 `quota.reset_day` 会自动继承为“每月几号重置”，例如原来设置每月 2 日重置，会继续按每月 2 日执行。
 - 新增或修改周期型策略时，下一次自动重置会从未来日期开始计算，避免刚添加端口就被当天任务重置。
 - 第一次批量添加多个有限配额端口时，可选择为每个端口分别设置自动重置策略。
-- 指定到期日期为当天时，脚本会询问是否立即重置当前流量；不立即重置则等待下一次每日检查。
+- 指定到期日期为当天时，脚本会询问是否立即重置当前流量；不立即重置则等待下一次周期检查。
 - 31 号遇到没有 31 号的月份，会按该月最后一天处理。
 - 2 月 29 日遇到非闰年，会按 2 月 28 日处理。
-- 自动任务每天 00:05 检查是否到期，只有到期端口才会真正重置。
+- 自动任务每 5 分钟按北京时间检查一次所有端口，只有到期端口才会真正重置，不依赖 VPS 的系统时区。
+- 重置会验证 counter/quota 确实清零；失败时保留原到期日期并在下一次检查时重试，不会错误推进周期。
+- cron、手动命令和即时重置共用重置锁，避免同一端口被并发清零两次。
 - 手动“立即重置”只清零当前流量，不会自动改变下一次到期日期。
 
 ## 6) 流量统计口径
@@ -226,7 +228,7 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "no related cron"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port|--check-scheduled-resets' || echo "no related cron"
 ```
 
 ### 8.2 再清（卸载后兜底）
@@ -247,7 +249,7 @@ if sudo tc qdisc show dev "${IFACE}" | grep -q 'htb 1:'; then
   sudo tc qdisc del dev "${IFACE}" root
 fi
 
-sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' | sudo crontab -
+sudo crontab -l 2>/dev/null | grep -v -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port|--check-scheduled-resets' | sudo crontab -
 ```
 
 ### 8.3 复查（确认清理完成）
@@ -260,7 +262,7 @@ sudo tc qdisc show dev "${IFACE}"
 sudo tc class show dev "${IFACE}"
 sudo tc filter show dev "${IFACE}"
 
-sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port' || echo "cron clean"
+sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-status|--snapshot-traffic|--reset-port|--check-reset-port|--check-scheduled-resets' || echo "cron clean"
 ```
 
 ## VPS 安装后的系统文件
