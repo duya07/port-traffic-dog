@@ -10,6 +10,7 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
+trap 'echo "regression failed at line $LINENO" >&2' ERR
 
 # Load function definitions without running main, and redirect all state to a temp directory.
 source <(sed \
@@ -248,9 +249,17 @@ nft() {
     printf '%s\n' "$*" >> "$NFT_COMMAND_LOG"
     if [ "${1:-}" = "list" ] && [ "${2:-}" = "counter" ]; then
         echo "counter test { packets 1 bytes 100 }"
+    elif [ "${1:-}" = "list" ] && [ "${2:-}" = "quota" ]; then
+        echo "quota test { over 1 bytes used 0 bytes }"
     fi
     return 0
 }
+count_quota_rules() {
+    local mode
+    mode=$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")
+    get_expected_quota_rule_count "$mode"
+}
+nftables_quota_is_absent() { return 0; }
 
 : > "$NFT_COMMAND_LOG"
 update_config_file '.ports["3265"].billing_mode = "double"'
@@ -279,7 +288,23 @@ add_nftables_rules 3265
 : > "$NFT_COMMAND_LOG"
 apply_nftables_quota 3265 100GB
 [ "$(grep -c 'insert rule .*quota name port_3265_quota drop$' "$NFT_COMMAND_LOG")" -eq 8 ]
+(
+    count_quota_rules() { echo 0; }
+    nft() {
+        if [ "${1:-}" = "list" ] && [ "${2:-}" = "counter" ]; then
+            echo "counter test { packets 1 bytes 100 }"
+            return 0
+        fi
+        if [ "${1:-}" = "list" ] && [ "${2:-}" = "quota" ]; then
+            return 1
+        fi
+        return 0
+    }
+    ! apply_nftables_quota 3265 100GB
+)
 update_config_file '.ports["3265"].billing_mode = "double"'
+unset -f count_quota_rules
+unset -f nftables_quota_is_absent
 unset -f nft
 
 readonly CRON_FILE="$TEST_DIR/crontab"
@@ -419,7 +444,7 @@ remove_nftables_quota() {
 log_notification() {
     :
 }
-apply_nftables_quota 2000 "invalid"
+! apply_nftables_quota 2000 "invalid"
 [ "$quota_removed" = "false" ]
 
 update_config_file '
@@ -529,6 +554,10 @@ bc() { :; }
 cron() { :; }
 count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
+self_check >/dev/null
+sed -i 's/^\* \* \* \* \* \(.*--snapshot-traffic.*\)$/0 * * * * \1/' "$CRON_FILE"
+! self_check >/dev/null
+sed -i 's/^0 \* \* \* \* \(.*--snapshot-traffic.*\)$/* * * * * \1/' "$CRON_FILE"
 self_check >/dev/null
 sed -i '/--snapshot-traffic/d' "$CRON_FILE"
 ! self_check >/dev/null

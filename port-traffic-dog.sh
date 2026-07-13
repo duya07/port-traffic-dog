@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.4.4"
+readonly SCRIPT_VERSION="1.4.5"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -1393,7 +1393,10 @@ repair_port_traffic_rules() {
     local monthly_limit
     monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
     if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ]; then
-        apply_nftables_quota "$port" "$monthly_limit"
+        if ! apply_nftables_quota "$port" "$monthly_limit"; then
+            log_notification "port $port traffic rules rebuilt, but quota rules could not be restored"
+            return 1
+        fi
     fi
 
     log_notification "port $port traffic rules rebuilt: in_rules=$in_rule_count/$expected_in_count, out_rules=$out_rule_count/$expected_out_count, in_multiplier=$input_source_multiplier->$target_multiplier, out_multiplier=$output_source_multiplier->$target_multiplier"
@@ -1422,7 +1425,10 @@ repair_port_quota_rules() {
         return 1
     fi
 
-    apply_nftables_quota "$port" "$monthly_limit"
+    if ! apply_nftables_quota "$port" "$monthly_limit"; then
+        log_notification "port $port quota rules rebuild failed: quota_rules=$quota_rule_count, expected=$expected_count"
+        return 1
+    fi
     log_notification "port $port quota rules rebuilt: quota_rules=$quota_rule_count, expected=$expected_count"
     return 0
 }
@@ -3498,6 +3504,10 @@ set_port_quota_limit() {
 
         if [ "$quota" = "0" ] || [ -z "$quota" ]; then
             remove_nftables_quota "$port"
+            if ! nftables_quota_is_absent "$port"; then
+                echo -e "${RED}端口 $port 流量配额清理失败，配置未修改${NC}"
+                continue
+            fi
             # 设为无限额时删除自动重置策略并清除定时任务
             update_config_file '
                 .ports[$port].quota.enabled = true |
@@ -3511,11 +3521,19 @@ set_port_quota_limit() {
             continue
         fi
 
-        remove_nftables_quota "$port"
-        apply_nftables_quota "$port" "$quota"
-
         # 获取当前配额限制状态
-        local current_monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
+        local current_monthly_limit
+        current_monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
+        local current_quota_enabled
+        current_quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // false" "$CONFIG_FILE")
+
+        if ! apply_nftables_quota "$port" "$quota"; then
+            if [ "$current_quota_enabled" = "true" ] && [ "$current_monthly_limit" != "unlimited" ]; then
+                apply_nftables_quota "$port" "$current_monthly_limit" >/dev/null 2>&1 || true
+            fi
+            echo -e "${RED}端口 $port 流量配额应用失败，配置未修改${NC}"
+            continue
+        fi
         
         # 从无限额改为有限额时默认添加reset_day=1
         if [ "$current_monthly_limit" = "unlimited" ]; then
@@ -3686,7 +3704,7 @@ apply_nftables_quota() {
     quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
     if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
         log_notification "端口 $port 配额值无效，已保留现有限额规则: $quota_limit"
-        return 0
+        return 1
     fi
 
     # Use raw nftables counters as the current-cycle baseline.
@@ -3696,6 +3714,10 @@ apply_nftables_quota() {
     local current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
 
     remove_nftables_quota "$port"
+    if ! nftables_quota_is_absent "$port"; then
+        log_notification "端口 $port 旧配额规则清理不完整，已停止应用新配额"
+        return 1
+    fi
 
     if is_port_range "$port"; then
         local port_safe=$(echo "$port" | tr '-' '_')
@@ -3769,6 +3791,30 @@ apply_nftables_quota() {
             nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
         fi
     fi
+
+    local expected_rule_count
+    expected_rule_count=$(get_expected_quota_rule_count "$billing_mode")
+    local actual_rule_count
+    actual_rule_count=$(count_quota_rules "$port")
+    if ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 ||
+       [ "$actual_rule_count" -ne "$expected_rule_count" ]; then
+        log_notification "端口 $port 配额规则创建不完整: rules=${actual_rule_count}/${expected_rule_count}"
+        remove_nftables_quota "$port" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+nftables_quota_is_absent() {
+    local port="$1"
+    local table_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    local family
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local quota_name
+    quota_name=$(get_port_quota_name "$port")
+
+    [ "$(count_quota_rules "$port")" -eq 0 ] &&
+        ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1
 }
 
 # 删除nftables配额限制 - 使用handle删除法
@@ -5473,7 +5519,7 @@ self_check() {
         done
         if [ "$has_reset_policy" = "true" ]; then
             expected_reset_count=1
-            if ! printf '%s\n' "$cron_content" | grep -Fq -- "--check-scheduled-resets "; then
+            if ! printf '%s\n' "$cron_content" | grep -Eq '^\*/5[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)'; then
                 cron_matches_config=false
             fi
         fi
@@ -5492,6 +5538,9 @@ self_check() {
         local expected_wecom_count=0
         if [ ${#configured_ports[@]} -gt 0 ]; then
             expected_snapshot_count=1
+            if ! printf '%s\n' "$cron_content" | grep -Eq '^\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--snapshot-traffic([[:space:]]|$)'; then
+                cron_matches_config=false
+            fi
             if [ "$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
                [ "$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
                 expected_telegram_count=1
@@ -5771,11 +5820,6 @@ main() {
                 init_config
                 repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null || echo 0)
                 echo -e "${GREEN}流量计数/配额规则检查完成，修复端口数: ${repaired_count}${NC}"
-                exit 0
-                ;;
-            --snapshot-traffic)
-                record_traffic_snapshot >/dev/null 2>&1 || true
-                echo -e "${GREEN}流量快照已更新${NC}"
                 exit 0
                 ;;
             *)
