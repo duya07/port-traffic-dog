@@ -166,6 +166,11 @@ if [ "${ports_before}" != "${ports_after}" ]; then
     echo "迁移后: ${ports_after}"
     exit 1
 fi
+if [ "$(jq 'length' <<< "${ports_after}")" -gt 0 ] &&
+   ! crontab -l 2>/dev/null | grep -q 'port-traffic-dog.*--restore-runtime'; then
+    echo "错误: 迁移后缺少开机运行时恢复任务"
+    exit 1
+fi
 
 if ! bash "${INSTALLED_SCRIPT_PATH}" --self-check; then
     echo "错误: 迁移后自检失败，备份目录: ${BACKUP_DIR}"

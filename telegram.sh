@@ -46,12 +46,19 @@ normalize_telegram_api_base() {
     echo "$raw_base"
 }
 
+telegram_api_base_is_secure() {
+    local api_base="$1"
+    [[ "$api_base" =~ ^https:// ]] ||
+        [[ "$api_base" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]]
+}
+
 get_telegram_api_base() {
     local route=$(get_telegram_api_route)
     local custom_base=$(jq -r '.notifications.telegram.custom_api_base // "https://tgapi.duyaw.com/"' "$CONFIG_FILE" 2>/dev/null || echo "https://tgapi.duyaw.com/")
     custom_base=$(normalize_telegram_api_base "$custom_base")
 
-    if [ "$route" = "custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
+    if [ "$route" = "custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ] &&
+       telegram_api_base_is_secure "$custom_base"; then
         echo "$custom_base"
     else
         echo "https://api.telegram.org"

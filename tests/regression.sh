@@ -33,6 +33,12 @@ write_base_config() {
 }
 
 write_base_config
+validate_config_file "$CONFIG_FILE"
+cp "$CONFIG_FILE" "$TEST_DIR/config.valid.json"
+jq '.ports = {"3265": {}, "3000-4000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.overlap.json"
+! validate_config_file "$TEST_DIR/config.overlap.json" >/dev/null 2>&1
+jq '.ports = {"70000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.bad-port.json"
+! validate_config_file "$TEST_DIR/config.bad-port.json" >/dev/null 2>&1
 
 mkdir "$TRAFFIC_STATS_LOCK_DIR"
 printf '99999999 0\n' > "$TRAFFIC_STATS_LOCK_DIR/owner"
@@ -80,6 +86,34 @@ jq -e --arg port "3265" --arg date "$today" \
     '.daily[$port][$date].input == 200 and .daily[$port][$date].output == 400' \
     "$TRAFFIC_STATS_FILE" >/dev/null
 rm -f "$TRAFFIC_STATS_FILE"
+
+cp "$CONFIG_FILE" "$TEST_DIR/config.before-snapshot.json"
+update_config_file '
+    .global.data_retention_days = 30 |
+    .ports = {"3265": {enabled:true,billing_mode:"single",quota:{enabled:false,monthly_limit:"unlimited"}}}
+'
+jq -n '{last_snapshot:{},state:{},daily:{"3265":{"2025-01-01":{input:1,output:1}}}}' > "$TRAFFIC_STATS_FILE"
+(
+    current_input=100
+    current_output=200
+    port_counter_objects_exist() { return 0; }
+    get_nftables_counter_data() { echo "$current_input $current_output"; }
+    get_current_date() { echo "2026-07-11"; }
+    get_beijing_time() { echo "2026-07-11T12:00:00+08:00"; }
+    record_traffic_snapshot
+    current_input=150
+    current_output=260
+    record_traffic_snapshot
+    record_traffic_snapshot
+)
+jq -e '
+    .daily["3265"]["2026-07-11"].input == 50 and
+    .daily["3265"]["2026-07-11"].output == 60 and
+    .daily["3265"]["2025-01-01"] == null
+' "$TRAFFIC_STATS_FILE" >/dev/null
+jq -e '."3265".input == 150 and ."3265".output == 260' "$TRAFFIC_DATA_FILE" >/dev/null
+cp "$TEST_DIR/config.before-snapshot.json" "$CONFIG_FILE"
+rm -f "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE"
 
 update_config_file '.concurrency.first = 1' &
 first_pid=$!
@@ -161,6 +195,16 @@ jq -e '
     .ports["3265"].quota.reset_policy.last_reset_date == "2026-07-12" and
     .ports["3265"].quota.reset_policy.next_reset_date == "2026-08-02"
 ' "$CONFIG_FILE" >/dev/null
+
+update_config_file '.ports["3265"].quota.reset_policy.next_reset_date = "2026-08-02"'
+record_reset_history 3265 123 "2026-08-02"
+(
+    get_current_date() { echo "2026-08-02"; }
+    perform_auto_reset_port() { echo called > "$TEST_DIR/repeated-reset"; return 0; }
+    check_reset_port_due 3265
+)
+[ ! -f "$TEST_DIR/repeated-reset" ]
+jq -e '.ports["3265"].quota.reset_policy.last_reset_date == "2026-08-02"' "$CONFIG_FILE" >/dev/null
 
 (
     test_input=100
@@ -259,6 +303,13 @@ count_quota_rules() {
     mode=$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")
     get_expected_quota_rule_count "$mode"
 }
+count_counter_rules() {
+    local port="$1"
+    local direction="$2"
+    local prefix
+    prefix=$(get_port_counter_prefix "$port")
+    grep -c "counter name ${prefix}_${direction}$" "$NFT_COMMAND_LOG" 2>/dev/null || true
+}
 nftables_quota_is_absent() { return 0; }
 
 : > "$NFT_COMMAND_LOG"
@@ -303,6 +354,20 @@ apply_nftables_quota 3265 100GB
     ! apply_nftables_quota 3265 100GB
 )
 update_config_file '.ports["3265"].billing_mode = "double"'
+update_config_file '.ports["3000-4000"] = {enabled:true,billing_mode:"single",quota:{enabled:false,monthly_limit:"unlimited"}}'
+: > "$NFT_COMMAND_LOG"
+add_nftables_rules 3000-4000
+! grep -q 'meta mark set.*counter name' "$NFT_COMMAND_LOG"
+[ "$(grep -c 'counter name port_3000_4000_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+update_config_file 'del(.ports["3000-4000"])'
+
+[ "$(generate_port_range_mark 1-2)" = "$(generate_port_range_mark 721-898)" ]
+update_config_file '.ports["1-2"]={bandwidth_limit:{}} | .ports["721-898"]={bandwidth_limit:{}}'
+mark_one=$(get_or_create_port_range_mark 1-2 1:2)
+mark_two=$(get_or_create_port_range_mark 721-898 1:3)
+[ "$mark_one" != "$mark_two" ]
+update_config_file 'del(.ports["1-2"], .ports["721-898"])'
+
 unset -f count_quota_rules
 unset -f nftables_quota_is_absent
 unset -f nft
@@ -346,6 +411,7 @@ migrate_legacy_cron_if_needed
 ! grep -Eq -- '--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
 [ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 printf '%s\n' '5 0 * * * /usr/local/bin/port-traffic-dog.sh --check-reset-port 3011 >/dev/null 2>&1  # 端口流量狗自动重置端口3011' >> "$CRON_FILE"
@@ -365,6 +431,7 @@ grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 update_config_file '.ports = {}'
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
+! grep -q -- '--restore-runtime' "$CRON_FILE"
 ! grep -Eq -- '--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
 grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
@@ -392,6 +459,7 @@ update_config_file '
 setup_traffic_snapshot_cron
 setup_traffic_snapshot_cron
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
 grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
@@ -415,6 +483,7 @@ restore_counter_value() {
 restore_traffic_data_from_backup
 [ "${#restored_ports[@]}" -eq 1 ]
 [ "${restored_ports[0]}" = "2000" ]
+[ -f "$TRAFFIC_DATA_FILE" ]
 
 jq -n '{
     last_snapshot: {"2000": {}, "3000": {}},
@@ -494,6 +563,15 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     unset -f update_config_file
     source "$PROJECT_DIR/telegram.sh"
     telegram_update_config_file '.compat.telegram = true'
+    telegram_update_config_file '
+        .notifications.telegram.api_route = "custom" |
+        .notifications.telegram.custom_api_base = "http://example.com"
+    '
+    [ "$(get_telegram_api_base)" = "https://api.telegram.org" ]
+    telegram_update_config_file '.notifications.telegram.custom_api_base = "http://127.0.0.1:8080"'
+    [ "$(get_telegram_api_base)" = "http://127.0.0.1:8080" ]
+    telegram_update_config_file '.notifications.telegram.custom_api_base = "https://tg.example.com/"'
+    [ "$(get_telegram_api_base)" = "https://tg.example.com" ]
 )
 (
     unset -f update_config_file
@@ -543,6 +621,7 @@ mkdir -p "$CONFIG_DIR/notifications"
 cp "$PROJECT_DIR/telegram.sh" "$CONFIG_DIR/notifications/telegram.sh"
 cp "$PROJECT_DIR/wecom.sh" "$CONFIG_DIR/notifications/wecom.sh"
 printf '%s\n' \
+    '@reboot sleep 15 && /usr/local/bin/port-traffic-dog.sh --restore-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知' \
