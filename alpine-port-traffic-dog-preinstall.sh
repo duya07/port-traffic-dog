@@ -17,6 +17,7 @@ apk update
 apk add --no-cache \
     bash \
     nftables \
+    conntrack-tools \
     iproute2 \
     iproute2-ss \
     jq \
@@ -47,7 +48,7 @@ fi
 
 echo "[4/4] Verifying required commands..."
 missing=""
-for tool in nft tc ss jq awk bc unzip cron crontab curl bash; do
+for tool in nft tc ss jq awk bc unzip cron crontab curl bash conntrack; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing="$missing $tool"
     fi

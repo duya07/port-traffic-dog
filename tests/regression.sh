@@ -57,6 +57,10 @@ should_carry_cross_day_snapshot_delta \
 
 [ "$(add_days_to_date 2024-02-28 1)" = "2024-02-29" ]
 [ "$(add_days_to_date 2024-02-29 1)" = "2024-03-01" ]
+[ "$(add_days_to_date 2024-03-01 -1)" = "2024-02-29" ]
+[ "$(calculate_interval_days_next_date 2000-01-01 1 2026-07-26)" = "2026-07-26" ]
+[ "$(calculate_interval_days_next_date 2026-07-01 10 2026-07-26)" = "2026-07-31" ]
+! is_valid_date "0000-01-01"
 [ "$(add_months_to_date 2025-01-31 1 31)" = "2025-02-28" ]
 [ "$(add_months_to_date 2024-01-31 1 31)" = "2024-02-29" ]
 [ "$(calculate_monthly_next_date 31 2025-02-01)" = "2025-02-28" ]
@@ -224,17 +228,21 @@ jq -e '.ports["3265"].quota.reset_policy.last_reset_date == "2026-08-02"' "$CONF
         elif [ "$action" = "list" ] && [ "$object_type" = "quota" ]; then
             [ "$quota_exists" = "true" ] || return 1
             echo "quota $object_name { over 1000 bytes used $test_quota bytes }"
-        elif [ "$action" = "reset" ] && [ "$object_type" = "counter" ]; then
-            if [[ "$object_name" == *_in ]]; then test_input=0; else test_output=0; fi
-        elif [ "$action" = "reset" ] && [ "$object_type" = "quota" ]; then
-            test_quota=0
+        elif [ "$action" = "-f" ]; then
+            grep -q '^reset counter inet port_traffic_monitor port_3265_in$' "$2"
+            grep -q '^reset counter inet port_traffic_monitor port_3265_out$' "$2"
+            grep -q '^reset quota inet port_traffic_monitor port_3265_quota$' "$2"
+            # 模拟事务提交后立即产生的新流量；这不能被误判成重置失败。
+            test_input=7
+            test_output=11
+            test_quota=13
         fi
     }
 
     reset_port_nftables_counters 3265
-    [ "$test_input" -eq 0 ]
-    [ "$test_output" -eq 0 ]
-    [ "$test_quota" -eq 0 ]
+    [ "$test_input" -eq 7 ]
+    [ "$test_output" -eq 11 ]
+    [ "$test_quota" -eq 13 ]
 
     test_input=100
     test_output=200
@@ -373,8 +381,13 @@ unset -f nftables_quota_is_absent
 unset -f nft
 
 readonly CRON_FILE="$TEST_DIR/crontab"
+CRON_READ_FAIL=false
 crontab() {
     if [ "${1:-}" = "-l" ]; then
+        if [ "$CRON_READ_FAIL" = "true" ]; then
+            echo "permission denied" >&2
+            return 2
+        fi
         [ -f "$CRON_FILE" ] && cat "$CRON_FILE"
         return 0
     fi
@@ -421,6 +434,12 @@ migrate_legacy_cron_if_needed
 cp "$CRON_FILE" "$TEST_DIR/crontab.before-noop"
 migrate_legacy_cron_if_needed
 cmp -s "$CRON_FILE" "$TEST_DIR/crontab.before-noop"
+
+cp "$CRON_FILE" "$TEST_DIR/crontab.before-read-failure"
+CRON_READ_FAIL=true
+! setup_telegram_notification_cron
+CRON_READ_FAIL=false
+cmp -s "$CRON_FILE" "$TEST_DIR/crontab.before-read-failure"
 
 refresh_port_auto_reset_cron_from_config
 ! grep -q -- '--reset-port' "$CRON_FILE"
@@ -679,8 +698,13 @@ main
 
 grep -q -- '--refresh-all-cron' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -q -- 'port-traffic-dog-config/cron.lock' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
+grep -Fq -- '"conntrack"' "$SCRIPT_FILE"
+grep -Fq -- 'conntrack-tools' "$PROJECT_DIR/alpine-port-traffic-dog-preinstall.sh"
 
 : > "$STARTUP_TRACE_FILE"
 system_check_and_repair >/dev/null

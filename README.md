@@ -38,6 +38,10 @@
 26. 自然日快照改为每轮一次原子写入，并同步刷新 `traffic_data.json`；历史按 `.global.data_retention_days` 裁剪，未配置时默认保留 400 天。
 27. 端口段统计规则不再无条件写 packet mark；只有启用 TC 限速时才创建独立且唯一的标记规则，避免不同端口段碰撞或干扰其他网络策略。
 28. 自动重置历史记录包含本次到期日期；若 counter 已清零但下一到期日写入失败，下次检查只补推进日期，不会重复清零。
+29. counter 与 quota 使用同一个 nftables 事务批量重置；高流量端口在清零后立即产生的新流量会计入新周期，不会被误判为重置失败并反复清零。
+30. 所有 root crontab 更新共用独立锁；读取失败时停止写入，避免覆盖 DDNS、备份等无关定时任务。
+31. 菜单更新和迁移会先校验主脚本、通知模块及旧配置，后续维护失败时恢复更新前的脚本、配置、快捷命令和定时任务。
+32. 脚本只清理由本机脚本创建且已无子分类/过滤器的 TC 根队列，不会主动删除无法确认归属的 QoS 配置。
 
 ## 下载方式说明
 
@@ -94,11 +98,11 @@ REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "h
 REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/alpine-port-traffic-dog-preinstall.sh" && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/port-traffic-dog.sh" && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
 ```
 
-Alpine 预装脚本会补齐 `bash/nftables/iproute2/jq/gawk/bc/unzip/dcron/ca-certificates/curl/tzdata` 等依赖，创建 `cron -> crond` 兼容命令，启动并注册 `crond`，并检查 `nft/tc/ss/jq/awk/bc/unzip/cron/crontab/curl/bash` 是否可用。
+Alpine 预装脚本会补齐 `bash/nftables/conntrack-tools/iproute2/jq/gawk/bc/unzip/dcron/ca-certificates/curl/tzdata` 等依赖，创建 `cron -> crond` 兼容命令，启动并注册 `crond`，并检查 `nft/tc/ss/jq/awk/bc/unzip/cron/crontab/curl/bash/conntrack` 是否可用。
 
 ## 3) 旧 VPS 迁移到定制版
 
-迁移脚本会先备份配置、主脚本、快捷命令、root crontab 和现有 nftables 表，再完整下载并校验主脚本及两个通知模块；全部校验通过后才覆盖安装。
+迁移脚本会先以仅 root 可读的权限备份配置、主脚本、快捷命令、root crontab 和现有 nftables 表，再完整下载并校验主脚本、两个通知模块及当前配置；全部校验通过后才覆盖安装。覆盖后的刷新、修复或自检失败时会自动恢复迁移前状态。
 
 直连:
 
@@ -143,6 +147,7 @@ sudo dog --uninstall
 ```
 
 - `--self-check`: 检查配置结构与端口重叠、计数/配额/限速规则、统计与灾备文件、cron 精确频率、依赖命令、通知模块和 Telegram 连通性。
+- `--validate-config FILE`: 只校验指定 JSON 配置，不安装依赖或修改运行状态，供升级和迁移预检使用。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
 - `--refresh-port-reset-cron`: 根据当前端口重置策略重建自动重置任务，并清理旧版 `--reset-port` 和失效端口残留任务。
@@ -175,7 +180,7 @@ sudo dog --uninstall
 - 31 号遇到没有 31 号的月份，会按该月最后一天处理。
 - 2 月 29 日遇到非闰年，会按 2 月 28 日处理。
 - 自动任务每 5 分钟按北京时间检查一次所有端口，只有到期端口才会真正重置，不依赖 VPS 的系统时区。
-- 重置会验证 counter/quota 确实清零；失败时保留原到期日期并在下一次检查时重试，不会错误推进周期。
+- counter 与 quota 在同一个 nftables 事务中批量清零；事务失败时保留原到期日期并重试。事务成功后读到的非零值属于新周期刚产生的流量，不会被当成失败而重复清零。
 - 已成功清零的到期日会写入重置历史；即使下一到期日期暂时保存失败，也不会在五分钟后重复清零。
 - cron、手动命令和即时重置共用重置锁，避免同一端口被并发清零两次。
 - 手动“立即重置”只清零当前流量，不会自动改变下一次到期日期。
@@ -191,7 +196,7 @@ sudo dog --uninstall
 - `last_snapshot`: 记录每个端口上一次采样时的 nftables 入站/出站 counter。
 - `daily`: 按北京时间自然日保存每日入站/出站增量。
 - 主菜单端口总量、通知消息和配额进度读取当前 nftables counter；自然日快照文件只用于独立日统计，不参与主菜单总量叠加。
-- 存在监控端口时，每分钟会自动执行 `dog --snapshot-traffic`；每轮只对统计文件做一次原子替换，并同步保存当前 counter 灾备。只有上一条快照在昨天 23:59、当前快照在今天 00:00 时，才会把边界增量补到昨天，避免把午夜后多分钟的流量错记到前一天。
+- 存在监控端口时，每分钟会自动执行 `dog --snapshot-traffic`；每轮只读取一次全部端口的历史状态、执行一次统计文件原子替换，并同步保存当前 counter 灾备。只有上一条快照在昨天 23:59、当前快照在今天 00:00 时，才会把边界增量补到昨天，避免把午夜后多分钟的流量错记到前一天。
 - 自然日统计依赖 cron 持续运行；若 cron 停止很久或跨日后很久才恢复，脚本会从恢复当天重新建立安全基线，不能把停机期间的流量精确拆回每一天。
 - `traffic_data.json` 仍用于异常退出、开机和规则恢复时保留 nftables counter，不等同于自然日统计文件；恢复失败时会保留备份供下次重试，恢复后也由分钟快照持续刷新。
 - 首次生成 `traffic_stats.json` 时只建立当前 nftables counter 基线，不把升级前的历史 counter 直接计入当天，避免旧偏差继续污染新统计。
@@ -296,6 +301,9 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 │   ├── reset_history.log                # 流量重置历史
 │   ├── config.lock/                     # 配置写入锁目录，运行中临时出现
 │   ├── traffic_stats.lock/              # 快照写入锁目录，运行中临时出现
+│   ├── reset.lock/                      # 流量重置锁目录，运行中临时出现
+│   ├── cron.lock/                       # crontab 更新锁目录，运行中临时出现
+│   ├── tc-root-qdisc.owner              # 本机脚本创建的 TC 根队列归属标记
 │   ├── logs/
 │   │   ├── traffic.log                  # 运行日志
 │   │   └── notification.log             # 通知日志
