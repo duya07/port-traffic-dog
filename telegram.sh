@@ -54,7 +54,7 @@ telegram_api_base_is_secure() {
 
 get_telegram_api_base() {
     local route=$(get_telegram_api_route)
-    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // "https://tgapi.duyaw.com/"' "$CONFIG_FILE" 2>/dev/null || echo "https://tgapi.duyaw.com/")
+    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
     custom_base=$(normalize_telegram_api_base "$custom_base")
 
     if [ "$route" = "custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ] &&
@@ -488,7 +488,7 @@ telegram_manage_settings() {
 
 telegram_switch_api_route() {
     local current_route=$(get_telegram_api_route)
-    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // "https://tgapi.duyaw.com/"' "$CONFIG_FILE" 2>/dev/null || echo "https://tgapi.duyaw.com/")
+    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
     custom_base=$(normalize_telegram_api_base "$custom_base")
 
     local current_route_display="官方"
@@ -516,12 +516,18 @@ telegram_switch_api_route() {
             ;;
         2)
             local default_custom="$custom_base"
-            if [ -z "$default_custom" ] || [ "$default_custom" = "null" ]; then
-                default_custom="https://tgapi.duyaw.com"
+            if [ -n "$default_custom" ] && [ "$default_custom" != "null" ]; then
+                read -p "请输入自定义API基础地址 (回车沿用: $default_custom): " input_custom
+            else
+                read -p "请输入自定义API基础地址: " input_custom
             fi
-            read -p "请输入自定义API基础地址 (回车默认: $default_custom): " input_custom
-            if [ -z "$input_custom" ]; then
+            if [ -z "$input_custom" ] && [ -n "$default_custom" ] && [ "$default_custom" != "null" ]; then
                 input_custom="$default_custom"
+            fi
+            if [ -z "$input_custom" ]; then
+                echo -e "${RED}自定义API基础地址不能为空${NC}"
+                sleep 2
+                return 1
             fi
 
             local normalized_custom

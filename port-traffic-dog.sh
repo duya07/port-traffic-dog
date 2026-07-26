@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.1"
+readonly SCRIPT_VERSION="1.5.2"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -211,7 +211,7 @@ init_config() {
       "chat_id": "",
       "server_name": "",
       "api_route": "official",
-      "custom_api_base": "https://tgapi.duyaw.com/",
+      "custom_api_base": "",
       "status_notifications": {
         "enabled": false,
         "interval": "1h"
@@ -5744,12 +5744,9 @@ manage_telegram_api_route() {
 
 telegram_switch_api_route_fallback() {
     local current_route=$(jq -r '.notifications.telegram.api_route // "official"' "$CONFIG_FILE" 2>/dev/null || echo "official")
-    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // "https://tgapi.duyaw.com/"' "$CONFIG_FILE" 2>/dev/null || echo "https://tgapi.duyaw.com/")
+    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
     custom_base=$(echo "$custom_base" | tr -d ' ')
     custom_base="${custom_base%/}"
-    if [ -z "$custom_base" ] || [ "$custom_base" = "null" ]; then
-        custom_base="https://tgapi.duyaw.com"
-    fi
 
     local current_route_display="官方"
     if [ "$current_route" = "custom" ]; then
@@ -5758,7 +5755,9 @@ telegram_switch_api_route_fallback() {
 
     echo -e "${BLUE}=== Telegram通信线路切换 ===${NC}"
     echo "当前线路: ${current_route_display}"
-    echo "当前自定义地址: ${custom_base}"
+    if [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
+        echo "当前自定义地址: ${custom_base}"
+    fi
     echo
     echo "1. 官方线路 (https://api.telegram.org)"
     echo "2. 自定义线路"
@@ -5772,9 +5771,17 @@ telegram_switch_api_route_fallback() {
             echo -e "${GREEN}已切换到官方线路${NC}"
             ;;
         2)
-            read -p "请输入自定义API基础地址 (回车默认: ${custom_base}): " input_custom
-            if [ -z "$input_custom" ]; then
+            if [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
+                read -p "请输入自定义API基础地址 (回车沿用: ${custom_base}): " input_custom
+            else
+                read -p "请输入自定义API基础地址: " input_custom
+            fi
+            if [ -z "$input_custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
                 input_custom="$custom_base"
+            fi
+            if [ -z "$input_custom" ]; then
+                echo -e "${RED}自定义API基础地址不能为空${NC}"
+                return 1
             fi
             input_custom=$(echo "$input_custom" | tr -d ' ')
             input_custom="${input_custom%/}"
