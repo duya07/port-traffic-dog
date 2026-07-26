@@ -3188,7 +3188,7 @@ ${total_formatted}/${monthly_limit} | ${percent_text} | ${cycle_range}
 
 # 显示主界面
 show_main_menu() {
-    clear
+    clear 2>/dev/null || true
 
     local active_ports=($(get_active_ports))
     local port_count=${#active_ports[@]}
@@ -6593,7 +6593,7 @@ self_check() {
 }
 
 system_check_and_repair() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${BLUE}=== 系统自检/修复 ===${NC}"
     echo
 

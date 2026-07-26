@@ -20,6 +20,7 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
+trap 'echo "integration failed at line $LINENO" >&2' ERR
 
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
@@ -63,7 +64,14 @@ server_pid=$!
 sleep 0.2
 python3 -c '
 import socket, time
-s = socket.create_connection(("127.0.0.1", 3265))
+for _ in range(50):
+    try:
+        s = socket.create_connection(("127.0.0.1", 3265))
+        break
+    except ConnectionRefusedError:
+        time.sleep(0.02)
+else:
+    raise RuntimeError("test listener did not start")
 chunk = b"x" * 65536
 for _ in range(3000):
     s.sendall(chunk)
