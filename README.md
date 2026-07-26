@@ -12,7 +12,7 @@
 
 1. Telegram 通知排版优化（更适合消息推送阅读）。
 2. Telegram 支持官方线路与自定义线路切换；远程自定义线路必须使用 HTTPS，HTTP 只允许本机回环地址。
-3. 默认内置自定义线路地址示例: `https://tgapi.duyaw.com/`。
+3. Telegram 默认使用官方线路；自定义线路仅在用户主动填写地址并切换后启用。
 4. 通知模块同步支持“默认只补缺失”和“强制同步覆盖”两种模式；手动更新、迁移和 `--sync-notification-modules` 会使用强制同步。
 5. 增加自检命令: `dog --self-check`。
 6. 增加迁移脚本: `migrate-to-custom.sh`。

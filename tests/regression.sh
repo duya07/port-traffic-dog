@@ -35,6 +35,22 @@ write_base_config() {
 write_base_config
 validate_config_file "$CONFIG_FILE"
 cp "$CONFIG_FILE" "$TEST_DIR/config.valid.json"
+
+# 新安装必须默认走 Telegram 官方线路，且不预填自定义 API 地址。
+rm -f "$CONFIG_FILE"
+(
+    init_nftables() { :; }
+    setup_exit_hooks() { :; }
+    restore_monitoring_if_needed() { :; }
+    ensure_traffic_accounting_model() { :; }
+    init_config
+    jq -e '
+        .notifications.telegram.api_route == "official" and
+        .notifications.telegram.custom_api_base == ""
+    ' "$CONFIG_FILE" >/dev/null
+)
+write_base_config
+
 jq '.ports = {"3265": {}, "3000-4000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.overlap.json"
 ! validate_config_file "$TEST_DIR/config.overlap.json" >/dev/null 2>&1
 jq '.ports = {"70000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.bad-port.json"
@@ -583,6 +599,14 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     source "$PROJECT_DIR/telegram.sh"
     telegram_update_config_file '.compat.telegram = true'
     telegram_update_config_file '
+        del(.notifications.telegram.api_route) |
+        del(.notifications.telegram.custom_api_base)
+    '
+    [ "$(get_telegram_api_route)" = "official" ]
+    [ "$(get_telegram_api_base)" = "https://api.telegram.org" ]
+
+    # 旧版明确保存的自定义线路和地址必须继续按原配置读取。
+    telegram_update_config_file '
         .notifications.telegram.api_route = "custom" |
         .notifications.telegram.custom_api_base = "http://example.com"
     '
@@ -591,6 +615,17 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     [ "$(get_telegram_api_base)" = "http://127.0.0.1:8080" ]
     telegram_update_config_file '.notifications.telegram.custom_api_base = "https://tg.example.com/"'
     [ "$(get_telegram_api_base)" = "https://tg.example.com" ]
+    (
+        init_nftables() { :; }
+        setup_exit_hooks() { :; }
+        restore_monitoring_if_needed() { :; }
+        ensure_traffic_accounting_model() { :; }
+        init_config
+        jq -e '
+            .notifications.telegram.api_route == "custom" and
+            .notifications.telegram.custom_api_base == "https://tg.example.com/"
+        ' "$CONFIG_FILE" >/dev/null
+    )
 )
 (
     unset -f update_config_file
