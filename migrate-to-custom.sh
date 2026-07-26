@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+umask 077
 
 REPO="${REPO:-duya07/port-traffic-dog}"
 BRANCH="${BRANCH:-main}"
@@ -16,6 +17,14 @@ NOTIFICATIONS_DIR="${CONFIG_DIR}/notifications"
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/etc/port-traffic-dog-migration-backup/${timestamp}"
+had_config=false
+had_script=false
+had_dog=false
+had_crontab=false
+install_started=false
+migration_complete=false
+nft_family="inet"
+nft_table="port_traffic_monitor"
 
 download_to() {
     local url="$1"
@@ -38,7 +47,37 @@ fi
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
+    local result=$?
+    if [ "${install_started}" = "true" ] && [ "${migration_complete}" != "true" ]; then
+        set +e
+        echo
+        echo "迁移失败，正在恢复迁移前状态..."
+
+        rm -f "${INSTALLED_SCRIPT_PATH}" "${DOG_PATH}"
+        rm -rf "${CONFIG_DIR}"
+        [ "${had_script}" = "true" ] &&
+            cp -a "${BACKUP_DIR}/port-traffic-dog.sh.bak" "${INSTALLED_SCRIPT_PATH}"
+        [ "${had_dog}" = "true" ] && cp -a "${BACKUP_DIR}/dog.bak" "${DOG_PATH}"
+        [ "${had_config}" = "true" ] &&
+            cp -a "${BACKUP_DIR}/port-traffic-dog-config" "${CONFIG_DIR}"
+        rm -rf "${CONFIG_DIR}/config.lock" "${CONFIG_DIR}/traffic_stats.lock" \
+            "${CONFIG_DIR}/reset.lock" "${CONFIG_DIR}/cron.lock"
+
+        if [ "${had_crontab}" = "true" ]; then
+            crontab "${BACKUP_DIR}/root.crontab.bak"
+        else
+            crontab -r 2>/dev/null || true
+        fi
+
+        if command -v nft >/dev/null 2>&1; then
+            nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
+            [ -f "${BACKUP_DIR}/nftables-table.bak" ] &&
+                nft -f "${BACKUP_DIR}/nftables-table.bak" >/dev/null 2>&1
+        fi
+        echo "已尝试恢复；迁移备份保留在: ${BACKUP_DIR}"
+    fi
     rm -rf "${TMP_DIR}"
+    return "${result}"
 }
 trap cleanup EXIT
 
@@ -49,12 +88,15 @@ echo
 
 echo "[1/5] 备份旧配置与通知模块..."
 mkdir -p "${BACKUP_DIR}"
+chmod 700 "${BACKUP_DIR}"
 
 if [ -d "${CONFIG_DIR}" ]; then
+    had_config=true
     cp -a "${CONFIG_DIR}" "${BACKUP_DIR}/port-traffic-dog-config"
     rm -rf "${BACKUP_DIR}/port-traffic-dog-config/config.lock" \
         "${BACKUP_DIR}/port-traffic-dog-config/traffic_stats.lock" \
-        "${BACKUP_DIR}/port-traffic-dog-config/reset.lock"
+        "${BACKUP_DIR}/port-traffic-dog-config/reset.lock" \
+        "${BACKUP_DIR}/port-traffic-dog-config/cron.lock"
     chmod 600 "${BACKUP_DIR}/port-traffic-dog-config/config.json" 2>/dev/null || true
     echo "已备份: ${CONFIG_DIR} -> ${BACKUP_DIR}/port-traffic-dog-config"
 else
@@ -62,16 +104,19 @@ else
 fi
 
 if [ -f "${INSTALLED_SCRIPT_PATH}" ]; then
+    had_script=true
     cp -a "${INSTALLED_SCRIPT_PATH}" "${BACKUP_DIR}/port-traffic-dog.sh.bak"
     echo "已备份: ${INSTALLED_SCRIPT_PATH} -> ${BACKUP_DIR}/port-traffic-dog.sh.bak"
 fi
 
 if [ -f "${DOG_PATH}" ]; then
+    had_dog=true
     cp -a "${DOG_PATH}" "${BACKUP_DIR}/dog.bak"
     echo "已备份: ${DOG_PATH} -> ${BACKUP_DIR}/dog.bak"
 fi
 
 if crontab -l > "${BACKUP_DIR}/root.crontab.bak" 2>/dev/null; then
+    had_crontab=true
     echo "已备份: root crontab -> ${BACKUP_DIR}/root.crontab.bak"
 else
     rm -f "${BACKUP_DIR}/root.crontab.bak"
@@ -122,10 +167,16 @@ if ! grep -q '^wecom_send_status_notification()' "${tmp_wc}"; then
     echo "错误: 企业微信模块内容校验失败"
     exit 1
 fi
+if [ -f "${CONFIG_DIR}/config.json" ] &&
+   ! bash "${tmp_main}" --validate-config "${CONFIG_DIR}/config.json"; then
+    echo "错误: 当前配置无法被目标版本安全读取，已停止迁移"
+    exit 1
+fi
 echo "下载与语法校验通过"
 
 echo
 echo "[3/5] 安装主脚本与通知模块..."
+install_started=true
 mkdir -p "${NOTIFICATIONS_DIR}"
 install -m 755 "${tmp_main}" "${INSTALLED_SCRIPT_PATH}"
 install -m 755 "${tmp_tg}" "${NOTIFICATIONS_DIR}/telegram.sh"
@@ -177,6 +228,7 @@ if ! bash "${INSTALLED_SCRIPT_PATH}" --self-check; then
     exit 1
 fi
 
+migration_complete=true
 echo
 echo "迁移完成。"
 echo "备份目录: ${BACKUP_DIR}"
