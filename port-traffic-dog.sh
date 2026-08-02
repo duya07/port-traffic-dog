@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.2"
+readonly SCRIPT_VERSION="1.5.3"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -595,6 +595,71 @@ get_nftables_counter_data() {
     echo "$input_bytes $output_bytes"
 }
 
+get_nftables_quota_used() {
+    local port="$1"
+    local table_name
+    local family
+    local quota_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    quota_name=$(get_port_quota_name "$port")
+
+    local quota_used
+    quota_used=$(nft -j list quota "$family" "$table_name" "$quota_name" 2>/dev/null |
+        jq -r '.nftables[] | select(.quota != null) | .quota.used // 0' 2>/dev/null |
+        head -n1)
+    if [[ "$quota_used" =~ ^[0-9]+$ ]]; then
+        echo "$quota_used"
+        return 0
+    fi
+
+    local quota_output
+    quota_output=$(nft list quota "$family" "$table_name" "$quota_name" 2>/dev/null) || return 1
+    quota_used=$(printf '%s\n' "$quota_output" |
+        sed -n 's/.*used \([0-9][0-9]*\) bytes.*/\1/p' |
+        head -n1)
+    if [[ "$quota_used" =~ ^[0-9]+$ ]]; then
+        echo "$quota_used"
+        return 0
+    fi
+    # 文本输出省略 used 字段时表示尚未产生流量。
+    echo 0
+}
+
+port_counter_quota_usage_consistent() {
+    local port="$1"
+    [ -d "$RESET_LOCK_DIR" ] && return 0
+    [ "$(get_quota_enabled "$port")" = "true" ] || return 0
+    local quota_limit
+    quota_limit=$(get_quota_limit "$port")
+    [ "$quota_limit" != "unlimited" ] || return 0
+
+    local first=()
+    local second=()
+    local quota_used
+    read -r -a first < <(get_nftables_counter_data "$port")
+    quota_used=$(get_nftables_quota_used "$port") || return 1
+    read -r -a second < <(get_nftables_counter_data "$port")
+    local first_total=$(( ${first[0]:-0} + ${first[1]:-0} ))
+    local second_total=$(( ${second[0]:-0} + ${second[1]:-0} ))
+    local lower_total="$first_total"
+    local upper_total="$second_total"
+    if [ "$lower_total" -gt "$upper_total" ]; then
+        lower_total="$second_total"
+        upper_total="$first_total"
+    fi
+
+    # quota 在两次 counter 读取之间采样；1MiB 仅用于容纳单个大包/GSO 与命令读取抖动。
+    local tolerance=$((1024 * 1024))
+    [ $((quota_used + tolerance)) -ge "$lower_total" ] || return 1
+
+    local limit_bytes
+    limit_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
+    if [[ "$limit_bytes" =~ ^[0-9]+$ ]] && [ "$quota_used" -lt "$limit_bytes" ]; then
+        [ "$quota_used" -le $((upper_total + tolerance)) ] || return 1
+    fi
+}
+
 port_counter_objects_exist() {
     local port="$1"
     local table_name
@@ -763,6 +828,8 @@ restore_all_monitoring_rules() {
 
 restore_port_counters_from_backup() {
     local port="$1"
+    acquire_traffic_stats_lock || return 1
+
     local current_data=()
     read -r -a current_data < <(get_nftables_counter_data "$port")
     local target_input=${current_data[0]:-0}
@@ -783,7 +850,10 @@ restore_port_counters_from_backup() {
 
     remove_nftables_quota "$port" >/dev/null 2>&1 || true
     remove_nftables_rules "$port" >/dev/null 2>&1 || true
-    restore_counter_value "$port" "$target_input" "$target_output"
+    local result=0
+    restore_counter_value "$port" "$target_input" "$target_output" || result=$?
+    release_traffic_stats_lock
+    return "$result"
 }
 
 port_runtime_rules_complete() {
@@ -1160,20 +1230,17 @@ record_traffic_snapshot() {
     release_traffic_stats_lock
 }
 
-update_traffic_snapshot_baseline() {
+update_traffic_snapshot_baseline_locked() {
     local port="$1"
     local mode="${2:-preserve_today}"
     [ -f "$CONFIG_FILE" ] || return 0
-
-    acquire_traffic_stats_lock || return 1
-    if ! ensure_traffic_stats_file; then
-        release_traffic_stats_lock
-        return 1
-    fi
+    ensure_traffic_stats_file || return 1
 
     local traffic_data=($(get_nftables_counter_data "$port"))
     local current_input=${traffic_data[0]:-0}
     local current_output=${traffic_data[1]:-0}
+    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
+    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
     local snapshot_date
     snapshot_date=$(get_current_date)
     local snapshot_time
@@ -1189,8 +1256,13 @@ update_traffic_snapshot_baseline() {
         existing_output=0
     fi
 
-    local temp_file
-    temp_file=$(mktemp)
+    local stats_temp
+    local backup_temp
+    stats_temp=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX") || return 1
+    backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX") || {
+        rm -f "$stats_temp"
+        return 1
+    }
 
     if jq \
         --arg port "$port" \
@@ -1226,15 +1298,55 @@ update_traffic_snapshot_baseline() {
             "date": $date,
             "time": $time
         }
-        ' "$TRAFFIC_STATS_FILE" > "$temp_file"; then
-        mv "$temp_file" "$TRAFFIC_STATS_FILE"
+        ' "$TRAFFIC_STATS_FILE" > "$stats_temp"; then
+        :
     else
-        rm -f "$temp_file"
-        release_traffic_stats_lock
+        rm -f "$stats_temp" "$backup_temp"
         return 1
     fi
 
+    if [ -f "$TRAFFIC_DATA_FILE" ] &&
+       jq -e 'type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
+        if ! jq \
+            --arg port "$port" \
+            --arg time "$snapshot_time" \
+            --argjson input "$current_input" \
+            --argjson output "$current_output" \
+            '.[$port] = {input:$input, output:$output, backup_time:$time}' \
+            "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
+            rm -f "$stats_temp" "$backup_temp"
+            return 1
+        fi
+    elif ! jq -n \
+        --arg port "$port" \
+        --arg time "$snapshot_time" \
+        --argjson input "$current_input" \
+        --argjson output "$current_output" \
+        '{($port): {input:$input, output:$output, backup_time:$time}}' > "$backup_temp"; then
+        rm -f "$stats_temp" "$backup_temp"
+        return 1
+    fi
+
+    # 先刷新灾备计数，避免规则意外丢失时把重置前的旧值恢复回来。
+    if ! mv "$backup_temp" "$TRAFFIC_DATA_FILE"; then
+        rm -f "$stats_temp" "$backup_temp"
+        return 1
+    fi
+    if ! mv "$stats_temp" "$TRAFFIC_STATS_FILE"; then
+        rm -f "$stats_temp"
+        return 1
+    fi
+    chmod 600 "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE" 2>/dev/null || true
+}
+
+update_traffic_snapshot_baseline() {
+    local port="$1"
+    local mode="${2:-preserve_today}"
+    acquire_traffic_stats_lock || return 1
+    local result=0
+    update_traffic_snapshot_baseline_locked "$port" "$mode" || result=$?
     release_traffic_stats_lock
+    return "$result"
 }
 
 scale_current_day_traffic_stats() {
@@ -4831,7 +4943,6 @@ immediate_reset() {
             local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
             if reset_port_nftables_counters "$port"; then
-                update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
                 record_reset_history "$port" "$total_bytes"
                 echo -e "${GREEN}端口 $port 流量统计重置成功${NC}"
                 reset_count=$((reset_count + 1))
@@ -4872,7 +4983,6 @@ perform_auto_reset_port() {
         log_notification "端口 $port 自动重置失败，counter/quota 未全部清零，将保留到期日期等待重试"
         return 1
     fi
-    update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
     if ! record_reset_history "$port" "$total_bytes" "$due_date"; then
         log_notification "端口 $port 自动重置已完成，但写入重置历史失败"
     fi
@@ -4937,11 +5047,116 @@ check_scheduled_resets() {
     done
 }
 
-# 重置端口nftables计数器和配额
+# 在单个 nft 事务中重建目标端口的命名 counter。
+# 部分内核会让“reset counter”返回成功却不清零正在被规则引用的对象；删除引用后重建可规避该问题。
+rebuild_port_counter_objects() {
+    local port="$1"
+    local target_input="${2:-0}"
+    local target_output="${3:-0}"
+    local reset_quota="${4:-false}"
+    [[ "$target_input" =~ ^[0-9]+$ ]] || return 1
+    [[ "$target_output" =~ ^[0-9]+$ ]] || return 1
+
+    local table_name
+    local family
+    local billing_mode
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE")
+
+    local object_prefix
+    object_prefix=$(get_port_counter_prefix "$port")
+    local input_counter="${object_prefix}_in"
+    local output_counter="${object_prefix}_out"
+    local quota_name="${object_prefix}_quota"
+    local rules_json
+    local rebuild_batch
+    rules_json=$(mktemp "$CONFIG_DIR/.nft-rules.XXXXXX") || return 1
+    rebuild_batch=$(mktemp "$CONFIG_DIR/.nft-rebuild.XXXXXX") || {
+        rm -f "$rules_json"
+        return 1
+    }
+
+    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+       ! jq -r \
+            --arg family "$family" \
+            --arg table "$table_name" \
+            --arg input "$input_counter" \
+            --arg output "$output_counter" '
+            .nftables[] |
+            select(.rule != null and .rule.handle != null) |
+            .rule as $rule |
+            [
+                $rule.expr[]? | .counter? |
+                if type == "string" then .
+                elif type == "object" then (.name // empty)
+                else empty end
+            ] as $counters |
+            select(any($counters[]; . == $input or . == $output)) |
+            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
+        ' "$rules_json" > "$rebuild_batch"; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+
+    local listed_rule_count
+    local actual_rule_count
+    listed_rule_count=$(wc -l < "$rebuild_batch" 2>/dev/null || echo 0)
+    actual_rule_count=$(( $(count_counter_rules "$port" in) + $(count_counter_rules "$port" out) ))
+    if [ "$listed_rule_count" -ne "$actual_rule_count" ]; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+
+    {
+        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$input_counter"
+        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$output_counter"
+        printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
+            "$family" "$table_name" "$input_counter" "$target_input"
+        printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
+            "$family" "$table_name" "$output_counter" "$target_output"
+
+        local multiplier
+        multiplier=$(get_billing_rule_multiplier "$billing_mode")
+        local copy
+        local protocol
+        for ((copy=0; copy<multiplier; copy++)); do
+            for protocol in tcp udp; do
+                printf 'add rule %s %s input %s dport %s counter name "%s"\n' \
+                    "$family" "$table_name" "$protocol" "$port" "$input_counter"
+                printf 'add rule %s %s forward %s dport %s counter name "%s"\n' \
+                    "$family" "$table_name" "$protocol" "$port" "$input_counter"
+                printf 'add rule %s %s output %s sport %s counter name "%s"\n' \
+                    "$family" "$table_name" "$protocol" "$port" "$output_counter"
+                printf 'add rule %s %s forward %s sport %s counter name "%s"\n' \
+                    "$family" "$table_name" "$protocol" "$port" "$output_counter"
+            done
+        done
+        if [ "$reset_quota" = "true" ]; then
+            printf 'reset quota %s %s %s\n' "$family" "$table_name" "$quota_name"
+        fi
+    } >> "$rebuild_batch"
+
+    if ! nft -f "$rebuild_batch" >/dev/null 2>&1; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+    rm -f "$rules_json" "$rebuild_batch"
+
+    local expected_count
+    expected_count=$(get_expected_counter_rule_count "$billing_mode")
+    port_counter_objects_exist "$port" &&
+        [ "$(count_counter_rules "$port" in)" -eq "$expected_count" ] &&
+        [ "$(count_counter_rules "$port" out)" -eq "$expected_count" ]
+}
+
+# 重置端口 nftables 计数器和配额。
 reset_port_nftables_counters() {
-    local port=$1
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local port="$1"
+    local table_name
+    local family
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
     local object_prefix
     object_prefix=$(get_port_counter_prefix "$port")
     local input_counter="${object_prefix}_in"
@@ -4952,7 +5167,6 @@ reset_port_nftables_counters() {
         quota_required=true
     fi
 
-    # 先检查所有对象，避免对象缺失时出现只清零一个方向的部分重置。
     if ! nft list counter "$family" "$table_name" "$input_counter" >/dev/null 2>&1 ||
        ! nft list counter "$family" "$table_name" "$output_counter" >/dev/null 2>&1; then
         log_notification "端口 $port 重置失败：流量 counter 对象缺失"
@@ -4964,28 +5178,23 @@ reset_port_nftables_counters() {
         return 1
     fi
 
-    # 一个 nft 批次会按事务提交，避免只清零部分对象。
-    # 清零完成后可能立即出现新流量，因此不能用“读数必须精确为 0”判断成败。
-    local reset_batch
-    reset_batch=$(mktemp "$CONFIG_DIR/.nft-reset.XXXXXX") || return 1
-    {
-        printf 'reset counter %s %s %s\n' "$family" "$table_name" "$input_counter"
-        printf 'reset counter %s %s %s\n' "$family" "$table_name" "$output_counter"
-        if [ "$quota_required" = "true" ]; then
-            printf 'reset quota %s %s %s\n' "$family" "$table_name" "$quota_name"
-        fi
-    } > "$reset_batch"
+    # 与快照和灾备恢复共用锁，保证旧备份不能在重置窗口内重新写回 counter。
+    acquire_traffic_stats_lock || return 1
+    local reset_ok=true
+    if ! rebuild_port_counter_objects "$port" 0 0 "$quota_required"; then
+        reset_ok=false
+    elif ! update_traffic_snapshot_baseline_locked "$port" "preserve_today"; then
+        # 宁可丢弃灾备文件并由下一次快照重建，也不能保留重置前的旧计数。
+        rm -f "$TRAFFIC_DATA_FILE"
+        log_notification "端口 $port 已完成内核计数重置，但重置后基线写入失败，已丢弃旧灾备计数"
+    fi
+    release_traffic_stats_lock
 
-    if ! nft -f "$reset_batch" >/dev/null 2>&1; then
-        rm -f "$reset_batch"
-        log_notification "端口 $port 重置失败：nftables 批量清零事务未提交"
+    if [ "$reset_ok" != "true" ]; then
+        log_notification "端口 $port 重置失败：nftables counter 原子重建事务未提交"
         return 1
     fi
-    rm -f "$reset_batch"
 
-    # 仅确认对象仍然可读；非零值属于新计费周期内刚产生的真实流量。
-    nft list counter "$family" "$table_name" "$input_counter" >/dev/null 2>&1 || return 1
-    nft list counter "$family" "$table_name" "$output_counter" >/dev/null 2>&1 || return 1
     if [ "$quota_required" = "true" ]; then
         nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 || return 1
     fi
@@ -6399,6 +6608,18 @@ self_check() {
             check_ok "流量计数与配额规则完整"
         else
             check_fail "流量计数或配额规则异常: ${invalid_rule_ports[*]}"
+        fi
+
+        local inconsistent_usage_ports=()
+        for configured_port in "${configured_ports[@]}"; do
+            if ! port_counter_quota_usage_consistent "$configured_port"; then
+                inconsistent_usage_ports+=("$configured_port")
+            fi
+        done
+        if [ ${#inconsistent_usage_ports[@]} -eq 0 ]; then
+            check_ok "流量 counter 与 quota 当前周期用量一致"
+        else
+            check_fail "流量 counter 含有未同步的历史周期用量: ${inconsistent_usage_ports[*]}"
         fi
 
         local invalid_tc_ports=()
