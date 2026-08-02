@@ -56,33 +56,43 @@ s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 3265))
 s.listen(1)
-c, _ = s.accept()
-while c.recv(65536):
-    pass
+for _ in range(2):
+    c, _ = s.accept()
+    while c.recv(65536):
+        pass
+    c.close()
 ' &
 server_pid=$!
 sleep 0.2
 python3 -c '
-import socket, time
-for _ in range(50):
-    try:
-        s = socket.create_connection(("127.0.0.1", 3265))
-        break
-    except ConnectionRefusedError:
-        time.sleep(0.02)
-else:
-    raise RuntimeError("test listener did not start")
+import socket
+s = socket.create_connection(("127.0.0.1", 3265))
 chunk = b"x" * 65536
-for _ in range(3000):
+for _ in range(160):
     s.sendall(chunk)
-    time.sleep(0.001)
 s.close()
-' &
-client_pid=$!
+'
 
-sleep 0.3
+read -r before_input before_output < <(get_nftables_counter_data 3265)
+[ "$before_input" -gt 0 ]
+[ "$before_output" -gt 0 ]
 reset_port_nftables_counters 3265
-wait "$client_pid"
+
+read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
+[ "$input_bytes" -eq 0 ]
+[ "$output_bytes" -eq 0 ]
+quota_used=$(nft -j list quota inet port_traffic_monitor port_3265_quota |
+    jq -r '.nftables[] | select(.quota != null) | .quota.used // 0')
+[ "$quota_used" -eq 0 ]
+
+python3 -c '
+import socket
+s = socket.create_connection(("127.0.0.1", 3265))
+chunk = b"y" * 65536
+for _ in range(160):
+    s.sendall(chunk)
+s.close()
+'
 wait "$server_pid"
 
 read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)

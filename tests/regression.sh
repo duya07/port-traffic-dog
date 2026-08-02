@@ -132,6 +132,13 @@ jq -e '
     .daily["3265"]["2025-01-01"] == null
 ' "$TRAFFIC_STATS_FILE" >/dev/null
 jq -e '."3265".input == 150 and ."3265".output == 260' "$TRAFFIC_DATA_FILE" >/dev/null
+(
+    get_nftables_counter_data() { echo "7 11"; }
+    get_current_date() { echo "2026-07-11"; }
+    get_beijing_time() { echo "2026-07-11T12:01:00+08:00"; }
+    update_traffic_snapshot_baseline 3265
+)
+jq -e '."3265".input == 7 and ."3265".output == 11' "$TRAFFIC_DATA_FILE" >/dev/null
 cp "$TEST_DIR/config.before-snapshot.json" "$CONFIG_FILE"
 rm -f "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE"
 
@@ -166,6 +173,13 @@ update_config_file '
 [ "$(get_reset_policy_type 3265)" = "monthly" ]
 ensure_port_next_reset_date 3265 >/dev/null
 ensure_port_next_reset_date 8123 >/dev/null
+(
+    get_nftables_counter_data() { echo "100000000 200000000"; }
+    get_nftables_quota_used() { echo 300000000; }
+    port_counter_quota_usage_consistent 3265
+    get_nftables_quota_used() { echo 10000000; }
+    ! port_counter_quota_usage_consistent 3265
+)
 jq -e '
     .ports["3265"].quota.reset_day == 2 and
     .ports["3265"].quota.reset_policy.type == "monthly" and
@@ -231,6 +245,7 @@ jq -e '.ports["3265"].quota.reset_policy.last_reset_date == "2026-08-02"' "$CONF
     test_output=200
     test_quota=300
     quota_exists=true
+    baseline_updated=false
     nft() {
         local action="${1:-}"
         local object_type="${2:-}"
@@ -244,21 +259,28 @@ jq -e '.ports["3265"].quota.reset_policy.last_reset_date == "2026-08-02"' "$CONF
         elif [ "$action" = "list" ] && [ "$object_type" = "quota" ]; then
             [ "$quota_exists" = "true" ] || return 1
             echo "quota $object_name { over 1000 bytes used $test_quota bytes }"
-        elif [ "$action" = "-f" ]; then
-            grep -q '^reset counter inet port_traffic_monitor port_3265_in$' "$2"
-            grep -q '^reset counter inet port_traffic_monitor port_3265_out$' "$2"
-            grep -q '^reset quota inet port_traffic_monitor port_3265_quota$' "$2"
-            # 模拟事务提交后立即产生的新流量；这不能被误判成重置失败。
-            test_input=7
-            test_output=11
-            test_quota=13
         fi
+    }
+    rebuild_port_counter_objects() {
+        [ "$1" = "3265" ]
+        [ "$2" -eq 0 ]
+        [ "$3" -eq 0 ]
+        [ "$4" = "true" ]
+        # 模拟事务提交后立即产生的新流量；这不能被误判成重置失败。
+        test_input=7
+        test_output=11
+        test_quota=13
+    }
+    update_traffic_snapshot_baseline_locked() {
+        [ "$1" = "3265" ]
+        baseline_updated=true
     }
 
     reset_port_nftables_counters 3265
     [ "$test_input" -eq 7 ]
     [ "$test_output" -eq 11 ]
     [ "$test_quota" -eq 13 ]
+    [ "$baseline_updated" = "true" ]
 
     test_input=100
     test_output=200
