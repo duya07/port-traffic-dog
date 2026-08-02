@@ -61,6 +61,29 @@ printf '99999999 0\n' > "$TRAFFIC_STATS_LOCK_DIR/owner"
 acquire_traffic_stats_lock
 release_traffic_stats_lock
 
+readonly LIVE_LOCK_DIR="$CONFIG_DIR/live.lock"
+mkdir "$LIVE_LOCK_DIR"
+printf '%s 0\n' "${BASHPID:-$$}" > "$LIVE_LOCK_DIR/owner"
+(release_directory_lock "$LIVE_LOCK_DIR")
+[ -d "$LIVE_LOCK_DIR" ]
+release_directory_lock "$LIVE_LOCK_DIR"
+[ ! -d "$LIVE_LOCK_DIR" ]
+
+(
+    save_traffic_data_locked() { [ -d "$TRAFFIC_STATS_LOCK_DIR" ]; }
+    save_traffic_data
+)
+[ ! -d "$TRAFFIC_STATS_LOCK_DIR" ]
+
+acquire_traffic_stats_lock
+original_save_traffic_data_locked=$(declare -f save_traffic_data_locked)
+save_traffic_data_locked() { [ -d "$TRAFFIC_STATS_LOCK_DIR" ]; }
+save_traffic_data
+eval "$original_save_traffic_data_locked"
+[ -d "$TRAFFIC_STATS_LOCK_DIR" ]
+release_traffic_stats_lock
+[ ! -d "$TRAFFIC_STATS_LOCK_DIR" ]
+
 should_carry_cross_day_snapshot_delta \
     "2026-07-10" "2026-07-10T23:59:10+08:00" \
     "2026-07-11" "2026-07-11T00:00:05+08:00"
@@ -139,6 +162,24 @@ jq -e '."3265".input == 150 and ."3265".output == 260' "$TRAFFIC_DATA_FILE" >/de
     update_traffic_snapshot_baseline 3265
 )
 jq -e '."3265".input == 7 and ."3265".output == 11' "$TRAFFIC_DATA_FILE" >/dev/null
+
+jq -n '{
+    last_snapshot: {"3265": {input:100,output:200,date:"2026-07-10",time:"2026-07-10T23:58:00+08:00"}},
+    state: {"3265": {date:"2026-07-10",time:"2026-07-10T23:58:00+08:00",input_base:50,output_base:100,input_offset:50,output_offset:100,last_input:100,last_output:200}},
+    daily: {"3265": {"2026-07-10": {input:50,output:100}}}
+}' > "$TRAFFIC_STATS_FILE"
+(
+    port_counter_objects_exist() { return 0; }
+    get_nftables_counter_data() { echo "130 250"; }
+    get_current_date() { echo "2026-07-11"; }
+    get_beijing_time() { echo "2026-07-11T00:01:00+08:00"; }
+    record_traffic_snapshot
+)
+jq -e '
+    .daily["3265"]["2026-07-10"] == {input:50,output:100} and
+    .daily["3265"]["2026-07-11"].input == 30 and
+    .daily["3265"]["2026-07-11"].output == 50
+' "$TRAFFIC_STATS_FILE" >/dev/null
 cp "$TEST_DIR/config.before-snapshot.json" "$CONFIG_FILE"
 rm -f "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE"
 
@@ -312,7 +353,23 @@ readonly DOUBLE_REPAIR_CAPTURE="$TEST_DIR/double-repair.capture"
     log_notification() { :; }
     repair_port_traffic_rules 8123
 )
-[ "$(cat "$DOUBLE_REPAIR_CAPTURE")" = "200 400" ]
+[ "$(cat "$DOUBLE_REPAIR_CAPTURE")" = "100 200" ]
+
+readonly DOUBLE_MIGRATION_CAPTURE="$TEST_DIR/double-migration.capture"
+(
+    count_counter_rules() { echo 4; }
+    get_nftables_counter_data() { echo "100 200"; }
+    remove_nftables_quota() { :; }
+    remove_nftables_rules() { :; }
+    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_MIGRATION_CAPTURE"; }
+    add_nftables_rules() { :; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { :; }
+    apply_nftables_quota() { :; }
+    log_notification() { :; }
+    repair_port_traffic_rules 8123 true true
+)
+[ "$(cat "$DOUBLE_MIGRATION_CAPTURE")" = "200 400" ]
 
 readonly SINGLE_REPAIR_CAPTURE="$TEST_DIR/single-repair.capture"
 update_config_file '.ports["3265"].billing_mode = "single"'
@@ -582,6 +639,7 @@ class_id=$(generate_tc_class_id 65535)
 class_minor=$(tc_class_id_minor "$class_id")
 [ "$class_minor" -ge 2 ]
 [ "$class_minor" -le 65535 ]
+[ "$(get_tc_ipv6_filter_handle 65535 3)" = "0x3ffff" ]
 jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $class_id' \
     "$CONFIG_FILE" >/dev/null
 
@@ -649,11 +707,33 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
         ' "$CONFIG_FILE" >/dev/null
     )
 )
+readonly TELEGRAM_TEST_CAPTURE="$TEST_DIR/telegram-test.capture"
+(
+    source "$PROJECT_DIR/telegram.sh"
+    telegram_is_enabled() { return 0; }
+    format_status_message() { echo test; }
+    send_telegram_message() { touch "$TELEGRAM_TEST_CAPTURE"; }
+    sleep() { :; }
+    telegram_update_config_file '.notifications.telegram.status_notifications.enabled = false'
+    telegram_test >/dev/null
+)
+[ -f "$TELEGRAM_TEST_CAPTURE" ]
 (
     unset -f update_config_file
     source "$PROJECT_DIR/wecom.sh"
     wecom_update_config_file '.compat.wecom = true'
 )
+readonly WECOM_TEST_CAPTURE="$TEST_DIR/wecom-test.capture"
+(
+    source "$PROJECT_DIR/wecom.sh"
+    wecom_is_enabled() { return 0; }
+    format_text_status_message() { echo test; }
+    send_wecom_message() { touch "$WECOM_TEST_CAPTURE"; }
+    sleep() { :; }
+    wecom_update_config_file '.notifications.wecom.status_notifications.enabled = false'
+    wecom_test >/dev/null
+)
+[ -f "$WECOM_TEST_CAPTURE" ]
 jq -e '.compat == {telegram: true, wecom: true}' "$CONFIG_FILE" >/dev/null
 
 readonly WECOM_PAYLOAD_CAPTURE="$TEST_DIR/wecom-payload.json"
@@ -760,6 +840,7 @@ grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --restore-runtime' "$SCRIPT_FILE"
 grep -Fq -- '"conntrack"' "$SCRIPT_FILE"
 grep -Fq -- 'conntrack-tools' "$PROJECT_DIR/alpine-port-traffic-dog-preinstall.sh"
 

@@ -120,8 +120,12 @@ wecom_test() {
 
     echo "正在发送测试消息..."
 
-    # 使用真实状态消息测试：确保配置正确性
-    if wecom_send_status_notification; then
+    # 测试通信本身，不受周期状态通知开关影响。
+    local server_name
+    server_name=$(jq -r '.notifications.wecom.server_name // ""' "$CONFIG_FILE" 2>/dev/null || hostname)
+    local message
+    message=$(format_text_status_message "$server_name")
+    if send_wecom_message "$message"; then
         echo -e "${GREEN}状态通知发送成功！${NC}"
     else
         echo -e "${RED}状态通知发送失败${NC}"

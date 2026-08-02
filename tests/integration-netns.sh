@@ -100,6 +100,21 @@ read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
 [ "$output_bytes" -gt 0 ]
 nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
 
+# 当前计费模型下即使规则只剩一组，运行时修复也必须保留已有 counter，不能再次乘 2。
+update_config_file '.ports["3265"].billing_mode = "single"'
+add_nftables_rules 3265
+[ "$(count_counter_rules 3265 in)" -eq 4 ]
+update_config_file \
+    '.ports["3265"].billing_mode = "double" | .global.traffic_accounting_model = $model' \
+    --arg model "$TRAFFIC_ACCOUNTING_MODEL"
+read -r repair_input_before repair_output_before < <(get_nftables_counter_data 3265)
+repair_port_traffic_rules 3265
+read -r repair_input_after repair_output_after < <(get_nftables_counter_data 3265)
+[ "$repair_input_after" -eq "$repair_input_before" ]
+[ "$repair_output_after" -eq "$repair_output_before" ]
+[ "$(count_counter_rules 3265 in)" -eq 8 ]
+[ "$(count_counter_rules 3265 out)" -eq 8 ]
+
 ip link add eth0 type veth peer name peer0
 ip link set eth0 up
 ip link set peer0 up
@@ -109,6 +124,9 @@ get_default_interface() {
 
 apply_tc_limit 3265 10mbit
 tc qdisc show dev eth0 | grep -q '^qdisc htb 1:'
+tc class show dev eth0 | grep -q 'class htb 1:1 .*rate 100Gbit'
+class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
+[ "$(tc filter show dev eth0 protocol ipv6 parent 1:0 | grep -Fc "classid $class_id")" -eq 4 ]
 [ -f "$(get_tc_root_owner_file)" ]
 remove_tc_limit 3265
 ! tc qdisc show dev eth0 | grep -q '^qdisc htb 1:'
