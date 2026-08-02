@@ -198,8 +198,10 @@ echo
 echo "[5/5] 刷新定时任务、修复流量规则并执行自检..."
 bash "${INSTALLED_SCRIPT_PATH}" --refresh-all-cron >/dev/null
 bash "${INSTALLED_SCRIPT_PATH}" --repair-traffic-rules >/dev/null
+bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime >/dev/null
 echo "已执行: --refresh-all-cron"
 echo "已执行: --repair-traffic-rules"
+echo "已执行: --restore-runtime"
 
 if crontab -l 2>/dev/null | grep -Eq \
     'port-traffic-dog.*--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'; then

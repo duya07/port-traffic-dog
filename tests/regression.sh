@@ -22,7 +22,11 @@ mkdir -p "$CONFIG_DIR/logs"
 
 write_base_config() {
     jq -n '{
-        global: {billing_mode: "double"},
+        global: {
+            billing_mode: "double",
+            traffic_accounting_model: "upstream-weighted-v2",
+            tc_runtime_model: "dual-stack-v1"
+        },
         ports: {},
         nftables: {table_name: "port_traffic_monitor", family: "inet"},
         notifications: {
@@ -43,6 +47,7 @@ rm -f "$CONFIG_FILE"
     setup_exit_hooks() { :; }
     restore_monitoring_if_needed() { :; }
     ensure_traffic_accounting_model() { :; }
+    ensure_tc_runtime_model() { :; }
     init_config
     jq -e '
         .notifications.telegram.api_route == "official" and
@@ -154,14 +159,23 @@ jq -e '
     .daily["3265"]["2026-07-11"].output == 60 and
     .daily["3265"]["2025-01-01"] == null
 ' "$TRAFFIC_STATS_FILE" >/dev/null
-jq -e '."3265".input == 150 and ."3265".output == 260' "$TRAFFIC_DATA_FILE" >/dev/null
+jq -e '
+    ."3265".input == 150 and
+    ."3265".output == 260 and
+    ._meta.traffic_accounting_model == "upstream-weighted-v2" and
+    ._meta.port_multipliers["3265"] == {input:1, output:1}
+' "$TRAFFIC_DATA_FILE" >/dev/null
 (
     get_nftables_counter_data() { echo "7 11"; }
     get_current_date() { echo "2026-07-11"; }
     get_beijing_time() { echo "2026-07-11T12:01:00+08:00"; }
     update_traffic_snapshot_baseline 3265
 )
-jq -e '."3265".input == 7 and ."3265".output == 11' "$TRAFFIC_DATA_FILE" >/dev/null
+jq -e '
+    ."3265".input == 7 and
+    ."3265".output == 11 and
+    ._meta.port_multipliers["3265"] == {input:1, output:1}
+' "$TRAFFIC_DATA_FILE" >/dev/null
 
 jq -n '{
     last_snapshot: {"3265": {input:100,output:200,date:"2026-07-10",time:"2026-07-10T23:58:00+08:00"}},
@@ -370,6 +384,42 @@ readonly DOUBLE_MIGRATION_CAPTURE="$TEST_DIR/double-migration.capture"
     repair_port_traffic_rules 8123 true true
 )
 [ "$(cat "$DOUBLE_MIGRATION_CAPTURE")" = "200 400" ]
+
+readonly DOUBLE_BACKUP_MIGRATION_CAPTURE="$TEST_DIR/double-backup-migration.capture"
+jq -n '{
+    "8123": {input:100, output:200},
+    _meta: {
+        schema_version: 2,
+        traffic_accounting_model: "legacy-single-group",
+        port_multipliers: {"8123": {input:1, output:1}}
+    }
+}' > "$TRAFFIC_DATA_FILE"
+(
+    count_counter_rules() { echo 0; }
+    get_nftables_counter_data() { echo "100 200"; }
+    remove_nftables_quota() { :; }
+    remove_nftables_rules() { :; }
+    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_BACKUP_MIGRATION_CAPTURE"; }
+    add_nftables_rules() { :; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { :; }
+    apply_nftables_quota() { :; }
+    log_notification() { :; }
+    repair_port_traffic_rules 8123 true true
+)
+[ "$(cat "$DOUBLE_BACKUP_MIGRATION_CAPTURE")" = "200 400" ]
+
+jq -n '{"8123": {input:100, output:200}}' > "$TRAFFIC_DATA_FILE"
+readonly UNKNOWN_MIGRATION_CAPTURE="$TEST_DIR/unknown-migration.capture"
+(
+    count_counter_rules() { echo 0; }
+    get_nftables_counter_data() { echo "100 200"; }
+    remove_nftables_rules() { touch "$UNKNOWN_MIGRATION_CAPTURE"; }
+    log_notification() { :; }
+    ! repair_port_traffic_rules 8123 true true
+)
+[ ! -e "$UNKNOWN_MIGRATION_CAPTURE" ]
+rm -f "$TRAFFIC_DATA_FILE"
 
 readonly SINGLE_REPAIR_CAPTURE="$TEST_DIR/single-repair.capture"
 update_config_file '.ports["3265"].billing_mode = "single"'
@@ -604,12 +654,21 @@ jq -n '{
     state: {"2000": {}, "3000": {}},
     daily: {"2000": {}, "3000": {}}
 }' > "$TRAFFIC_STATS_FILE"
-jq -n '{"2000": {input: 1}, "3000": {input: 2}}' > "$TRAFFIC_DATA_FILE"
+jq -n '{
+    "2000": {input: 1},
+    "3000": {input: 2},
+    _meta: {
+        schema_version: 2,
+        port_multipliers: {"2000": {input:2, output:2}, "3000": {input:1, output:1}}
+    }
+}' > "$TRAFFIC_DATA_FILE"
 remove_port_traffic_state 2000
 jq -e '(.last_snapshot["2000"] == null) and (.state["2000"] == null) and
        (.daily["2000"] == null) and (.daily["3000"] != null)' "$TRAFFIC_STATS_FILE" >/dev/null
 jq -e 'has("2000") | not' "$TRAFFIC_DATA_FILE" >/dev/null
 jq -e 'has("3000")' "$TRAFFIC_DATA_FILE" >/dev/null
+jq -e '._meta.port_multipliers["2000"] == null and
+       ._meta.port_multipliers["3000"] == {input:1, output:1}' "$TRAFFIC_DATA_FILE" >/dev/null
 
 update_config_file '
     .ports = {
@@ -700,6 +759,7 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
         setup_exit_hooks() { :; }
         restore_monitoring_if_needed() { :; }
         ensure_traffic_accounting_model() { :; }
+        ensure_tc_runtime_model() { :; }
         init_config
         jq -e '
             .notifications.telegram.api_route == "custom" and
@@ -819,6 +879,7 @@ repair_duplicate_traffic_rules() {
     trace_startup_call repair_duplicate_traffic_rules
     echo 0
 }
+restore_runtime_state() { trace_startup_call restore_runtime_state; }
 record_traffic_snapshot() { trace_startup_call record_traffic_snapshot; }
 self_check() { trace_startup_call self_check; }
 show_main_menu() { trace_startup_call show_main_menu; }
@@ -833,11 +894,39 @@ main
 (main --version >/dev/null)
 [ "$(cat "$STARTUP_TRACE_FILE")" = "check_root" ]
 
+install_update_script() {
+    [ "${1:-}" = "false" ]
+    return 23
+}
+install_status=0
+(main --install >/dev/null 2>&1) || install_status=$?
+[ "$install_status" -eq 23 ]
+
+readonly EXPORT_SAVE_CAPTURE="$TEST_DIR/export-save.capture"
+(
+    has_active_ports() { return 0; }
+    record_traffic_snapshot() { return 1; }
+    save_traffic_data() { touch "$EXPORT_SAVE_CAPTURE"; }
+    manage_configuration() { :; }
+    read() { :; }
+    ! export_config >/dev/null
+)
+[ ! -e "$EXPORT_SAVE_CAPTURE" ]
+(
+    has_active_ports() { return 0; }
+    record_traffic_snapshot() { return 0; }
+    save_traffic_data() { return 1; }
+    manage_configuration() { :; }
+    read() { :; }
+    ! export_config >/dev/null
+)
+
 grep -q -- '--refresh-all-cron' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/cron.lock' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq -- 'bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --restore-runtime' "$SCRIPT_FILE"
@@ -850,7 +939,7 @@ for expected_call in \
     check_dependencies init_config setup_script_permissions setup_cron_environment \
     create_shortcut_command download_notification_modules \
     refresh_all_cron_from_config repair_duplicate_traffic_rules \
-    record_traffic_snapshot self_check show_main_menu; do
+    restore_runtime_state record_traffic_snapshot self_check show_main_menu; do
     [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
 done
 

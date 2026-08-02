@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.4"
+readonly SCRIPT_VERSION="1.5.5"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -16,6 +16,7 @@ readonly CONFIG_LOCK_DIR="$CONFIG_DIR/config.lock"
 readonly RESET_LOCK_DIR="$CONFIG_DIR/reset.lock"
 readonly CRON_LOCK_DIR="$CONFIG_DIR/cron.lock"
 readonly TRAFFIC_ACCOUNTING_MODEL="upstream-weighted-v2"
+readonly TC_RUNTIME_MODEL="dual-stack-v1"
 readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
 readonly TC_PARENT_RATE="100gbit"
 
@@ -250,6 +251,7 @@ EOF
     setup_exit_hooks
     restore_monitoring_if_needed || return 1
     ensure_traffic_accounting_model || return 1
+    ensure_tc_runtime_model || return 1
 }
 
 init_nftables() {
@@ -692,6 +694,91 @@ runtime_counter_objects_complete() {
     done
 }
 
+write_traffic_backup_metadata() {
+    local data_file="$1"
+    [ -f "$data_file" ] || return 1
+
+    local current_model
+    current_model=$(jq -r '.global.traffic_accounting_model // ""' "$CONFIG_FILE" 2>/dev/null || true)
+    [ "$current_model" = "$TRAFFIC_ACCOUNTING_MODEL" ] || return 0
+
+    local metadata_temp
+    metadata_temp=$(mktemp "$CONFIG_DIR/.traffic_data.metadata.XXXXXX") || return 1
+    if ! jq \
+        --arg model "$TRAFFIC_ACCOUNTING_MODEL" \
+        --slurpfile config "$CONFIG_FILE" \
+        '
+        ._meta = {
+            schema_version: 2,
+            traffic_accounting_model: $model,
+            port_multipliers: (
+                ($config[0].ports // {}) |
+                with_entries(
+                    .value = if (.value.billing_mode // "double") == "double" then
+                        {input: 2, output: 2}
+                    else
+                        {input: 1, output: 1}
+                    end
+                )
+            )
+        }
+        ' "$data_file" > "$metadata_temp" || ! mv "$metadata_temp" "$data_file"; then
+        rm -f "$metadata_temp"
+        return 1
+    fi
+}
+
+get_traffic_backup_rule_multiplier() {
+    local port="$1"
+    local direction="$2"
+    local target_multiplier="$3"
+    [ -f "$TRAFFIC_DATA_FILE" ] || return 1
+
+    local backup_multiplier
+    backup_multiplier=$(jq -r \
+        --arg port "$port" \
+        --arg direction "$direction" \
+        --arg model "$TRAFFIC_ACCOUNTING_MODEL" \
+        --argjson target "$target_multiplier" \
+        '
+        if ((._meta.port_multipliers[$port][$direction] // 0) | type) == "number" and
+           (._meta.port_multipliers[$port][$direction] // 0) >= 1 then
+            ._meta.port_multipliers[$port][$direction]
+        elif (._meta.traffic_accounting_model // "") == $model then
+            $target
+        else
+            empty
+        end
+        ' "$TRAFFIC_DATA_FILE" 2>/dev/null || true)
+    [[ "$backup_multiplier" =~ ^[0-9]+$ ]] && [ "$backup_multiplier" -ge 1 ] || return 1
+    echo "$backup_multiplier"
+}
+
+resolve_legacy_counter_multiplier() {
+    local port="$1"
+    local direction="$2"
+    local rule_count="$3"
+    local target_multiplier="$4"
+    local counter_bytes="$5"
+
+    if [[ "$rule_count" =~ ^[0-9]+$ ]] && [ "$rule_count" -ge 4 ] && [ $((rule_count % 4)) -eq 0 ]; then
+        echo $((rule_count / 4))
+        return 0
+    fi
+    if [[ "$rule_count" =~ ^[0-9]+$ ]] && [ "$rule_count" -gt 0 ]; then
+        echo "$target_multiplier"
+        return 0
+    fi
+    if get_traffic_backup_rule_multiplier "$port" "$direction" "$target_multiplier"; then
+        return 0
+    fi
+    if [[ "$counter_bytes" =~ ^[0-9]+$ ]] && [ "$counter_bytes" -eq 0 ]; then
+        echo "$target_multiplier"
+        return 0
+    fi
+    return 1
+}
+
 
 
 save_traffic_data_locked() {
@@ -739,7 +826,9 @@ save_traffic_data_locked() {
         }
     done
 
-    if ! jq -s 'from_entries' "$entries_file" > "$temp_file" || ! mv "$temp_file" "$TRAFFIC_DATA_FILE"; then
+    if ! jq -s 'from_entries' "$entries_file" > "$temp_file" ||
+       ! write_traffic_backup_metadata "$temp_file" ||
+       ! mv "$temp_file" "$TRAFFIC_DATA_FILE"; then
         rm -f "$entries_file" "$temp_file"
         return 1
     fi
@@ -1248,7 +1337,8 @@ record_traffic_snapshot() {
         .daily |= with_entries(.value |= with_entries(select(.key >= $cutoff)))
     ' "$TRAFFIC_STATS_FILE" > "$stats_temp" ||
        ! jq -s 'map({key:.port,value:{input:.cin,output:.cout,backup_time:.time}}) | from_entries' \
-            "$updates_file" > "$backup_temp"; then
+            "$updates_file" > "$backup_temp" ||
+       ! write_traffic_backup_metadata "$backup_temp"; then
         rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
         release_traffic_stats_lock
         return 1
@@ -1362,6 +1452,11 @@ update_traffic_snapshot_baseline_locked() {
         return 1
     fi
 
+    if ! write_traffic_backup_metadata "$backup_temp"; then
+        rm -f "$stats_temp" "$backup_temp"
+        return 1
+    fi
+
     # 先刷新灾备计数，避免规则意外丢失时把重置前的旧值恢复回来。
     if ! mv "$backup_temp" "$TRAFFIC_DATA_FILE"; then
         rm -f "$stats_temp" "$backup_temp"
@@ -1454,8 +1549,9 @@ remove_port_traffic_state() {
     if [ -f "$TRAFFIC_DATA_FILE" ] && jq empty "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
         local backup_temp
         backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX")
-        if jq --arg port "$port" 'del(.[$port])' "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
-            if [ "$(jq 'keys | length' "$backup_temp" 2>/dev/null || echo 0)" -gt 0 ]; then
+        if jq --arg port "$port" 'del(.[$port]) | del(._meta.port_multipliers[$port])' \
+            "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
+            if [ "$(jq '[keys[] | select(. != "_meta")] | length' "$backup_temp" 2>/dev/null || echo 0)" -gt 0 ]; then
                 mv "$backup_temp" "$TRAFFIC_DATA_FILE"
             else
                 rm -f "$backup_temp" "$TRAFFIC_DATA_FILE"
@@ -1747,8 +1843,13 @@ repair_port_traffic_rules() {
     local input_source_multiplier="$target_multiplier"
     local output_source_multiplier="$target_multiplier"
     if [ "$convert_legacy_multiplier" = "true" ]; then
-        input_source_multiplier=$(get_counter_rule_multiplier_from_count "$in_rule_count" "$target_multiplier")
-        output_source_multiplier=$(get_counter_rule_multiplier_from_count "$out_rule_count" "$target_multiplier")
+        if ! input_source_multiplier=$(resolve_legacy_counter_multiplier \
+            "$port" "input" "$in_rule_count" "$target_multiplier" "$current_input") ||
+           ! output_source_multiplier=$(resolve_legacy_counter_multiplier \
+            "$port" "output" "$out_rule_count" "$target_multiplier" "$current_output"); then
+            log_notification "port $port legacy traffic multiplier is unknown; preserved counters and stopped automatic conversion"
+            return 1
+        fi
     fi
     local repaired_input
     repaired_input=$(scale_counter_for_rule_multiplier "$current_input" "$input_source_multiplier" "$target_multiplier")
@@ -1890,6 +1991,36 @@ ensure_traffic_accounting_model() {
     update_config_file \
         '.global = (.global // {}) | .global.traffic_accounting_model = $model' \
         --arg model "$TRAFFIC_ACCOUNTING_MODEL"
+}
+
+ensure_tc_runtime_model() {
+    local current_model
+    current_model=$(jq -r '.global.tc_runtime_model // ""' "$CONFIG_FILE" 2>/dev/null || true)
+    [ "$current_model" = "$TC_RUNTIME_MODEL" ] && return 0
+
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local need_restore=false
+    local port
+    for port in "${active_ports[@]}"; do
+        local limit_enabled
+        local rate_limit
+        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
+        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
+        if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] &&
+           ! tc_limit_runtime_complete "$port"; then
+            need_restore=true
+            break
+        fi
+    done
+
+    if [ "$need_restore" = "true" ]; then
+        restore_runtime_state || return 1
+    fi
+
+    update_config_file \
+        '.global = (.global // {}) | .global.tc_runtime_model = $model' \
+        --arg model "$TC_RUNTIME_MODEL"
 }
 
 
@@ -4636,7 +4767,9 @@ apply_tc_limit() {
     fi
 
     local created_root=false
-    if ! tc qdisc show dev "$interface" 2>/dev/null | grep -Eq '^qdisc htb 1:'; then
+    local qdisc_state
+    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+    if ! grep -Eq '^qdisc htb 1:' <<< "$qdisc_state"; then
         if ! tc qdisc add dev "$interface" root handle 1: htb default 30 2>/dev/null; then
             log_notification "端口 $port 无法创建HTB根队列，网卡可能已有其他根qdisc: $interface"
             return 1
@@ -4648,7 +4781,9 @@ apply_tc_limit() {
             return 1
         fi
     fi
-    if tc class show dev "$interface" 2>/dev/null | grep -Eq '^class htb 1:1([[:space:]]|$)'; then
+    local class_state
+    class_state=$(tc class show dev "$interface" 2>/dev/null || true)
+    if grep -Eq '^class htb 1:1([[:space:]]|$)' <<< "$class_state"; then
         if ! tc class replace dev "$interface" parent 1: classid 1:1 htb rate "$TC_PARENT_RATE" 2>/dev/null; then
             log_notification "端口 $port 无法更新HTB根分类: $interface"
             return 1
@@ -4742,7 +4877,8 @@ apply_tc_limit() {
         fi
     fi
 
-    tc class show dev "$interface" 2>/dev/null | grep -Fq "class htb $class_id " || return 1
+    class_state=$(tc class show dev "$interface" 2>/dev/null || true)
+    grep -Fq "class htb $class_id " <<< "$class_state" || return 1
     if is_port_range "$port"; then
         local comment
         comment=$(get_port_range_mark_comment "$port")
@@ -4823,8 +4959,12 @@ tc_limit_runtime_complete() {
     interface=$(get_default_interface)
     class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
     [ -n "$interface" ] && tc_class_id_minor "$class_id" >/dev/null 2>&1 || return 1
-    tc class show dev "$interface" 2>/dev/null | grep -Fq "class htb $class_id " || return 1
-    tc filter show dev "$interface" parent 1:0 2>/dev/null | grep -Fq "flowid $class_id" || return 1
+    local class_state
+    local filter_state
+    class_state=$(tc class show dev "$interface" 2>/dev/null || true)
+    grep -Fq "class htb $class_id " <<< "$class_state" || return 1
+    filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null || true)
+    grep -Fq "flowid $class_id" <<< "$filter_state" || return 1
     if ! is_port_range "$port"; then
         [ "$(tc filter show dev "$interface" protocol ipv6 parent 1:0 2>/dev/null |
             grep -Fc "classid $class_id")" -eq 4 ] || return 1
@@ -5358,9 +5498,14 @@ export_config() {
     echo "  - 日志文件"
     echo
 
-    # 打包前刷新自然日统计和内核计数备份。
-    record_traffic_snapshot >/dev/null 2>&1 || true
-    save_traffic_data >/dev/null 2>&1 || true
+    # 打包前刷新自然日统计和内核计数备份，失败时不生成伪成功的旧数据包。
+    if has_active_ports &&
+       { ! record_traffic_snapshot >/dev/null 2>&1 || ! save_traffic_data >/dev/null 2>&1; }; then
+        echo -e "${RED}配置包导出失败：无法刷新当前流量数据，请稍后重试${NC}"
+        read -p "按回车键返回..."
+        manage_configuration
+        return 1
+    fi
 
     # 创建临时目录用于打包
     local temp_dir
@@ -5790,6 +5935,7 @@ download_notification_modules() {
 
 # 安装(更新)脚本
 install_update_script() {
+    local reload_after_update="${1:-true}"
     echo -e "${BLUE}安装依赖(更新)脚本${NC}"
     echo "────────────────────────────────────────────────────────"
 
@@ -5915,13 +6061,12 @@ install_update_script() {
 
     rm -rf "$temp_dir"
     echo -e "${GREEN}依赖检查、主脚本和通知模块更新完成${NC}"
-    echo -e "${YELLOW}正在重新加载新版本...${NC}"
-    sleep 1
-    exec bash "$INSTALLED_SCRIPT_PATH"
-
-    echo "────────────────────────────────────────────────────────"
-    read -p "按回车键返回..."
-    show_main_menu
+    if [ "$reload_after_update" = "true" ]; then
+        echo -e "${YELLOW}正在重新加载新版本...${NC}"
+        sleep 1
+        exec bash "$INSTALLED_SCRIPT_PATH"
+    fi
+    return 0
 }
 
 create_shortcut_command() {
@@ -7024,6 +7169,11 @@ system_check_and_repair() {
     else
         echo -e "${RED}流量规则修复失败，将在最终自检中显示异常端口${NC}"
     fi
+    if restore_runtime_state >/dev/null 2>&1; then
+        echo -e "${GREEN}nftables 与 TC 运行状态已按当前配置恢复${NC}"
+    else
+        echo -e "${RED}运行状态恢复失败，将在最终自检中显示异常端口${NC}"
+    fi
 
     echo -e "${YELLOW}[5/6] 更新自然日流量快照...${NC}"
     if record_traffic_snapshot >/dev/null 2>&1; then
@@ -7133,8 +7283,9 @@ main() {
                 exit 0
                 ;;
             --install)
-                install_update_script
-                exit 0
+                local install_status=0
+                install_update_script false || install_status=$?
+                exit "$install_status"
                 ;;
             --uninstall)
                 uninstall_script

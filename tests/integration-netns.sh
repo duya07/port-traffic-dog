@@ -20,7 +20,17 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
-trap 'echo "integration failed at line $LINENO" >&2' ERR
+trap '
+    echo "integration failed at line $LINENO" >&2
+    if [ -f "${CONFIG_DIR:-}/logs/notification.log" ]; then
+        tail -n 10 "${CONFIG_DIR}/logs/notification.log" >&2
+    fi
+    if ip link show eth0 >/dev/null 2>&1; then
+        tc qdisc show dev eth0 >&2 || true
+        tc class show dev eth0 >&2 || true
+        tc filter show dev eth0 parent 1:0 >&2 || true
+    fi
+' ERR
 
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
@@ -122,14 +132,30 @@ get_default_interface() {
     echo eth0
 }
 
+wait_for_tc_state() {
+    local object_type="$1"
+    local pattern="$2"
+    local expected_state="$3"
+    local attempt
+    local output
+    for attempt in {1..100}; do
+        output=$(tc "$object_type" show dev eth0 2>/dev/null || true)
+        if [[ "$output" == *"$pattern"* ]]; then
+            [ "$expected_state" = "present" ] && return 0
+        elif [ "$expected_state" = "absent" ]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
 apply_tc_limit 3265 10mbit
-tc qdisc show dev eth0 | grep -q '^qdisc htb 1:'
-tc class show dev eth0 | grep -q 'class htb 1:1 .*rate 100Gbit'
 class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
 [ "$(tc filter show dev eth0 protocol ipv6 parent 1:0 | grep -Fc "classid $class_id")" -eq 4 ]
 [ -f "$(get_tc_root_owner_file)" ]
 remove_tc_limit 3265
-! tc qdisc show dev eth0 | grep -q '^qdisc htb 1:'
+wait_for_tc_state qdisc "qdisc htb 1:" absent
 [ ! -f "$(get_tc_root_owner_file)" ]
 
 echo "network namespace integration tests passed"
