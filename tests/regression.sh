@@ -551,7 +551,7 @@ printf '%s\n' \
     '0 0 * * 1 /usr/local/bin/port-traffic-dog.sh --create-snapshot weekly >/dev/null 2>&1' \
     '0 0 1 * * /usr/local/bin/port-traffic-dog.sh --create-snapshot monthly >/dev/null 2>&1' \
     '0 1 * * * /bin/bash -c "find /etc/port-traffic-dog/data/snapshots -type f -delete"' \
-    '5 0 1 * * /usr/local/bin/port-traffic-dog.sh --reset-port 8123 >/dev/null 2>&1' \
+    '0 0 */80 * * /usr/local/bin/port-traffic-dog.sh --reset-port 8123 >/dev/null 2>&1' \
     '0 */12 * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
     '17 * * * * /usr/local/bin/unrelated-job' \
     > "$CRON_FILE"
@@ -930,6 +930,8 @@ grep -Fq -- 'bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime' "$PROJECT_DIR/mi
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --restore-runtime' "$SCRIPT_FILE"
+add_port_monitoring_body=$(sed -n '/^add_port_monitoring() {/,/^}/p' "$SCRIPT_FILE")
+grep -q 'refresh_port_auto_reset_cron_from_config' <<< "$add_port_monitoring_body"
 grep -Fq -- '"conntrack"' "$SCRIPT_FILE"
 grep -Fq -- 'conntrack-tools' "$PROJECT_DIR/alpine-port-traffic-dog-preinstall.sh"
 
