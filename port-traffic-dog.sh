@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.5"
+readonly SCRIPT_VERSION="1.5.6"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -3842,6 +3842,7 @@ add_port_monitoring() {
         added_count=$((added_count + 1))
     done
 
+    refresh_port_auto_reset_cron_from_config
     refresh_notification_cron_from_config
     setup_traffic_snapshot_cron
 
