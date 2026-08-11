@@ -441,6 +441,54 @@ update_config_file '.ports["3265"].billing_mode = "single"'
 [ "$(cat "$SINGLE_REPAIR_CAPTURE")" = "0 300" ]
 update_config_file '.ports["3265"].billing_mode = "double"'
 
+# 外来终止规则位于命名 counter 之前时必须被识别；规则位于 counter 之后不应误报。
+(
+    order_state=invalid
+    nft() {
+        local chain="${@: -1}"
+        if [ "$chain" != "input" ]; then
+            printf '%s\n' '{"nftables":[{"chain":{"name":"test"}}]}'
+            return 0
+        fi
+        if [ "$order_state" = "invalid" ]; then
+            printf '%s\n' '{"nftables":[
+                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"quota":"port_3265_quota"},{"drop":null}]}},
+                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"accept":null}]}},
+                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+            ]}'
+        else
+            printf '%s\n' '{"nftables":[
+                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}},
+                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"accept":null}]}}
+            ]}'
+        fi
+    }
+    counter_direction_has_preceding_terminal_rule 3265 in
+    order_state=valid
+    ! counter_direction_has_preceding_terminal_rule 3265 in
+    ! counter_direction_has_preceding_terminal_rule 3265 out
+)
+
+readonly ORDER_REPAIR_CAPTURE="$TEST_DIR/order-repair.capture"
+readonly ORDER_BASELINE_CAPTURE="$TEST_DIR/order-baseline.capture"
+(
+    count_counter_rules() { echo 8; }
+    get_invalid_counter_order_directions() { echo in; }
+    record_traffic_snapshot() { :; }
+    add_nftables_rules() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 350"; }
+    remove_nftables_quota() { :; }
+    remove_nftables_rules() { :; }
+    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$ORDER_REPAIR_CAPTURE"; }
+    apply_nftables_quota() { :; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { printf '%s %s %s %s\n' "$@" > "$ORDER_BASELINE_CAPTURE"; }
+    log_notification() { :; }
+    repair_port_traffic_rules 8123
+)
+[ "$(cat "$ORDER_REPAIR_CAPTURE")" = "150 200" ]
+[ "$(cat "$ORDER_BASELINE_CAPTURE")" = "8123 preserve_today 50 0" ]
+
 readonly NFT_COMMAND_LOG="$TEST_DIR/nft-commands.log"
 nft() {
     printf '%s\n' "$*" >> "$NFT_COMMAND_LOG"
@@ -468,12 +516,12 @@ nftables_quota_is_absent() { return 0; }
 : > "$NFT_COMMAND_LOG"
 update_config_file '.ports["3265"].billing_mode = "double"'
 add_nftables_rules 3265
-[ "$(grep -c 'add rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 8 ]
-[ "$(grep -c 'add rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 8 ]
-[ "$(grep -Ec 'add rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'add rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'add rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'add rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'insert rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -c 'insert rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
 
 : > "$NFT_COMMAND_LOG"
 apply_nftables_quota 3265 100GB
@@ -482,12 +530,12 @@ apply_nftables_quota 3265 100GB
 : > "$NFT_COMMAND_LOG"
 update_config_file '.ports["3265"].billing_mode = "single"'
 add_nftables_rules 3265
-[ "$(grep -c 'add rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -c 'add rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'add rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'add rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'add rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'add rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -c 'insert rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'insert rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
 
 : > "$NFT_COMMAND_LOG"
 apply_nftables_quota 3265 100GB
@@ -849,6 +897,7 @@ bc() { :; }
 cron() { :; }
 count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
+get_invalid_counter_order_directions() { :; }
 self_check >/dev/null
 sed -i 's/^\* \* \* \* \* \(.*--snapshot-traffic.*\)$/0 * * * * \1/' "$CRON_FILE"
 ! self_check >/dev/null

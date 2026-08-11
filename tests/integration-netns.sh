@@ -94,6 +94,8 @@ read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
 quota_used=$(nft -j list quota inet port_traffic_monitor port_3265_quota |
     jq -r '.nftables[] | select(.quota != null) | .quota.used // 0')
 [ "$quota_used" -eq 0 ]
+! counter_direction_has_preceding_terminal_rule 3265 in
+! counter_direction_has_preceding_terminal_rule 3265 out
 
 python3 -c '
 import socket
@@ -109,6 +111,48 @@ read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
 [ "$input_bytes" -gt 0 ]
 [ "$output_bytes" -gt 0 ]
 nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
+
+# 模拟第三方开端口脚本先插入 accept、随后流量狗重建 quota 的顺序：quota 可见流量，input counter 被提前终止。
+nft insert rule inet port_traffic_monitor input tcp dport 3265 accept
+apply_nftables_quota 3265 1GB
+counter_direction_has_preceding_terminal_rule 3265 in
+! counter_direction_has_preceding_terminal_rule 3265 out
+
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 3265))
+s.listen(1)
+c, _ = s.accept()
+while c.recv(65536):
+    pass
+c.close()
+s.close()
+' &
+order_server_pid=$!
+sleep 0.2
+python3 -c '
+import socket
+s = socket.create_connection(("127.0.0.1", 3265))
+chunk = b"z" * 65536
+for _ in range(32):
+    s.sendall(chunk)
+s.close()
+'
+wait "$order_server_pid"
+
+read -r order_input_before order_output_before < <(get_nftables_counter_data 3265)
+order_quota_before=$(get_nftables_quota_used 3265)
+[ "$order_quota_before" -gt $((order_input_before + order_output_before)) ]
+repair_port_traffic_rules 3265
+read -r order_input_after order_output_after < <(get_nftables_counter_data 3265)
+order_quota_after=$(get_nftables_quota_used 3265)
+[ "$order_input_after" -gt "$order_input_before" ]
+[ $((order_input_after + order_output_after)) -eq "$order_quota_after" ]
+! counter_direction_has_preceding_terminal_rule 3265 in
+! counter_direction_has_preceding_terminal_rule 3265 out
+port_counter_quota_usage_consistent 3265
 
 # 当前计费模型下即使规则只剩一组，运行时修复也必须保留已有 counter，不能再次乘 2。
 update_config_file '.ports["3265"].billing_mode = "single"'
