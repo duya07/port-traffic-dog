@@ -60,6 +60,22 @@ init_nftables
 add_nftables_rules 3265
 apply_nftables_quota 3265 1GB
 
+# Runtime reconciliation must remove only dog-owned objects that are absent from config.
+nft add counter inet port_traffic_monitor port_33366_in
+nft add counter inet port_traffic_monitor port_33366_out
+nft add quota inet port_traffic_monitor port_33366_quota \
+    '{ over 1073741824 bytes used 0 bytes }'
+nft insert rule inet port_traffic_monitor input tcp dport 33366 counter name port_33366_in
+nft insert rule inet port_traffic_monitor output tcp sport 33366 counter name port_33366_out
+nft insert rule inet port_traffic_monitor input tcp dport 33366 quota name port_33366_quota drop
+[ "$(list_orphaned_runtime_objects | wc -l)" -eq 3 ]
+reconcile_orphaned_runtime_objects
+! nft list counter inet port_traffic_monitor port_33366_in >/dev/null 2>&1
+! nft list counter inet port_traffic_monitor port_33366_out >/dev/null 2>&1
+! nft list quota inet port_traffic_monitor port_33366_quota >/dev/null 2>&1
+nft list counter inet port_traffic_monitor port_3265_in >/dev/null
+nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
+
 python3 -c '
 import socket
 s = socket.socket()
@@ -84,7 +100,9 @@ s.close()
 '
 
 read -r before_input before_output < <(get_nftables_counter_data 3265)
-[ "$before_input" -gt 0 ]
+payload_bytes=$((160 * 65536))
+[ "$before_input" -ge $((payload_bytes * 2)) ]
+[ "$before_input" -lt $((payload_bytes * 3)) ]
 [ "$before_output" -gt 0 ]
 reset_port_nftables_counters 3265
 
@@ -112,8 +130,8 @@ read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
 [ "$output_bytes" -gt 0 ]
 nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
 
-# 模拟第三方开端口脚本先插入 accept、随后流量狗重建 quota 的顺序：quota 可见流量，input counter 被提前终止。
-nft insert rule inet port_traffic_monitor input tcp dport 3265 accept
+# A superset range verdict before dog rules must be detected and repaired.
+nft insert rule inet port_traffic_monitor input tcp dport 3000-4000 accept
 apply_nftables_quota 3265 1GB
 counter_direction_has_preceding_terminal_rule 3265 in
 ! counter_direction_has_preceding_terminal_rule 3265 out
@@ -153,6 +171,87 @@ order_quota_after=$(get_nftables_quota_used 3265)
 ! counter_direction_has_preceding_terminal_rule 3265 in
 ! counter_direction_has_preceding_terminal_rule 3265 out
 port_counter_quota_usage_consistent 3265
+
+# If only one direction loses a counter rule, recover the quota/counter gap before rebuilding.
+missing_rule_handle=$(nft -j -a list chain inet port_traffic_monitor input |
+    jq -r --arg counter "port_3265_in" '
+        def counter_name:
+            .counter? |
+            if type == "string" then .
+            elif type == "object" then (.name // empty)
+            else empty end;
+        [
+            .nftables[] | .rule? |
+            select(any(.expr[]?; counter_name == $counter)) |
+            select(any(.expr[]?;
+                .match?.left.payload.protocol? == "tcp" and
+                .match?.left.payload.field? == "dport")) |
+            .handle
+        ][0] // empty
+    ')
+[ -n "$missing_rule_handle" ]
+nft delete rule inet port_traffic_monitor input handle "$missing_rule_handle"
+[ "$(count_counter_rules 3265 in)" -eq 7 ]
+
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 3265))
+s.listen(1)
+c, _ = s.accept()
+while c.recv(65536):
+    pass
+c.close()
+s.close()
+' &
+missing_rule_server_pid=$!
+sleep 0.2
+python3 -c '
+import socket
+s = socket.create_connection(("127.0.0.1", 3265))
+chunk = b"m" * 65536
+for _ in range(32):
+    s.sendall(chunk)
+s.close()
+'
+wait "$missing_rule_server_pid"
+
+read -r missing_input_before missing_output_before < <(get_nftables_counter_data 3265)
+missing_quota_before=$(get_nftables_quota_used 3265)
+[ "$missing_quota_before" -gt $((missing_input_before + missing_output_before + 1024 * 1024)) ]
+repair_port_traffic_rules 3265
+read -r missing_input_after missing_output_after < <(get_nftables_counter_data 3265)
+missing_quota_after=$(get_nftables_quota_used 3265)
+[ "$missing_input_after" -gt "$missing_input_before" ]
+[ $((missing_input_after + missing_output_after)) -eq "$missing_quota_after" ]
+[ "$(count_counter_rules 3265 in)" -eq 8 ]
+
+# Failed nft transactions must leave the previously working state intact.
+atomic_input_before="$missing_input_after"
+atomic_output_before="$missing_output_after"
+atomic_quota_before=$(nft -j -a list quota inet port_traffic_monitor port_3265_quota)
+atomic_in_rules_before=$(count_counter_rules 3265 in)
+atomic_out_rules_before=$(count_counter_rules 3265 out)
+atomic_quota_rules_before=$(count_quota_rules 3265)
+(
+    nft() {
+        if [ "${1:-}" = "-f" ]; then
+            return 1
+        fi
+        command nft "$@"
+    }
+    ! repair_port_traffic_rules 3265 true
+    ! apply_nftables_quota 3265 2GB
+    ! add_nftables_rules 3265
+)
+read -r atomic_input_after atomic_output_after < <(get_nftables_counter_data 3265)
+[ "$atomic_input_after" -eq "$atomic_input_before" ]
+[ "$atomic_output_after" -eq "$atomic_output_before" ]
+[ "$(count_counter_rules 3265 in)" -eq "$atomic_in_rules_before" ]
+[ "$(count_counter_rules 3265 out)" -eq "$atomic_out_rules_before" ]
+[ "$(count_quota_rules 3265)" -eq "$atomic_quota_rules_before" ]
+[ "$(nft -j -a list quota inet port_traffic_monitor port_3265_quota)" = "$atomic_quota_before" ]
 
 # 当前计费模型下即使规则只剩一组，运行时修复也必须保留已有 counter，不能再次乘 2。
 update_config_file '.ports["3265"].billing_mode = "single"'

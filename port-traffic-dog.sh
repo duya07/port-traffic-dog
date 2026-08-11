@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.7"
+readonly SCRIPT_VERSION="1.5.8"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -987,10 +987,9 @@ restore_port_counters_from_backup() {
         [ "$backup_output" -gt "$target_output" ] && target_output=$backup_output
     fi
 
-    remove_nftables_quota "$port" >/dev/null 2>&1 || true
-    remove_nftables_rules "$port" >/dev/null 2>&1 || true
     local result=0
-    restore_counter_value "$port" "$target_input" "$target_output" || result=$?
+    rebuild_port_counter_objects \
+        "$port" "$target_input" "$target_output" rebuild || result=$?
     release_traffic_stats_lock
     return "$result"
 }
@@ -1028,6 +1027,11 @@ restore_runtime_state() {
     mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
     local failed=false
     local port
+
+    if ! reconcile_orphaned_runtime_objects; then
+        log_notification "orphaned nftables runtime objects could not be reconciled"
+        failed=true
+    fi
 
     for port in "${active_ports[@]}"; do
         if ! port_counter_objects_exist "$port"; then
@@ -1768,7 +1772,7 @@ count_counter_rules() {
     counter_name="$(get_port_counter_prefix "$port")_${direction}"
 
     nft -a list table "$family" "$table_name" 2>/dev/null | \
-        grep -F "counter name \"$counter_name\"" | wc -l | awk '{print $1}'
+        grep -F "counter name \"$counter_name\"" | wc -l | awk '{print $1}' || true
 }
 
 get_port_quota_name() {
@@ -1792,7 +1796,114 @@ count_quota_rules() {
     quota_name=$(get_port_quota_name "$port")
 
     nft -a list table "$family" "$table_name" 2>/dev/null | \
-        grep -F "quota name \"$quota_name\"" | wc -l | awk '{print $1}'
+        grep -F "quota name \"$quota_name\"" | wc -l | awk '{print $1}' || true
+}
+
+get_active_runtime_prefixes_json() {
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local port
+    {
+        for port in "${active_ports[@]}"; do
+            get_port_counter_prefix "$port"
+        done
+    } | jq -Rsc 'split("\n") | map(select(length > 0)) | unique'
+}
+
+# 只识别本脚本固定命名格式的对象，避免触碰同表中的外部规则。
+list_orphaned_runtime_objects() {
+    local table_name
+    local family
+    local table_json
+    local allowed_prefixes
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
+    allowed_prefixes=$(get_active_runtime_prefixes_json) || return 1
+
+    printf '%s\n' "$table_json" | jq -r --argjson allowed "$allowed_prefixes" '
+        def is_owned_counter:
+            type == "string" and test("^port_[0-9]+(_[0-9]+)?_(in|out)$");
+        def is_owned_quota:
+            type == "string" and test("^port_[0-9]+(_[0-9]+)?_quota$");
+        def is_allowed($name):
+            ($name | sub("_(in|out|quota)$"; "")) as $prefix |
+            ($allowed | index($prefix)) != null;
+        [
+            .nftables[] |
+            if .counter?.name? | is_owned_counter then
+                select(is_allowed(.counter.name) | not) |
+                "counter \(.counter.name)"
+            elif .quota?.name? | is_owned_quota then
+                select(is_allowed(.quota.name) | not) |
+                "quota \(.quota.name)"
+            else
+                empty
+            end
+        ] | unique[]
+    ' || return 1
+}
+
+reconcile_orphaned_runtime_objects() {
+    local orphaned
+    orphaned=$(list_orphaned_runtime_objects) || return 1
+    [ -n "$orphaned" ] || return 0
+
+    local table_name
+    local family
+    local rules_json
+    local cleanup_batch
+    local orphan_names
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    rules_json=$(mktemp "$CONFIG_DIR/.nft-orphans.XXXXXX") || return 1
+    cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-cleanup.XXXXXX") || {
+        rm -f "$rules_json"
+        return 1
+    }
+    orphan_names=$(printf '%s\n' "$orphaned" | awk '{print $2}' |
+        jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || {
+        rm -f "$rules_json" "$cleanup_batch"
+        return 1
+    }
+
+    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+       ! jq -r \
+            --arg family "$family" \
+            --arg table "$table_name" \
+            --argjson orphan_names "$orphan_names" '
+            def named_refs($kind):
+                [
+                    .expr[]? | .[$kind]? |
+                    if type == "string" then .
+                    elif type == "object" then (.name // empty)
+                    else empty end
+                ];
+            .nftables[] |
+            select(.rule != null and .rule.handle != null) |
+            .rule as $rule |
+            ((($rule | named_refs("counter")) + ($rule | named_refs("quota"))) |
+                any(.[]; . as $name | ($orphan_names | index($name)) != null)) as $owned |
+            select($owned) |
+            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
+        ' "$rules_json" > "$cleanup_batch"; then
+        rm -f "$rules_json" "$cleanup_batch"
+        return 1
+    fi
+
+    while read -r object_type object_name; do
+        [ -n "$object_type" ] && [ -n "$object_name" ] || continue
+        printf 'delete %s %s %s %s\n' \
+            "$object_type" "$family" "$table_name" "$object_name" >> "$cleanup_batch"
+    done <<< "$orphaned"
+
+    if ! nft -f "$cleanup_batch" >/dev/null 2>&1; then
+        rm -f "$rules_json" "$cleanup_batch"
+        return 1
+    fi
+    rm -f "$rules_json" "$cleanup_batch"
+
+    [ -z "$(list_orphaned_runtime_objects)" ]
 }
 
 # 返回 0 表示目标方向存在位于 counter 之前的终止规则，1 表示顺序正常，2 表示无法读取。
@@ -1842,25 +1953,99 @@ counter_direction_has_preceding_terminal_rule() {
                         if type == "string" then . == $name
                         elif type == "object" then (.name // "") == $name
                         else false end));
-            def matches_port($field; $start; $finish):
-                any(.expr[]?;
-                    .match? as $match |
-                    ($match.left.payload.field? == $field) and
-                    (
-                        (($match.right | type) == "number" and
-                            $start == $finish and $match.right == $start) or
-                        (($match.right.range? | type) == "array" and
-                            $match.right.range[0] == $start and
-                            $match.right.range[1] == $finish)
-                    ));
+            def value_overlaps($value; $start; $finish):
+                if ($value | type) == "number" then
+                    $value >= $start and $value <= $finish
+                elif ($value | type) == "object" and ($value.range? | type) == "array" then
+                    $value.range[0] <= $finish and $value.range[1] >= $start
+                elif ($value | type) == "object" and ($value.set? | type) == "array" then
+                    any($value.set[]; value_overlaps(.; $start; $finish))
+                else
+                    true
+                end;
+            def port_match_may_apply($match; $start; $finish):
+                ($match.op // "==") as $op |
+                if $op == "==" or $op == "in" then
+                    value_overlaps($match.right; $start; $finish)
+                elif $op == "!=" then
+                    ($start != $finish) or
+                    (value_overlaps($match.right; $start; $finish) | not)
+                else
+                    true
+                end;
+            def protocol_value_may_apply($value):
+                if ($value | type) == "string" then
+                    $value == "tcp" or $value == "udp"
+                elif ($value | type) == "number" then
+                    $value == 6 or $value == 17
+                elif ($value | type) == "object" and ($value.set? | type) == "array" then
+                    any($value.set[]; protocol_value_may_apply(.))
+                else
+                    true
+                end;
+            def protocol_match_may_apply($match):
+                ($match.op // "==") as $op |
+                if $op == "==" or $op == "in" then
+                    protocol_value_may_apply($match.right)
+                else
+                    true
+                end;
+            def rule_protocol_may_apply:
+                [
+                    .expr[]? | .match? |
+                    select(
+                        .left.meta.key? == "l4proto" or
+                        (.left.payload.protocol? == "ip" and .left.payload.field? == "protocol") or
+                        (.left.payload.protocol? == "ip6" and .left.payload.field? == "nexthdr")
+                    )
+                ] as $protocol_matches |
+                [
+                    .expr[]? |
+                    (.match?.left.payload.protocol? //
+                        .vmap?.key.payload.protocol? // empty) as $protocol |
+                    select(
+                        ["tcp", "udp", "icmp", "icmpv6", "sctp", "dccp"] |
+                        index($protocol) != null
+                    ) |
+                    $protocol
+                ] as $payload_protocols |
+                (($protocol_matches | length) == 0 or
+                    all($protocol_matches[]; protocol_match_may_apply(.))) and
+                (($payload_protocols | length) == 0 or
+                    any($payload_protocols[]; . == "tcp" or . == "udp"));
+            def rule_port_may_apply($field; $start; $finish):
+                [
+                    .expr[]? | .match? |
+                    select(.left.payload.field? == $field)
+                ] as $matches |
+                [
+                    .expr[]? | .vmap? |
+                    select(.key.payload.field? == $field)
+                ] as $vmaps |
+                (($matches | length) == 0 or
+                    all($matches[]; port_match_may_apply(.; $start; $finish))) and
+                (($vmaps | length) == 0 or
+                    all($vmaps[];
+                        if (.data.set? | type) == "array" then
+                            any(.data.set[]?;
+                                value_overlaps(
+                                    if type == "array" then .[0] else . end;
+                                    $start; $finish
+                                ))
+                        else
+                            true
+                        end));
+            def rule_may_apply($field; $start; $finish):
+                rule_protocol_may_apply and rule_port_may_apply($field; $start; $finish);
             def terminal_verdict:
                 any(.expr[]?;
                     type == "object" and
                     (has("accept") or has("drop") or has("reject") or
-                        has("queue") or has("return")));
+                        has("queue") or has("return") or has("jump") or
+                        has("goto") or has("vmap")));
             reduce (
                 .nftables[] | .rule? |
-                select(matches_port($field; $start; $finish))
+                select(rule_may_apply($field; $start; $finish))
             ) as $rule (
                 {terminal:false, invalid:false};
                 if ($rule | named_ref("quota"; $quota)) then .
@@ -1962,11 +2147,14 @@ repair_port_traffic_rules() {
     out_rule_count=$(count_counter_rules "$port" "out")
 
     local needs_rebuild=false
+    local repair_directions=()
     if [ "$in_rule_count" -ne "$expected_in_count" ]; then
         needs_rebuild=true
+        repair_directions+=("in")
     fi
     if [ "$out_rule_count" -ne "$expected_out_count" ]; then
         needs_rebuild=true
+        repair_directions+=("out")
     fi
 
     if [ "$force_rebuild" = "true" ]; then
@@ -1980,7 +2168,14 @@ repair_port_traffic_rules() {
             log_notification "port $port traffic rule order could not be inspected"
             return 1
         }
-        [ -n "$invalid_order" ] && needs_rebuild=true
+        if [ -n "$invalid_order" ]; then
+            needs_rebuild=true
+            local invalid_direction
+            for invalid_direction in $invalid_order; do
+                [[ " ${repair_directions[*]} " == *" $invalid_direction "* ]] ||
+                    repair_directions+=("$invalid_direction")
+            done
+        fi
     fi
     [ "$needs_rebuild" = "true" ] || return 0
 
@@ -1991,18 +2186,14 @@ repair_port_traffic_rules() {
     local recovered_input=0
     local recovered_output=0
 
-    if [ -n "$invalid_order" ]; then
-        # 先记录现有自然日增量，再把 counter 提到外来 accept/drop 之前，缩短继续漏计的窗口。
+    if [ ${#repair_directions[@]} -gt 0 ]; then
+        # 先记录现有自然日增量，再以单个 nft 事务重建 counter 与 quota。
         record_traffic_snapshot >/dev/null 2>&1 || true
-        if ! add_nftables_rules "$port" >/dev/null 2>&1; then
-            log_notification "port $port unreachable traffic counters could not be reordered"
-            return 1
-        fi
     fi
 
     local traffic_data=()
     local quota_used=-1
-    if [ -n "$invalid_order" ] && [ "$quota_enabled" = "true" ] && \
+    if [ ${#repair_directions[@]} -gt 0 ] && [ "$quota_enabled" = "true" ] && \
        [ "$monthly_limit" != "unlimited" ]; then
         local usage_snapshot=()
         read -r -a usage_snapshot < <(get_port_runtime_usage_snapshot "$port") || {
@@ -2025,8 +2216,8 @@ repair_port_traffic_rules() {
             local missing_bytes=$((quota_used - current_total))
             local invalid_in=false
             local invalid_out=false
-            [[ " $invalid_order " == *" in "* ]] && invalid_in=true
-            [[ " $invalid_order " == *" out "* ]] && invalid_out=true
+            [[ " ${repair_directions[*]} " == *" in "* ]] && invalid_in=true
+            [[ " ${repair_directions[*]} " == *" out "* ]] && invalid_out=true
             if [ "$invalid_in" = "true" ] && [ "$invalid_out" = "false" ]; then
                 current_input=$((current_input + missing_bytes))
                 recovered_input="$missing_bytes"
@@ -2034,7 +2225,7 @@ repair_port_traffic_rules() {
                 current_output=$((current_output + missing_bytes))
                 recovered_output="$missing_bytes"
             elif [ "$missing_bytes" -gt $((1024 * 1024)) ]; then
-                log_notification "port $port counter/quota gap cannot be assigned safely: bytes=$missing_bytes, directions=$invalid_order"
+                log_notification "port $port counter/quota gap cannot be assigned safely: bytes=$missing_bytes, directions=${repair_directions[*]}"
                 return 1
             fi
         fi
@@ -2062,18 +2253,10 @@ repair_port_traffic_rules() {
     local repaired_recovered_output
     repaired_recovered_output=$(scale_counter_for_rule_multiplier "$recovered_output" "$output_source_multiplier" "$target_multiplier")
 
-    remove_nftables_quota "$port"
-    remove_nftables_rules "$port"
-    if ! restore_counter_value "$port" "$repaired_input" "$repaired_output" ||
-       ! add_nftables_rules "$port"; then
+    if ! rebuild_port_counter_objects \
+        "$port" "$repaired_input" "$repaired_output" rebuild; then
         log_notification "port $port traffic rules rebuild failed"
         return 1
-    fi
-    if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ]; then
-        if ! apply_nftables_quota "$port" "$monthly_limit"; then
-            log_notification "port $port traffic rules rebuilt, but quota rules could not be restored"
-            return 1
-        fi
     fi
 
     scale_current_day_traffic_stats \
@@ -4057,6 +4240,16 @@ add_port_monitoring() {
     manage_port_monitoring
 }
 
+clear_port_conntrack_state() {
+    local port_spec="$1"
+    local destination_port="$port_spec"
+    if is_port_range "$port_spec"; then
+        destination_port="${port_spec%%-*}:${port_spec##*-}"
+    fi
+    conntrack -D -p tcp --dport "$destination_port" 2>/dev/null || true
+    conntrack -D -p udp --dport "$destination_port" 2>/dev/null || true
+}
+
 remove_port_monitoring() {
     echo -e "${BLUE}=== 删除端口监控 ===${NC}"
     echo
@@ -4124,6 +4317,10 @@ remove_port_monitoring() {
             deleted_count=$((deleted_count + 1))
         done
 
+        if ! reconcile_orphaned_runtime_objects; then
+            echo -e "${RED}端口配置已删除，但 nftables 遗留对象清理失败，请运行 dog --self-check${NC}"
+        fi
+
         echo
         echo -e "${GREEN}成功删除 $deleted_count 个端口监控${NC}"
 
@@ -4131,18 +4328,11 @@ remove_port_monitoring() {
         echo "正在清理网络状态..."
         for port in "${ports_to_delete[@]}"; do
             if is_port_range "$port"; then
-                local start_port=$(echo "$port" | cut -d'-' -f1)
-                local end_port=$(echo "$port" | cut -d'-' -f2)
                 echo "清理端口段 $port 连接状态..."
-                for ((p=start_port; p<=end_port; p++)); do
-                    conntrack -D -p tcp --dport $p 2>/dev/null || true
-                    conntrack -D -p udp --dport $p 2>/dev/null || true
-                done
             else
                 echo "清理端口 $port 连接状态..."
-                conntrack -D -p tcp --dport $port 2>/dev/null || true
-                conntrack -D -p udp --dport $port 2>/dev/null || true
             fi
+            clear_port_conntrack_state "$port"
         done
 
         echo -e "${GREEN}网络状态已清理，现有连接的限制应该已解除${NC}"
@@ -4163,108 +4353,15 @@ remove_port_monitoring() {
 }
 
 add_nftables_rules() {
-    local port=$1
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-
-    remove_nftables_counter_rules "$port" >/dev/null 2>&1 || true
-
-    if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
-
-        if [ "$billing_mode" = "double" ]; then
-            # 双向模式沿用上游：in/out 各绑定两组规则（计费权重 ×2）。
-            nft list counter $family $table_name "port_${port_safe}_in" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port_safe}_in" 2>/dev/null || true
-            nft list counter $family $table_name "port_${port_safe}_out" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port_safe}_out" 2>/dev/null || true
-
-            # in 计数器：统计进入被监控端口的流量
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port_safe}_in"
-
-            # out 计数器：统计从被监控端口发出的流量
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port_safe}_out"
-        else
-            # 单向模式：双向规则减半，in/out 各绑定一组（计费权重 ×1）。
-            nft list counter $family $table_name "port_${port_safe}_in" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port_safe}_in" 2>/dev/null || true
-            nft list counter $family $table_name "port_${port_safe}_out" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port_safe}_out" 2>/dev/null || true
-
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port_safe}_in"
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port_safe}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port_safe}_out"
-        fi
-    else
-        if [ "$billing_mode" = "double" ]; then
-            # 双向模式：创建 in 和 out 两个计数器
-            nft list counter $family $table_name "port_${port}_in" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port}_in" 2>/dev/null || true
-            nft list counter $family $table_name "port_${port}_out" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port}_out" 2>/dev/null || true
-
-            # in 计数器：统计进入被监控端口的流量
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port}_in"
-
-            # out 计数器：统计从被监控端口发出的流量
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port}_out"
-        else
-            # 单向模式：双向规则减半，in/out 各绑定一组（计费权重 ×1）。
-            nft list counter $family $table_name "port_${port}_in" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port}_in" 2>/dev/null || true
-            nft list counter $family $table_name "port_${port}_out" >/dev/null 2>&1 || \
-                nft add counter $family $table_name "port_${port}_out" 2>/dev/null || true
-
-            nft insert rule $family $table_name input tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name input udp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward tcp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name forward udp dport $port counter name "port_${port}_in"
-            nft insert rule $family $table_name output tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name output udp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward tcp sport $port counter name "port_${port}_out"
-            nft insert rule $family $table_name forward udp sport $port counter name "port_${port}_out"
-        fi
-    fi
-
-    local expected_count
-    expected_count=$(get_expected_counter_rule_count "$billing_mode")
-    port_counter_objects_exist "$port" &&
-        [ "$(count_counter_rules "$port" in)" -eq "$expected_count" ] &&
-        [ "$(count_counter_rules "$port" out)" -eq "$expected_count" ]
+    local port="$1"
+    local current_traffic=()
+    read -r -a current_traffic < <(get_nftables_counter_data "$port")
+    local current_input="${current_traffic[0]:-0}"
+    local current_output="${current_traffic[1]:-0}"
+    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
+    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+    rebuild_port_counter_objects \
+        "$port" "$current_input" "$current_output" rebuild
 }
 
 remove_nftables_rules() {
@@ -4676,13 +4773,6 @@ change_port_billing_mode() {
     local converted_output
     converted_output=$(scale_counter_for_rule_multiplier "$saved_output" "$current_multiplier" "$new_multiplier")
     
-    local quota_enabled=$(jq -r ".ports.\"$target_port\".quota.enabled // true" "$CONFIG_FILE")
-    local quota_limit=$(jq -r ".ports.\"$target_port\".quota.monthly_limit // \"\"" "$CONFIG_FILE")
-
-    # 删除旧规则
-    remove_nftables_quota "$target_port"
-    remove_nftables_rules "$target_port"
-
     local mode_change_ok=true
     if ! update_config_file \
         '.ports[$port].billing_mode = $mode' \
@@ -4691,36 +4781,19 @@ change_port_billing_mode() {
         mode_change_ok=false
     fi
 
-    # 创建带初始值的计数器（复用灾备恢复函数）
     if [ "$mode_change_ok" = "true" ] &&
-       ! restore_counter_value "$target_port" "$converted_input" "$converted_output"; then
-        mode_change_ok=false
-    fi
-
-    # 添加规则（计数器已存在，会被复用）
-    if [ "$mode_change_ok" = "true" ] && ! add_nftables_rules "$target_port"; then
-        mode_change_ok=false
-    fi
-
-    # 重新应用配额（apply_nftables_quota 会先删除旧配额对象再创建新的）
-    if [ "$mode_change_ok" = "true" ] && [ "$quota_enabled" = "true" ] &&
-       [ -n "$quota_limit" ] && [ "$quota_limit" != "null" ] && [ "$quota_limit" != "unlimited" ] &&
-       ! apply_nftables_quota "$target_port" "$quota_limit"; then
+       ! rebuild_port_counter_objects \
+            "$target_port" "$converted_input" "$converted_output" rebuild; then
         mode_change_ok=false
     fi
 
     if [ "$mode_change_ok" != "true" ]; then
-        remove_nftables_quota "$target_port" >/dev/null 2>&1 || true
-        remove_nftables_rules "$target_port" >/dev/null 2>&1 || true
         update_config_file '.ports[$port].billing_mode = $mode' \
             --arg port "$target_port" --arg mode "$current_mode" >/dev/null 2>&1 || true
         local rollback_ok=true
-        restore_counter_value "$target_port" "$saved_input" "$saved_output" >/dev/null 2>&1 || rollback_ok=false
-        add_nftables_rules "$target_port" >/dev/null 2>&1 || rollback_ok=false
-        if [ "$quota_enabled" = "true" ] && [ -n "$quota_limit" ] &&
-           [ "$quota_limit" != "null" ] && [ "$quota_limit" != "unlimited" ]; then
-            apply_nftables_quota "$target_port" "$quota_limit" >/dev/null 2>&1 || rollback_ok=false
-        fi
+        rebuild_port_counter_objects \
+            "$target_port" "$saved_input" "$saved_output" rebuild \
+            >/dev/null 2>&1 || rollback_ok=false
         if [ "$rollback_ok" = "true" ]; then
             echo -e "${RED}模式切换失败，已恢复原模式和流量数据${NC}"
         else
@@ -4743,11 +4816,14 @@ change_port_billing_mode() {
 }
 
 apply_nftables_quota() {
-    local port=$1
-    local quota_limit=$2
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
+    local port="$1"
+    local quota_limit="$2"
+    local table_name
+    local family
+    local billing_mode
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE")
 
     local quota_bytes
     quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
@@ -4755,91 +4831,74 @@ apply_nftables_quota() {
         log_notification "端口 $port 配额值无效，已保留现有限额规则: $quota_limit"
         return 1
     fi
-
-    # Use raw nftables counters as the current-cycle baseline.
-    local current_traffic=($(get_nftables_counter_data "$port"))
-    local current_input=${current_traffic[0]}
-    local current_output=${current_traffic[1]}
-    local current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
-
-    remove_nftables_quota "$port"
-    if ! nftables_quota_is_absent "$port"; then
-        log_notification "端口 $port 旧配额规则清理不完整，已停止应用新配额"
+    if ! port_counter_objects_exist "$port"; then
+        log_notification "端口 $port counter 对象缺失，已保留原有限额规则"
         return 1
     fi
 
-    if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
-        local quota_name="port_${port_safe}_quota"
+    local current_traffic=()
+    read -r -a current_traffic < <(get_nftables_counter_data "$port")
+    local current_input="${current_traffic[0]:-0}"
+    local current_output="${current_traffic[1]:-0}"
+    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
+    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+    local current_total
+    current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
 
-        # 确保幂等：先删除现有配额对象（如果存在）
-        nft add quota $family $table_name $quota_name { over $quota_bytes bytes used $current_total bytes } 2>/dev/null || true
+    local quota_name
+    quota_name=$(get_port_quota_name "$port")
+    local rules_json
+    local quota_batch
+    rules_json=$(mktemp "$CONFIG_DIR/.nft-quota-rules.XXXXXX") || return 1
+    quota_batch=$(mktemp "$CONFIG_DIR/.nft-quota-rebuild.XXXXXX") || {
+        rm -f "$rules_json"
+        return 1
+    }
 
-        if [ "$billing_mode" = "double" ]; then
-            # 双向模式沿用上游：input/output 配额各绑定两组。
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-        else
-            # 单向模式：双向规则减半，input/output 配额各绑定一组。
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-        fi
-    else
-        local quota_name="port_${port}_quota"
-
-        # 确保幂等：先删除现有配额对象（如果存在）
-        nft add quota $family $table_name $quota_name { over $quota_bytes bytes used $current_total bytes } 2>/dev/null || true
-
-        if [ "$billing_mode" = "double" ]; then
-            # 双向模式沿用上游：input/output 配额各绑定两组。
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-        else
-            # 单向模式：双向规则减半，input/output 配额各绑定一组。
-            nft insert rule $family $table_name input tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name input udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp dport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name output udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward tcp sport $port quota name "$quota_name" drop 2>/dev/null || true
-            nft insert rule $family $table_name forward udp sport $port quota name "$quota_name" drop 2>/dev/null || true
-        fi
+    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+       ! jq -r \
+            --arg family "$family" \
+            --arg table "$table_name" \
+            --arg quota "$quota_name" '
+            .nftables[] |
+            select(.rule != null and .rule.handle != null) |
+            .rule as $rule |
+            [
+                $rule.expr[]? | .quota? |
+                if type == "string" then .
+                elif type == "object" then (.name // empty)
+                else empty end
+            ] as $quotas |
+            select(any($quotas[]; . == $quota)) |
+            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
+        ' "$rules_json" > "$quota_batch"; then
+        rm -f "$rules_json" "$quota_batch"
+        return 1
     fi
+
+    local listed_rule_count
+    listed_rule_count=$(wc -l < "$quota_batch" 2>/dev/null || echo 0)
+    if [ "$listed_rule_count" -ne "$(count_quota_rules "$port")" ]; then
+        rm -f "$rules_json" "$quota_batch"
+        return 1
+    fi
+    if jq -e --arg name "$quota_name" 'any(.nftables[]; .quota?.name? == $name)' \
+        "$rules_json" >/dev/null 2>&1; then
+        printf 'delete quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$quota_batch"
+    fi
+    printf 'add quota %s %s %s { over %s bytes used %s bytes }\n' \
+        "$family" "$table_name" "$quota_name" "$quota_bytes" "$current_total" >> "$quota_batch"
+    local multiplier
+    multiplier=$(get_billing_rule_multiplier "$billing_mode")
+    write_port_quota_rule_commands \
+        "$family" "$table_name" "$port" "$quota_name" "$multiplier" >> "$quota_batch"
+
+    if ! nft -f "$quota_batch" >/dev/null 2>&1; then
+        rm -f "$rules_json" "$quota_batch"
+        log_notification "端口 $port 配额事务应用失败，已保留原有限额规则"
+        return 1
+    fi
+    rm -f "$rules_json" "$quota_batch"
 
     local expected_rule_count
     expected_rule_count=$(get_expected_quota_rule_count "$billing_mode")
@@ -4848,7 +4907,6 @@ apply_nftables_quota() {
     if ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 ||
        [ "$actual_rule_count" -ne "$expected_rule_count" ]; then
         log_notification "端口 $port 配额规则创建不完整: rules=${actual_rule_count}/${expected_rule_count}"
-        remove_nftables_quota "$port" >/dev/null 2>&1 || true
         return 1
     fi
 }
@@ -5474,21 +5532,75 @@ check_reset_port_due() {
 }
 
 check_scheduled_resets() {
-    local active_ports=($(get_active_ports 2>/dev/null || true))
+    local active_ports=()
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    local failed=false
+    local port
     for port in "${active_ports[@]}"; do
-        check_reset_port_due "$port" >/dev/null 2>&1 || true
+        check_reset_port_due "$port" >/dev/null 2>&1 || failed=true
+    done
+    [ "$failed" = "false" ]
+}
+
+write_port_counter_rule_commands() {
+    local family="$1"
+    local table_name="$2"
+    local port="$3"
+    local input_counter="$4"
+    local output_counter="$5"
+    local multiplier="$6"
+    local copy
+    local protocol
+    for ((copy=0; copy<multiplier; copy++)); do
+        for protocol in tcp udp; do
+            printf 'insert rule %s %s input %s dport %s counter name "%s"\n' \
+                "$family" "$table_name" "$protocol" "$port" "$input_counter"
+            printf 'insert rule %s %s forward %s dport %s counter name "%s"\n' \
+                "$family" "$table_name" "$protocol" "$port" "$input_counter"
+            printf 'insert rule %s %s output %s sport %s counter name "%s"\n' \
+                "$family" "$table_name" "$protocol" "$port" "$output_counter"
+            printf 'insert rule %s %s forward %s sport %s counter name "%s"\n' \
+                "$family" "$table_name" "$protocol" "$port" "$output_counter"
+        done
     done
 }
 
-# 在单个 nft 事务中重建目标端口的命名 counter。
-# 部分内核会让“reset counter”返回成功却不清零正在被规则引用的对象；删除引用后重建可规避该问题。
+write_port_quota_rule_commands() {
+    local family="$1"
+    local table_name="$2"
+    local port="$3"
+    local quota_name="$4"
+    local multiplier="$5"
+    local copy
+    local protocol
+    for ((copy=0; copy<multiplier; copy++)); do
+        for protocol in tcp udp; do
+            printf 'insert rule %s %s input %s dport %s quota name "%s" drop\n' \
+                "$family" "$table_name" "$protocol" "$port" "$quota_name"
+            printf 'insert rule %s %s forward %s dport %s quota name "%s" drop\n' \
+                "$family" "$table_name" "$protocol" "$port" "$quota_name"
+            printf 'insert rule %s %s output %s sport %s quota name "%s" drop\n' \
+                "$family" "$table_name" "$protocol" "$port" "$quota_name"
+            printf 'insert rule %s %s forward %s sport %s quota name "%s" drop\n' \
+                "$family" "$table_name" "$protocol" "$port" "$quota_name"
+        done
+    done
+}
+
+# 在单个 nft 事务中重建目标端口。第四个参数兼容旧布尔值，并支持 rebuild 完整重建配额。
 rebuild_port_counter_objects() {
     local port="$1"
     local target_input="${2:-0}"
     local target_output="${3:-0}"
-    local reset_quota="${4:-false}"
+    local quota_action="${4:-false}"
     [[ "$target_input" =~ ^[0-9]+$ ]] || return 1
     [[ "$target_output" =~ ^[0-9]+$ ]] || return 1
+    case "$quota_action" in
+        false) quota_action="keep" ;;
+        true) quota_action="reset" ;;
+        keep|reset|rebuild) ;;
+        *) return 1 ;;
+    esac
 
     local table_name
     local family
@@ -5510,14 +5622,32 @@ rebuild_port_counter_objects() {
         return 1
     }
 
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r \
+    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+
+    local input_exists=false
+    local output_exists=false
+    local quota_exists=false
+    jq -e --arg name "$input_counter" 'any(.nftables[]; .counter?.name? == $name)' \
+        "$rules_json" >/dev/null 2>&1 && input_exists=true
+    jq -e --arg name "$output_counter" 'any(.nftables[]; .counter?.name? == $name)' \
+        "$rules_json" >/dev/null 2>&1 && output_exists=true
+    jq -e --arg name "$quota_name" 'any(.nftables[]; .quota?.name? == $name)' \
+        "$rules_json" >/dev/null 2>&1 && quota_exists=true
+    if [ "$quota_action" = "reset" ] && [ "$quota_exists" != "true" ]; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+
+    if ! jq -r \
             --arg family "$family" \
             --arg table "$table_name" \
             --arg input "$input_counter" \
             --arg output "$output_counter" \
             --arg quota "$quota_name" \
-            --arg reset_quota "$reset_quota" '
+            --arg quota_action "$quota_action" '
             .nftables[] |
             select(.rule != null and .rule.handle != null) |
             .rule as $rule |
@@ -5535,7 +5665,7 @@ rebuild_port_counter_objects() {
             ] as $quotas |
             select(
                 any($counters[]; . == $input or . == $output) or
-                ($reset_quota == "true" and any($quotas[]; . == $quota))
+                ($quota_action != "keep" and any($quotas[]; . == $quota))
             ) |
             "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
         ' "$rules_json" > "$rebuild_batch"; then
@@ -5547,7 +5677,7 @@ rebuild_port_counter_objects() {
     local actual_rule_count
     listed_rule_count=$(wc -l < "$rebuild_batch" 2>/dev/null || echo 0)
     actual_rule_count=$(( $(count_counter_rules "$port" in) + $(count_counter_rules "$port" out) ))
-    if [ "$reset_quota" = "true" ]; then
+    if [ "$quota_action" != "keep" ]; then
         actual_rule_count=$((actual_rule_count + $(count_quota_rules "$port")))
     fi
     if [ "$listed_rule_count" -ne "$actual_rule_count" ]; then
@@ -5555,46 +5685,50 @@ rebuild_port_counter_objects() {
         return 1
     fi
 
-    {
-        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$input_counter"
-        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$output_counter"
-        printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
-            "$family" "$table_name" "$input_counter" "$target_input"
-        printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
-            "$family" "$table_name" "$output_counter" "$target_output"
+    [ "$input_exists" = "true" ] &&
+        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$input_counter" >> "$rebuild_batch"
+    [ "$output_exists" = "true" ] &&
+        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$output_counter" >> "$rebuild_batch"
+    if [ "$quota_action" = "rebuild" ] && [ "$quota_exists" = "true" ]; then
+        printf 'delete quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$rebuild_batch"
+    fi
+    printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
+        "$family" "$table_name" "$input_counter" "$target_input" >> "$rebuild_batch"
+    printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
+        "$family" "$table_name" "$output_counter" "$target_output" >> "$rebuild_batch"
 
-        local multiplier
-        multiplier=$(get_billing_rule_multiplier "$billing_mode")
-        local copy
-        local protocol
-        for ((copy=0; copy<multiplier; copy++)); do
-            for protocol in tcp udp; do
-                printf 'insert rule %s %s input %s dport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$port" "$input_counter"
-                printf 'insert rule %s %s forward %s dport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$port" "$input_counter"
-                printf 'insert rule %s %s output %s sport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$port" "$output_counter"
-                printf 'insert rule %s %s forward %s sport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$port" "$output_counter"
-            done
-        done
-        if [ "$reset_quota" = "true" ]; then
-            printf 'reset quota %s %s %s\n' "$family" "$table_name" "$quota_name"
-            for ((copy=0; copy<multiplier; copy++)); do
-                for protocol in tcp udp; do
-                    printf 'insert rule %s %s input %s dport %s quota name "%s" drop\n' \
-                        "$family" "$table_name" "$protocol" "$port" "$quota_name"
-                    printf 'insert rule %s %s forward %s dport %s quota name "%s" drop\n' \
-                        "$family" "$table_name" "$protocol" "$port" "$quota_name"
-                    printf 'insert rule %s %s output %s sport %s quota name "%s" drop\n' \
-                        "$family" "$table_name" "$protocol" "$port" "$quota_name"
-                    printf 'insert rule %s %s forward %s sport %s quota name "%s" drop\n' \
-                        "$family" "$table_name" "$protocol" "$port" "$quota_name"
-                done
-            done
+    local multiplier
+    multiplier=$(get_billing_rule_multiplier "$billing_mode")
+    write_port_counter_rule_commands \
+        "$family" "$table_name" "$port" "$input_counter" "$output_counter" "$multiplier" \
+        >> "$rebuild_batch"
+
+    local quota_required=false
+    if [ "$quota_action" = "reset" ]; then
+        quota_required=true
+        printf 'reset quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$rebuild_batch"
+    elif [ "$quota_action" = "rebuild" ]; then
+        local quota_enabled
+        local quota_limit
+        local quota_bytes
+        quota_enabled=$(jq -r --arg port "$port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE")
+        quota_limit=$(jq -r --arg port "$port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE")
+        if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
+            quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
+            if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
+                rm -f "$rules_json" "$rebuild_batch"
+                return 1
+            fi
+            quota_required=true
+            printf 'add quota %s %s %s { over %s bytes used %s bytes }\n' \
+                "$family" "$table_name" "$quota_name" "$quota_bytes" \
+                "$((target_input + target_output))" >> "$rebuild_batch"
         fi
-    } >> "$rebuild_batch"
+    fi
+    if [ "$quota_required" = "true" ]; then
+        write_port_quota_rule_commands \
+            "$family" "$table_name" "$port" "$quota_name" "$multiplier" >> "$rebuild_batch"
+    fi
 
     if ! nft -f "$rebuild_batch" >/dev/null 2>&1; then
         rm -f "$rules_json" "$rebuild_batch"
@@ -5607,8 +5741,10 @@ rebuild_port_counter_objects() {
     port_counter_objects_exist "$port" &&
         [ "$(count_counter_rules "$port" in)" -eq "$expected_count" ] &&
         [ "$(count_counter_rules "$port" out)" -eq "$expected_count" ] || return 1
-    if [ "$reset_quota" = "true" ]; then
-        [ "$(count_quota_rules "$port")" -eq "$(get_expected_quota_rule_count "$billing_mode")" ] || return 1
+    if [ "$quota_action" != "keep" ]; then
+        local expected_quota_count=0
+        [ "$quota_required" = "true" ] && expected_quota_count=$(get_expected_quota_rule_count "$billing_mode")
+        [ "$(count_quota_rules "$port")" -eq "$expected_quota_count" ] || return 1
     fi
     return 0
 }
@@ -6833,9 +6969,7 @@ setup_runtime_restore_cron() {
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
-    if has_active_ports; then
-        echo "@reboot sleep 15 && $script_path --restore-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
-    fi
+    echo "@reboot sleep 15 && $script_path --restore-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
     finish_cron_update "$temp_cron"
 }
 
@@ -7166,6 +7300,17 @@ self_check() {
             check_fail "流量计数或配额规则数量/顺序异常: ${invalid_rule_ports[*]}"
         fi
 
+        local orphaned_runtime_objects=""
+        local orphan_status=0
+        orphaned_runtime_objects=$(list_orphaned_runtime_objects 2>/dev/null) || orphan_status=$?
+        if [ "$orphan_status" -ne 0 ]; then
+            check_fail "无法核对 nftables 孤儿运行对象"
+        elif [ -z "$orphaned_runtime_objects" ]; then
+            check_ok "nftables 运行对象与当前端口配置一致"
+        else
+            check_fail "发现未被当前配置使用的 nftables 对象: $(printf '%s' "$orphaned_runtime_objects" | tr '\n' ' ')"
+        fi
+
         local inconsistent_usage_ports=()
         for configured_port in "${configured_ports[@]}"; do
             if ! port_counter_quota_usage_consistent "$configured_port"; then
@@ -7230,14 +7375,13 @@ self_check() {
         local expected_snapshot_count=0
         local expected_telegram_count=0
         local expected_wecom_count=0
-        local expected_restore_count=0
+        local expected_restore_count=1
+        if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--restore-runtime([[:space:]]|$)'; then
+            cron_matches_config=false
+        fi
         if [ ${#configured_ports[@]} -gt 0 ]; then
             expected_snapshot_count=1
-            expected_restore_count=1
             if ! printf '%s\n' "$cron_content" | grep -Eq '^\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--snapshot-traffic([[:space:]]|$)'; then
-                cron_matches_config=false
-            fi
-            if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--restore-runtime([[:space:]]|$)'; then
                 cron_matches_config=false
             fi
             if [ "$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
@@ -7451,20 +7595,23 @@ main() {
                     echo -e "${RED}错误：--reset-port 需要指定端口号${NC}"
                     exit 1
                 fi
-                auto_reset_port "$2"
-                exit 0
+                local reset_status=0
+                auto_reset_port "$2" || reset_status=$?
+                exit "$reset_status"
                 ;;
             --check-reset-port)
                 if [ $# -lt 2 ]; then
                     echo -e "${RED}错误：--check-reset-port 需要指定端口号${NC}"
                     exit 1
                 fi
-                check_reset_port_due "$2"
-                exit 0
+                local reset_check_status=0
+                check_reset_port_due "$2" || reset_check_status=$?
+                exit "$reset_check_status"
                 ;;
             --check-scheduled-resets)
-                check_scheduled_resets
-                exit 0
+                local scheduled_reset_status=0
+                check_scheduled_resets || scheduled_reset_status=$?
+                exit "$scheduled_reset_status"
                 ;;
             --restore-runtime)
                 [ -f "$CONFIG_FILE" ] || exit 0
@@ -7488,10 +7635,10 @@ main() {
                     remove_telegram_notification_cron >/dev/null 2>&1 || true
                     exit 0
                 fi
-                if load_telegram_module; then
-                    telegram_send_status_notification
-                fi
-                exit 0
+                load_telegram_module || exit 1
+                local telegram_status=0
+                telegram_send_status_notification || telegram_status=$?
+                exit "$telegram_status"
                 ;;
             --send-wecom-status)
                 if ! has_active_ports; then
@@ -7499,16 +7646,18 @@ main() {
                     exit 0
                 fi
                 local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
-                if [ -f "$wecom_script" ]; then
-                    source "$wecom_script"
-                    wecom_send_status_notification
-                fi
-                exit 0
+                [ -f "$wecom_script" ] || exit 1
+                source "$wecom_script" || exit 1
+                declare -F wecom_send_status_notification >/dev/null || exit 1
+                local wecom_status=0
+                wecom_send_status_notification || wecom_status=$?
+                exit "$wecom_status"
                 ;;
             --send-status)
                 has_active_ports || exit 0
-                send_status_notification
-                exit 0
+                local notification_status=0
+                send_status_notification || notification_status=$?
+                exit "$notification_status"
                 ;;
         esac
     fi
@@ -7573,7 +7722,8 @@ main() {
             --repair-traffic-rules)
                 check_dependencies true
                 init_config || exit 1
-                if repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null); then
+                if reconcile_orphaned_runtime_objects &&
+                   repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null); then
                     echo -e "${GREEN}流量计数/配额规则检查完成，修复端口数: ${repaired_count}${NC}"
                     exit 0
                 fi
