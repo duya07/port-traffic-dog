@@ -2,25 +2,34 @@
 
 set -euo pipefail
 
+readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly LEGACY_COMMIT="c8c91c527fc4beb11e48e9c6fde4627f75fc2dd2"
+legacy_script="${LEGACY_SCRIPT:-}"
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "upgrade compatibility test requires root" >&2
     exit 1
 fi
 
-if [ -z "${LEGACY_SCRIPT:-}" ] || [ ! -f "$LEGACY_SCRIPT" ]; then
-    echo "skip: set LEGACY_SCRIPT to port-traffic-dog v1.5.2" >&2
-    exit 0
+if [ -n "$legacy_script" ] && [ ! -f "$legacy_script" ]; then
+    echo "LEGACY_SCRIPT does not exist: $legacy_script" >&2
+    exit 1
+fi
+if [ -z "$legacy_script" ] &&
+   ! git -c safe.directory="$PROJECT_DIR" -C "$PROJECT_DIR" \
+        cat-file -e "$LEGACY_COMMIT:port-traffic-dog.sh" 2>/dev/null; then
+    echo "v1.5.2 fixture is unavailable; provide LEGACY_SCRIPT or fetch commit $LEGACY_COMMIT" >&2
+    exit 1
 fi
 
 if [ "${PORT_TRAFFIC_DOG_UPGRADE_TEST:-0}" != "1" ]; then
     exec unshare -n env \
         PORT_TRAFFIC_DOG_UPGRADE_TEST=1 \
-        LEGACY_SCRIPT="$LEGACY_SCRIPT" \
+        LEGACY_SCRIPT="$legacy_script" \
         bash "$0"
 fi
 
 readonly TEST_DIR="$(mktemp -d)"
-readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly CURRENT_SCRIPT="$PROJECT_DIR/port-traffic-dog.sh"
 readonly TEST_CONFIG_DIR="$TEST_DIR/config"
 
@@ -29,6 +38,13 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'echo "v1.5.2 upgrade test failed at line $LINENO" >&2' ERR
+
+if [ -z "$legacy_script" ]; then
+    legacy_script="$TEST_DIR/port-traffic-dog-v1.5.2.sh"
+    git -c safe.directory="$PROJECT_DIR" -C "$PROJECT_DIR" \
+        show "$LEGACY_COMMIT:port-traffic-dog.sh" > "$legacy_script"
+fi
+readonly LEGACY_SCRIPT="$legacy_script"
 
 run_legacy_phase() (
     source <(sed \

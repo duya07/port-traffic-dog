@@ -356,14 +356,11 @@ readonly RESET_LOCK_CAPTURE="$TEST_DIR/reset-lock.capture"
 readonly DOUBLE_REPAIR_CAPTURE="$TEST_DIR/double-repair.capture"
 (
     count_counter_rules() { echo 4; }
-    get_nftables_counter_data() { echo "100 200"; }
-    remove_nftables_quota() { :; }
-    remove_nftables_rules() { :; }
-    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_REPAIR_CAPTURE"; }
-    add_nftables_rules() { :; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 300"; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$DOUBLE_REPAIR_CAPTURE"; }
     scale_current_day_traffic_stats() { :; }
     update_traffic_snapshot_baseline() { :; }
-    apply_nftables_quota() { :; }
     log_notification() { :; }
     repair_port_traffic_rules 8123
 )
@@ -372,14 +369,11 @@ readonly DOUBLE_REPAIR_CAPTURE="$TEST_DIR/double-repair.capture"
 readonly DOUBLE_MIGRATION_CAPTURE="$TEST_DIR/double-migration.capture"
 (
     count_counter_rules() { echo 4; }
-    get_nftables_counter_data() { echo "100 200"; }
-    remove_nftables_quota() { :; }
-    remove_nftables_rules() { :; }
-    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_MIGRATION_CAPTURE"; }
-    add_nftables_rules() { :; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 300"; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$DOUBLE_MIGRATION_CAPTURE"; }
     scale_current_day_traffic_stats() { :; }
     update_traffic_snapshot_baseline() { :; }
-    apply_nftables_quota() { :; }
     log_notification() { :; }
     repair_port_traffic_rules 8123 true true
 )
@@ -396,14 +390,11 @@ jq -n '{
 }' > "$TRAFFIC_DATA_FILE"
 (
     count_counter_rules() { echo 0; }
-    get_nftables_counter_data() { echo "100 200"; }
-    remove_nftables_quota() { :; }
-    remove_nftables_rules() { :; }
-    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$DOUBLE_BACKUP_MIGRATION_CAPTURE"; }
-    add_nftables_rules() { :; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 300"; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$DOUBLE_BACKUP_MIGRATION_CAPTURE"; }
     scale_current_day_traffic_stats() { :; }
     update_traffic_snapshot_baseline() { :; }
-    apply_nftables_quota() { :; }
     log_notification() { :; }
     repair_port_traffic_rules 8123 true true
 )
@@ -413,8 +404,9 @@ jq -n '{"8123": {input:100, output:200}}' > "$TRAFFIC_DATA_FILE"
 readonly UNKNOWN_MIGRATION_CAPTURE="$TEST_DIR/unknown-migration.capture"
 (
     count_counter_rules() { echo 0; }
-    get_nftables_counter_data() { echo "100 200"; }
-    remove_nftables_rules() { touch "$UNKNOWN_MIGRATION_CAPTURE"; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 300"; }
+    rebuild_port_counter_objects() { touch "$UNKNOWN_MIGRATION_CAPTURE"; }
     log_notification() { :; }
     ! repair_port_traffic_rules 8123 true true
 )
@@ -427,45 +419,81 @@ update_config_file '.ports["3265"].billing_mode = "single"'
     count_counter_rules() {
         if [ "$2" = "in" ]; then echo 0; else echo 4; fi
     }
-    get_nftables_counter_data() { echo "0 300"; }
-    remove_nftables_quota() { :; }
-    remove_nftables_rules() { :; }
-    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$SINGLE_REPAIR_CAPTURE"; }
-    add_nftables_rules() { :; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "0 300 300"; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$SINGLE_REPAIR_CAPTURE"; }
     scale_current_day_traffic_stats() { :; }
     update_traffic_snapshot_baseline() { :; }
-    apply_nftables_quota() { :; }
     log_notification() { :; }
     repair_port_traffic_rules 3265
 )
 [ "$(cat "$SINGLE_REPAIR_CAPTURE")" = "0 300" ]
 update_config_file '.ports["3265"].billing_mode = "double"'
 
-# 外来终止规则位于命名 counter 之前时必须被识别；规则位于 counter 之后不应误报。
+# 外来终止规则位于命名 counter 之前时必须被识别；明确不相交的规则不应误报。
 (
-    order_state=invalid
+    order_state=invalid_exact
     nft() {
         local chain="${@: -1}"
         if [ "$chain" != "input" ]; then
             printf '%s\n' '{"nftables":[{"chain":{"name":"test"}}]}'
             return 0
         fi
-        if [ "$order_state" = "invalid" ]; then
-            printf '%s\n' '{"nftables":[
-                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"quota":"port_3265_quota"},{"drop":null}]}},
-                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"accept":null}]}},
-                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
-            ]}'
-        else
-            printf '%s\n' '{"nftables":[
-                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}},
-                {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"field":"dport"}},"right":3265}},{"accept":null}]}}
-            ]}'
-        fi
+        case "$order_state" in
+            invalid_exact)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"quota":"port_3265_quota"},{"drop":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"accept":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            invalid_range)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":{"range":[3000,4000]}}},{"accept":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            invalid_set)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":{"set":[80,3265]}}},{"drop":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            invalid_broad)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"op":"in","left":{"ct":{"key":"state"}},"right":"established"}},{"accept":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            invalid_jump)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"jump":{"target":"child"}}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            invalid_vmap)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"vmap":{"key":{"payload":{"protocol":"tcp","field":"dport"}},"data":{"set":[[80,{"drop":null}],[3265,{"accept":null}]]}}}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            disjoint_port)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":{"range":[4000,5000]}}},{"accept":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            disjoint_protocol)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"meta":{"key":"l4proto"}},"right":"icmp"}},{"accept":null}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}}
+                ]}' ;;
+            valid)
+                printf '%s\n' '{"nftables":[
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"counter":"port_3265_in"}]}},
+                    {"rule":{"chain":"input","expr":[{"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3265}},{"accept":null}]}}
+                ]}' ;;
+        esac
     }
-    counter_direction_has_preceding_terminal_rule 3265 in
-    order_state=valid
-    ! counter_direction_has_preceding_terminal_rule 3265 in
+    for order_state in invalid_exact invalid_range invalid_set invalid_broad invalid_jump invalid_vmap; do
+        counter_direction_has_preceding_terminal_rule 3265 in
+    done
+    for order_state in valid disjoint_port disjoint_protocol; do
+        ! counter_direction_has_preceding_terminal_rule 3265 in
+    done
     ! counter_direction_has_preceding_terminal_rule 3265 out
 )
 
@@ -475,12 +503,8 @@ readonly ORDER_BASELINE_CAPTURE="$TEST_DIR/order-baseline.capture"
     count_counter_rules() { echo 8; }
     get_invalid_counter_order_directions() { echo in; }
     record_traffic_snapshot() { :; }
-    add_nftables_rules() { :; }
     get_port_runtime_usage_snapshot() { echo "100 200 350"; }
-    remove_nftables_quota() { :; }
-    remove_nftables_rules() { :; }
-    restore_counter_value() { printf '%s %s\n' "$2" "$3" > "$ORDER_REPAIR_CAPTURE"; }
-    apply_nftables_quota() { :; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$ORDER_REPAIR_CAPTURE"; }
     scale_current_day_traffic_stats() { :; }
     update_traffic_snapshot_baseline() { printf '%s %s %s %s\n' "$@" > "$ORDER_BASELINE_CAPTURE"; }
     log_notification() { :; }
@@ -489,10 +513,49 @@ readonly ORDER_BASELINE_CAPTURE="$TEST_DIR/order-baseline.capture"
 [ "$(cat "$ORDER_REPAIR_CAPTURE")" = "150 200" ]
 [ "$(cat "$ORDER_BASELINE_CAPTURE")" = "8123 preserve_today 50 0" ]
 
+readonly MISSING_RULE_REPAIR_CAPTURE="$TEST_DIR/missing-rule-repair.capture"
+(
+    count_counter_rules() {
+        if [ "$2" = "in" ]; then echo 7; else echo 8; fi
+    }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 350"; }
+    rebuild_port_counter_objects() { [ "$4" = "rebuild" ]; printf '%s %s\n' "$2" "$3" > "$MISSING_RULE_REPAIR_CAPTURE"; }
+    scale_current_day_traffic_stats() { :; }
+    update_traffic_snapshot_baseline() { :; }
+    log_notification() { :; }
+    repair_port_traffic_rules 8123
+)
+[ "$(cat "$MISSING_RULE_REPAIR_CAPTURE")" = "150 200" ]
+
+readonly AMBIGUOUS_GAP_REPAIR_CAPTURE="$TEST_DIR/ambiguous-gap-repair.capture"
+(
+    count_counter_rules() { echo 7; }
+    record_traffic_snapshot() { :; }
+    get_port_runtime_usage_snapshot() { echo "100 200 2097452"; }
+    rebuild_port_counter_objects() { touch "$AMBIGUOUS_GAP_REPAIR_CAPTURE"; }
+    log_notification() { :; }
+    ! repair_port_traffic_rules 8123
+)
+[ ! -e "$AMBIGUOUS_GAP_REPAIR_CAPTURE" ]
+
 readonly NFT_COMMAND_LOG="$TEST_DIR/nft-commands.log"
 nft() {
     printf '%s\n' "$*" >> "$NFT_COMMAND_LOG"
-    if [ "${1:-}" = "list" ] && [ "${2:-}" = "counter" ]; then
+    if [ "${1:-}" = "-j" ]; then
+        local mode
+        local expected
+        mode=$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")
+        expected=$(get_expected_quota_rule_count "$mode")
+        jq -n --argjson expected "$expected" '{
+            nftables:
+                ([range(0; $expected) |
+                    {rule:{chain:"input",handle:(. + 1),expr:[{quota:"port_3265_quota"}]}}] +
+                 [{quota:{name:"port_3265_quota"}}])
+        }'
+    elif [ "${1:-}" = "-f" ]; then
+        cat "$2" >> "$NFT_COMMAND_LOG"
+    elif [ "${1:-}" = "list" ] && [ "${2:-}" = "counter" ]; then
         echo "counter test { packets 1 bytes 100 }"
     elif [ "${1:-}" = "list" ] && [ "${2:-}" = "quota" ]; then
         echo "quota test { over 1 bytes used 0 bytes }"
@@ -500,6 +563,7 @@ nft() {
     return 0
 }
 count_quota_rules() {
+    [ "$1" = "3265" ] || { echo 0; return; }
     local mode
     mode=$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")
     get_expected_quota_rule_count "$mode"
@@ -509,37 +573,37 @@ count_counter_rules() {
     local direction="$2"
     local prefix
     prefix=$(get_port_counter_prefix "$port")
-    grep -c "counter name ${prefix}_${direction}$" "$NFT_COMMAND_LOG" 2>/dev/null || true
+    grep -c "counter name \"${prefix}_${direction}\"$" "$NFT_COMMAND_LOG" 2>/dev/null || true
 }
 nftables_quota_is_absent() { return 0; }
 
 : > "$NFT_COMMAND_LOG"
 update_config_file '.ports["3265"].billing_mode = "double"'
 add_nftables_rules 3265
-[ "$(grep -c 'insert rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 8 ]
-[ "$(grep -c 'insert rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 8 ]
-[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'insert rule .*counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -c 'insert rule .*counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 4 ]
 
 : > "$NFT_COMMAND_LOG"
 apply_nftables_quota 3265 100GB
-[ "$(grep -c 'insert rule .*quota name port_3265_quota drop$' "$NFT_COMMAND_LOG")" -eq 16 ]
+[ "$(grep -c 'insert rule .*quota name "port_3265_quota" drop$' "$NFT_COMMAND_LOG")" -eq 16 ]
 
 : > "$NFT_COMMAND_LOG"
 update_config_file '.ports["3265"].billing_mode = "single"'
 add_nftables_rules 3265
-[ "$(grep -c 'insert rule .*counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -c 'insert rule .*counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 4 ]
-[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name port_3265_in$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
-[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name port_3265_out$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -c 'insert rule .*counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'insert rule .*counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -Ec 'insert rule .* input (tcp|udp) dport 3265 counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) dport 3265 counter name "port_3265_in"$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* output (tcp|udp) sport 3265 counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 2 ]
+[ "$(grep -Ec 'insert rule .* forward (tcp|udp) sport 3265 counter name "port_3265_out"$' "$NFT_COMMAND_LOG")" -eq 2 ]
 
 : > "$NFT_COMMAND_LOG"
 apply_nftables_quota 3265 100GB
-[ "$(grep -c 'insert rule .*quota name port_3265_quota drop$' "$NFT_COMMAND_LOG")" -eq 8 ]
+[ "$(grep -c 'insert rule .*quota name "port_3265_quota" drop$' "$NFT_COMMAND_LOG")" -eq 8 ]
 (
     count_quota_rules() { echo 0; }
     nft() {
@@ -559,7 +623,7 @@ update_config_file '.ports["3000-4000"] = {enabled:true,billing_mode:"single",qu
 : > "$NFT_COMMAND_LOG"
 add_nftables_rules 3000-4000
 ! grep -q 'meta mark set.*counter name' "$NFT_COMMAND_LOG"
-[ "$(grep -c 'counter name port_3000_4000_in$' "$NFT_COMMAND_LOG")" -eq 4 ]
+[ "$(grep -c 'counter name "port_3000_4000_in"$' "$NFT_COMMAND_LOG")" -eq 4 ]
 update_config_file 'del(.ports["3000-4000"])'
 
 [ "$(generate_port_range_mark 1-2)" = "$(generate_port_range_mark 721-898)" ]
@@ -572,6 +636,61 @@ update_config_file 'del(.ports["1-2"], .ports["721-898"])'
 unset -f count_quota_rules
 unset -f nftables_quota_is_absent
 unset -f nft
+
+readonly ORPHAN_BATCH_CAPTURE="$TEST_DIR/orphan-cleanup.batch"
+(
+    orphan_state="stale"
+    nft() {
+        if [ "${1:-}" = "-j" ]; then
+            if [ "$orphan_state" = "stale" ]; then
+                printf '%s\n' '{"nftables":[
+                    {"counter":{"name":"port_3265_in"}},
+                    {"counter":{"name":"port_3265_out"}},
+                    {"quota":{"name":"port_3265_quota"}},
+                    {"counter":{"name":"port_33366_in"}},
+                    {"counter":{"name":"port_33366_out"}},
+                    {"quota":{"name":"port_33366_quota"}},
+                    {"rule":{"chain":"input","handle":3,"expr":[{"counter":"port_33366_in"}]}},
+                    {"rule":{"chain":"output","handle":4,"expr":[{"counter":"port_33366_out"}]}},
+                    {"rule":{"chain":"input","handle":5,"expr":[{"quota":"port_33366_quota"},{"drop":null}]}}
+                ]}'
+            else
+                printf '%s\n' '{"nftables":[
+                    {"counter":{"name":"port_3265_in"}},
+                    {"counter":{"name":"port_3265_out"}},
+                    {"quota":{"name":"port_3265_quota"}}
+                ]}'
+            fi
+            return 0
+        fi
+        if [ "${1:-}" = "-f" ]; then
+            cp "$2" "$ORPHAN_BATCH_CAPTURE"
+            orphan_state="clean"
+            return 0
+        fi
+        return 0
+    }
+    orphaned=$(list_orphaned_runtime_objects)
+    [ "$(printf '%s\n' "$orphaned" | wc -l)" -eq 3 ]
+    printf '%s\n' "$orphaned" | grep -q '^counter port_33366_in$'
+    printf '%s\n' "$orphaned" | grep -q '^counter port_33366_out$'
+    printf '%s\n' "$orphaned" | grep -q '^quota port_33366_quota$'
+    reconcile_orphaned_runtime_objects
+    grep -q '^delete rule inet port_traffic_monitor input handle 3$' "$ORPHAN_BATCH_CAPTURE"
+    grep -q '^delete counter inet port_traffic_monitor port_33366_in$' "$ORPHAN_BATCH_CAPTURE"
+    grep -q '^delete quota inet port_traffic_monitor port_33366_quota$' "$ORPHAN_BATCH_CAPTURE"
+    ! grep -q 'delete .*port_3265_' "$ORPHAN_BATCH_CAPTURE"
+    [ -z "$(list_orphaned_runtime_objects)" ]
+)
+
+readonly CONNTRACK_CAPTURE="$TEST_DIR/conntrack.capture"
+(
+    conntrack() { printf '%s\n' "$*" >> "$CONNTRACK_CAPTURE"; }
+    clear_port_conntrack_state 3000-4000
+    [ "$(wc -l < "$CONNTRACK_CAPTURE")" -eq 2 ]
+    grep -q -- '-p tcp --dport 3000:4000' "$CONNTRACK_CAPTURE"
+    grep -q -- '-p udp --dport 3000:4000' "$CONNTRACK_CAPTURE"
+)
 
 readonly CRON_FILE="$TEST_DIR/crontab"
 CRON_READ_FAIL=false
@@ -643,7 +762,7 @@ grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 update_config_file '.ports = {}'
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
-! grep -q -- '--restore-runtime' "$CRON_FILE"
+[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
 ! grep -Eq -- '--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
 grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
@@ -680,6 +799,7 @@ setup_telegram_notification_cron
 ! grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
+[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
 refresh_port_auto_reset_cron_from_config
 ! grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 
@@ -898,6 +1018,7 @@ cron() { :; }
 count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
 get_invalid_counter_order_directions() { :; }
+list_orphaned_runtime_objects() { :; }
 self_check >/dev/null
 sed -i 's/^\* \* \* \* \* \(.*--snapshot-traffic.*\)$/0 * * * * \1/' "$CRON_FILE"
 ! self_check >/dev/null
@@ -950,6 +1071,46 @@ install_update_script() {
 install_status=0
 (main --install >/dev/null 2>&1) || install_status=$?
 [ "$install_status" -eq 23 ]
+
+(
+    get_active_ports() { printf '%s\n' 3265 8123; }
+    check_reset_port_due() { [ "$1" != "8123" ]; }
+    ! check_scheduled_resets
+)
+
+cli_status=0
+(
+    check_root() { :; }
+    auto_reset_port() { return 7; }
+    main --reset-port 3265
+) >/dev/null 2>&1 || cli_status=$?
+[ "$cli_status" -eq 7 ]
+
+cli_status=0
+(
+    check_root() { :; }
+    check_scheduled_resets() { return 8; }
+    main --check-scheduled-resets
+) >/dev/null 2>&1 || cli_status=$?
+[ "$cli_status" -eq 8 ]
+
+cli_status=0
+(
+    check_root() { :; }
+    has_active_ports() { return 0; }
+    load_telegram_module() { return 1; }
+    main --send-telegram-status
+) >/dev/null 2>&1 || cli_status=$?
+[ "$cli_status" -eq 1 ]
+
+cli_status=0
+(
+    check_root() { :; }
+    has_active_ports() { return 0; }
+    send_status_notification() { return 9; }
+    main --send-status
+) >/dev/null 2>&1 || cli_status=$?
+[ "$cli_status" -eq 9 ]
 
 readonly EXPORT_SAVE_CAPTURE="$TEST_DIR/export-save.capture"
 (
