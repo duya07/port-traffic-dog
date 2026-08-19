@@ -131,6 +131,35 @@ port_specs_overlap 3000-4000 3500-4500
 [ "$(get_counter_rule_multiplier_from_count 7 2)" -eq 2 ]
 [ "$(calculate_total_traffic 100 200 double)" -eq 300 ]
 [ "$(calculate_total_traffic 100 200 single)" -eq 300 ]
+printf '%s\n' '#!/bin/bash' 'readonly SCRIPT_VERSION="1.5.10"' > "$TEST_DIR/version-script.sh"
+[ "$(get_script_version_from_file "$TEST_DIR/version-script.sh")" = "1.5.10" ]
+script_version_is_older 1.5.9 1.5.10
+script_version_is_older 1.4 1.5.0
+! script_version_is_older 1.5.10 1.5.10
+! script_version_is_older 1.6.0 1.5.10
+version_status=0
+script_version_is_older 1.5.x 1.5.10 || version_status=$?
+[ "$version_status" -eq 2 ]
+
+readonly FINALIZE_UPDATE_TRACE="$TEST_DIR/finalize-update.trace"
+(
+    check_dependencies() { printf 'dependencies\n' >> "$FINALIZE_UPDATE_TRACE"; }
+    init_config() { printf 'init\n' >> "$FINALIZE_UPDATE_TRACE"; }
+    refresh_all_cron_from_config() { printf 'cron\n' >> "$FINALIZE_UPDATE_TRACE"; }
+    restore_runtime_state() { printf 'runtime\n' >> "$FINALIZE_UPDATE_TRACE"; }
+    finalize_script_update >/dev/null
+)
+[ "$(paste -sd, "$FINALIZE_UPDATE_TRACE")" = "dependencies,init,cron,runtime" ]
+(
+    check_dependencies() { :; }
+    init_config() { :; }
+    refresh_all_cron_from_config() { return 1; }
+    restore_runtime_state() { touch "$TEST_DIR/finalize-restore-should-not-run"; }
+    ! finalize_script_update >/dev/null
+)
+[ ! -e "$TEST_DIR/finalize-restore-should-not-run" ]
+[ "$(declare -f install_update_script | grep -c 'download_with_sources')" -eq 1 ]
+declare -f install_update_script | grep -q -- '--finalize-update'
 
 # 配置提交失败时，运行时状态必须回滚，删除流程也不能触碰原端口。
 cp "$CONFIG_FILE" "$TEST_DIR/config.before-transaction-tests.json"
@@ -1234,9 +1263,8 @@ grep -q -- 'port-traffic-dog-config/cron.lock' "$PROJECT_DIR/migrate-to-custom.s
 grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime' "$PROJECT_DIR/migrate-to-custom.sh"
-grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron' "$SCRIPT_FILE"
-grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules' "$SCRIPT_FILE"
-grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --restore-runtime' "$SCRIPT_FILE"
+grep -Fq -- 'archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"' "$SCRIPT_FILE"
+grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --finalize-update' "$SCRIPT_FILE"
 add_port_monitoring_body=$(sed -n '/^add_port_monitoring() {/,/^}/p' "$SCRIPT_FILE")
 grep -q 'refresh_port_auto_reset_cron_from_config' <<< "$add_port_monitoring_body"
 grep -Fq -- '"conntrack"' "$SCRIPT_FILE"
