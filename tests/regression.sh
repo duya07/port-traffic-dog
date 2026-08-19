@@ -131,14 +131,14 @@ port_specs_overlap 3000-4000 3500-4500
 [ "$(get_counter_rule_multiplier_from_count 7 2)" -eq 2 ]
 [ "$(calculate_total_traffic 100 200 double)" -eq 300 ]
 [ "$(calculate_total_traffic 100 200 single)" -eq 300 ]
-printf '%s\n' '#!/bin/bash' 'readonly SCRIPT_VERSION="1.5.10"' > "$TEST_DIR/version-script.sh"
-[ "$(get_script_version_from_file "$TEST_DIR/version-script.sh")" = "1.5.10" ]
-script_version_is_older 1.5.9 1.5.10
+printf '%s\n' '#!/bin/bash' 'readonly SCRIPT_VERSION="1.5.11"' > "$TEST_DIR/version-script.sh"
+[ "$(get_script_version_from_file "$TEST_DIR/version-script.sh")" = "1.5.11" ]
+script_version_is_older 1.5.10 1.5.11
 script_version_is_older 1.4 1.5.0
-! script_version_is_older 1.5.10 1.5.10
-! script_version_is_older 1.6.0 1.5.10
+! script_version_is_older 1.5.11 1.5.11
+! script_version_is_older 1.6.0 1.5.11
 version_status=0
-script_version_is_older 1.5.x 1.5.10 || version_status=$?
+script_version_is_older 1.5.x 1.5.11 || version_status=$?
 [ "$version_status" -eq 2 ]
 
 readonly FINALIZE_UPDATE_TRACE="$TEST_DIR/finalize-update.trace"

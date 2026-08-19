@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.10"
+readonly SCRIPT_VERSION="1.5.11"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -6067,7 +6067,7 @@ write_port_quota_rule_commands() {
     done
 }
 
-# 在单个 nft 事务中重建目标端口。第四个参数兼容旧布尔值，并支持 rebuild 完整重建配额。
+# 在单个 nft 事务中重建目标端口。旧 true/reset 参数也通过重建配额对象完成清零。
 rebuild_port_counter_objects() {
     local port="$1"
     local target_input="${2:-0}"
@@ -6077,8 +6077,8 @@ rebuild_port_counter_objects() {
     [[ "$target_output" =~ ^[0-9]+$ ]] || return 1
     case "$quota_action" in
         false) quota_action="keep" ;;
-        true) quota_action="reset" ;;
-        keep|reset|rebuild) ;;
+        true|reset) quota_action="rebuild" ;;
+        keep|rebuild) ;;
         *) return 1 ;;
     esac
 
@@ -6116,11 +6116,6 @@ rebuild_port_counter_objects() {
         "$rules_json" >/dev/null 2>&1 && output_exists=true
     jq -e --arg name "$quota_name" 'any(.nftables[]; .quota?.name? == $name)' \
         "$rules_json" >/dev/null 2>&1 && quota_exists=true
-    if [ "$quota_action" = "reset" ] && [ "$quota_exists" != "true" ]; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-
     if ! jq -r \
             --arg family "$family" \
             --arg table "$table_name" \
@@ -6184,10 +6179,7 @@ rebuild_port_counter_objects() {
         >> "$rebuild_batch"
 
     local quota_required=false
-    if [ "$quota_action" = "reset" ]; then
-        quota_required=true
-        printf 'reset quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$rebuild_batch"
-    elif [ "$quota_action" = "rebuild" ]; then
+    if [ "$quota_action" = "rebuild" ]; then
         local quota_enabled
         local quota_limit
         local quota_bytes
