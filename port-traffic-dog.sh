@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.9"
+readonly SCRIPT_VERSION="1.5.10"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -6689,7 +6689,7 @@ download_with_sources() {
     local url=$1
     local output_file=$2
 
-    if curl -sL --connect-timeout $SHORT_CONNECT_TIMEOUT --max-time $SHORT_MAX_TIMEOUT "$url" -o "$output_file" 2>/dev/null; then
+    if curl -fsSL --connect-timeout "$SHORT_CONNECT_TIMEOUT" --max-time "$SHORT_MAX_TIMEOUT" "$url" -o "$output_file" 2>/dev/null; then
         if [ -s "$output_file" ]; then
             echo -e "${GREEN}下载成功${NC}"
             return 0
@@ -6697,6 +6697,42 @@ download_with_sources() {
     fi
 
     echo -e "${RED}下载失败${NC}"
+    return 1
+}
+
+get_script_version_from_file() {
+    local script_file="$1"
+    [ -f "$script_file" ] || return 1
+    awk -F'"' '/^readonly SCRIPT_VERSION="[0-9]+(\.[0-9]+)+"/ { print $2; exit }' "$script_file"
+}
+
+script_version_is_valid() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
+}
+
+script_version_is_older() {
+    local candidate="$1"
+    local current="$2"
+    script_version_is_valid "$candidate" || return 2
+    script_version_is_valid "$current" || return 2
+
+    local candidate_parts=()
+    local current_parts=()
+    local IFS='.'
+    read -r -a candidate_parts <<< "$candidate"
+    read -r -a current_parts <<< "$current"
+
+    local index
+    for index in 0 1 2; do
+        local candidate_part=${candidate_parts[$index]:-0}
+        local current_part=${current_parts[$index]:-0}
+        if ((10#$candidate_part < 10#$current_part)); then
+            return 0
+        fi
+        if ((10#$candidate_part > 10#$current_part)); then
+            return 1
+        fi
+    done
     return 1
 }
 
@@ -6729,7 +6765,8 @@ download_notification_modules() {
     fi
 
     # 下载解压后同步通知模块：默认只补齐缺失；force 模式覆盖同步
-    if download_with_sources "$MODULES_ARCHIVE_URL" "$temp_dir/repo.zip" &&
+    local archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"
+    if download_with_sources "$archive_url" "$temp_dir/repo.zip" &&
        (cd "$temp_dir" && unzip -q repo.zip); then
         local extracted_root=""
         local d
@@ -6784,6 +6821,29 @@ download_notification_modules() {
     return 1
 }
 
+finalize_script_update() {
+    echo -e "${YELLOW}[1/3] 初始化并迁移现有配置...${NC}"
+    check_dependencies true
+    if ! init_config; then
+        echo -e "${RED}新版本配置初始化失败${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}[2/3] 刷新定时任务...${NC}"
+    if ! refresh_all_cron_from_config; then
+        echo -e "${RED}新版本定时任务刷新失败${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}[3/3] 校验并恢复流量与限速状态...${NC}"
+    if ! restore_runtime_state; then
+        echo -e "${RED}新版本流量或限速状态恢复失败${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}新版本维护步骤完成${NC}"
+}
+
 # 安装(更新)脚本
 install_update_script() {
     local reload_after_update="${1:-true}"
@@ -6803,14 +6863,14 @@ install_update_script() {
 
     local temp_dir
     temp_dir=$(mktemp -d)
-    local new_script="$temp_dir/port-traffic-dog.sh"
+    local new_script=""
     local archive="$temp_dir/repo.zip"
     local extracted_root=""
     local new_telegram=""
     local new_wecom=""
+    local archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"
 
-    if ! download_with_sources "$SCRIPT_URL" "$new_script" ||
-       ! download_with_sources "$MODULES_ARCHIVE_URL" "$archive" ||
+    if ! download_with_sources "$archive_url" "$archive" ||
        ! (cd "$temp_dir" && unzip -q "$archive"); then
         echo -e "${RED}下载或解压失败，已保留当前版本${NC}"
         rm -rf "$temp_dir"
@@ -6824,6 +6884,8 @@ install_update_script() {
         break
     done
     if [ -n "$extracted_root" ]; then
+        [ -f "$extracted_root/port-traffic-dog.sh" ] &&
+            new_script="$extracted_root/port-traffic-dog.sh"
         [ -f "$extracted_root/notifications/telegram.sh" ] &&
             new_telegram="$extracted_root/notifications/telegram.sh"
         [ -f "$extracted_root/telegram.sh" ] && new_telegram="$extracted_root/telegram.sh"
@@ -6832,7 +6894,11 @@ install_update_script() {
         [ -f "$extracted_root/wecom.sh" ] && new_wecom="$extracted_root/wecom.sh"
     fi
 
+    local downloaded_version=""
+    downloaded_version=$(get_script_version_from_file "$new_script" 2>/dev/null || true)
+
     if [ ! -s "$new_script" ] || [ -z "$new_telegram" ] || [ -z "$new_wecom" ] ||
+       ! script_version_is_valid "$downloaded_version" ||
        ! grep -q "端口流量狗" "$new_script" 2>/dev/null ||
        ! bash -n "$new_script" || ! bash -n "$new_telegram" || ! bash -n "$new_wecom" ||
        ! bash "$new_script" --validate-config "$CONFIG_FILE" >/dev/null; then
@@ -6840,6 +6906,12 @@ install_update_script() {
         rm -rf "$temp_dir"
         return 1
     fi
+    if script_version_is_older "$downloaded_version" "$SCRIPT_VERSION"; then
+        echo -e "${RED}下载版本 v$downloaded_version 早于当前版本 v$SCRIPT_VERSION，已拒绝降级${NC}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    echo -e "${BLUE}版本: v$SCRIPT_VERSION -> v$downloaded_version${NC}"
 
     local backup_dir="$temp_dir/backup"
     local notifications_dir="$CONFIG_DIR/notifications"
@@ -6855,19 +6927,30 @@ install_update_script() {
     fi
 
     local update_ok=true
+    local failed_stage=""
     mkdir -p "$notifications_dir"
-    install -m 755 "$new_script" "${INSTALLED_SCRIPT_PATH}.new.$$" || update_ok=false
-    [ "$update_ok" = "true" ] && mv "${INSTALLED_SCRIPT_PATH}.new.$$" "$INSTALLED_SCRIPT_PATH" || update_ok=false
-    [ "$update_ok" = "true" ] && install -m 755 "$new_telegram" "$notifications_dir/telegram.sh" || update_ok=false
-    [ "$update_ok" = "true" ] && install -m 755 "$new_wecom" "$notifications_dir/wecom.sh" || update_ok=false
-    [ "$update_ok" = "true" ] && create_shortcut_command >/dev/null || update_ok=false
-    if [ "$update_ok" = "true" ]; then
-        bash "$INSTALLED_SCRIPT_PATH" --refresh-all-cron >/dev/null || update_ok=false
-        bash "$INSTALLED_SCRIPT_PATH" --repair-traffic-rules >/dev/null || update_ok=false
-        bash "$INSTALLED_SCRIPT_PATH" --restore-runtime >/dev/null || update_ok=false
+    if ! install -m 755 "$new_script" "${INSTALLED_SCRIPT_PATH}.new.$$" ||
+       ! mv "${INSTALLED_SCRIPT_PATH}.new.$$" "$INSTALLED_SCRIPT_PATH"; then
+        update_ok=false
+        failed_stage="安装主脚本"
+    elif ! install -m 755 "$new_telegram" "$notifications_dir/telegram.sh" ||
+         ! install -m 755 "$new_wecom" "$notifications_dir/wecom.sh"; then
+        update_ok=false
+        failed_stage="安装通知模块"
+    elif ! create_shortcut_command >/dev/null; then
+        update_ok=false
+        failed_stage="重建 dog 快捷命令"
+    elif ! bash "$INSTALLED_SCRIPT_PATH" --finalize-update; then
+        update_ok=false
+        failed_stage="应用新版本配置与运行状态"
+    elif ! bash "$INSTALLED_SCRIPT_PATH" --version 2>/dev/null |
+         grep -Fq "v$downloaded_version"; then
+        update_ok=false
+        failed_stage="核验安装版本"
     fi
 
     if [ "$update_ok" != "true" ]; then
+        echo -e "${RED}更新失败阶段: ${failed_stage:-未知}${NC}"
         local rollback_ok=true
         local current_ports=()
         mapfile -t current_ports < <(get_active_ports 2>/dev/null || true)
@@ -8180,6 +8263,11 @@ main() {
                 check_dependencies
                 exit 0
                 ;;
+            --finalize-update)
+                local finalize_status=0
+                finalize_script_update || finalize_status=$?
+                exit "$finalize_status"
+                ;;
             --install)
                 local install_status=0
                 install_update_script false || install_status=$?
@@ -8244,6 +8332,7 @@ main() {
                 echo "  --check-deps              检查依赖工具"
                 echo "  --version                 显示版本信息"
                 echo "  --install                 安装/更新脚本"
+                echo "  --finalize-update         执行更新后的配置和运行状态迁移"
                 echo "  --uninstall               卸载脚本"
                 echo "  --send-status             发送所有启用的状态通知"
                 echo "  --send-telegram-status    发送Telegram状态通知"
