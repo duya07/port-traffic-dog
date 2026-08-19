@@ -59,6 +59,15 @@ ip link set lo up
 init_nftables
 add_nftables_rules 3265
 apply_nftables_quota 3265 1GB
+[ "$(get_nftables_quota_limit_bytes 3265)" -eq 1073741824 ]
+
+# Correct rule counts must not hide a quota object with the wrong runtime limit.
+apply_nftables_quota 3265 2GB
+[ "$(count_quota_rules 3265)" -eq 16 ]
+[ "$(get_nftables_quota_limit_bytes 3265)" -eq 2147483648 ]
+repair_port_quota_rules 3265
+[ "$LAST_REPAIR_CHANGED" = "true" ]
+[ "$(get_nftables_quota_limit_bytes 3265)" -eq 1073741824 ]
 
 # Runtime reconciliation must remove only dog-owned objects that are absent from config.
 nft add counter inet port_traffic_monitor port_33366_in
@@ -297,8 +306,42 @@ apply_tc_limit 3265 10mbit
 class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
 [ "$(tc filter show dev eth0 protocol ipv6 parent 1:0 | grep -Fc "classid $class_id")" -eq 4 ]
 [ -f "$(get_tc_root_owner_file)" ]
+tc_limit_runtime_complete 3265
+
+# Missing IPv4 UDP filters and rate drift must both fail runtime validation.
+filter_prio=$((3265 % 1000 + 1))
+tc filter del dev eth0 protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32
+! tc_limit_runtime_complete 3265
+remove_tc_limit 3265
+apply_tc_limit 3265 10mbit
+tc_limit_runtime_complete 3265
+tc class replace dev eth0 parent 1:1 classid "$class_id" htb rate 20mbit ceil 20mbit
+! tc_limit_runtime_complete 3265
 remove_tc_limit 3265
 wait_for_tc_state qdisc "qdisc htb 1:" absent
 [ ! -f "$(get_tc_root_owner_file)" ]
+
+# An unrelated HTB hierarchy must remain untouched.
+tc qdisc add dev eth0 root handle 1: htb default 30
+tc class add dev eth0 parent 1: classid 1:1 htb rate 1mbit
+! apply_tc_limit 3265 10mbit
+tc class show dev eth0 | grep -Eq '^class htb 1:1 .*rate 1Mbit([[:space:]]|$)'
+tc qdisc del dev eth0 root handle 1:
+
+# Port-range marks reserve only high bits and keep the low 12 skb-mark bits.
+update_config_file '
+    .ports["4000-4010"] = {
+        enabled: true,
+        billing_mode: "single",
+        quota: {enabled: false, monthly_limit: "unlimited"},
+        bandwidth_limit: {enabled: true, rate: "5Mbps"}
+    }
+'
+apply_tc_limit 4000-4010 5mbit
+tc_limit_runtime_complete 4000-4010
+range_mark_id=$(jq -r '.ports["4000-4010"].bandwidth_limit.mark_id' "$CONFIG_FILE")
+port_range_mark_rules_complete 4000-4010 "$range_mark_id"
+remove_tc_limit 4000-4010
+update_config_file 'del(.ports["4000-4010"])'
 
 echo "network namespace integration tests passed"

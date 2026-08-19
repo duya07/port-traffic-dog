@@ -25,7 +25,7 @@ write_base_config() {
         global: {
             billing_mode: "double",
             traffic_accounting_model: "upstream-weighted-v2",
-            tc_runtime_model: "dual-stack-v1"
+            tc_runtime_model: "dual-stack-v2"
         },
         ports: {},
         nftables: {table_name: "port_traffic_monitor", family: "inet"},
@@ -65,6 +65,13 @@ mkdir "$TRAFFIC_STATS_LOCK_DIR"
 printf '99999999 0\n' > "$TRAFFIC_STATS_LOCK_DIR/owner"
 acquire_traffic_stats_lock
 release_traffic_stats_lock
+
+readonly REUSED_PID_LOCK_DIR="$CONFIG_DIR/reused-pid.lock"
+mkdir "$REUSED_PID_LOCK_DIR"
+printf '%s 0\n' "${BASHPID:-$$}" > "$REUSED_PID_LOCK_DIR/owner"
+acquire_directory_lock "$REUSED_PID_LOCK_DIR"
+[ "$(wc -w < "$REUSED_PID_LOCK_DIR/owner")" -eq 4 ]
+release_directory_lock "$REUSED_PID_LOCK_DIR"
 
 readonly LIVE_LOCK_DIR="$CONFIG_DIR/live.lock"
 mkdir "$LIVE_LOCK_DIR"
@@ -124,6 +131,71 @@ port_specs_overlap 3000-4000 3500-4500
 [ "$(get_counter_rule_multiplier_from_count 7 2)" -eq 2 ]
 [ "$(calculate_total_traffic 100 200 double)" -eq 300 ]
 [ "$(calculate_total_traffic 100 200 single)" -eq 300 ]
+
+# 配置提交失败时，运行时状态必须回滚，删除流程也不能触碰原端口。
+cp "$CONFIG_FILE" "$TEST_DIR/config.before-transaction-tests.json"
+update_config_file '
+    .ports = {
+        "3265": {
+            enabled: true,
+            billing_mode: "double",
+            quota: {enabled: true, monthly_limit: "1GB"},
+            bandwidth_limit: {enabled: true, rate: "10Mbps"}
+        }
+    }
+'
+readonly TC_ROLLBACK_CAPTURE="$TEST_DIR/tc-rollback.capture"
+(
+    show_port_list() { return 0; }
+    remove_tc_limit() { printf 'remove\n' >> "$TC_ROLLBACK_CAPTURE"; }
+    apply_tc_limit() { printf 'apply:%s\n' "$2" >> "$TC_ROLLBACK_CAPTURE"; }
+    update_config_file() { return 1; }
+    manage_traffic_limits() { :; }
+    sleep() { :; }
+    set_port_bandwidth_limit <<< $'1\n20Mbps'
+)
+[ "$(paste -sd, "$TC_ROLLBACK_CAPTURE")" = "remove,apply:20mbit,remove,apply:10mbit" ]
+jq -e '.ports["3265"].bandwidth_limit == {enabled:true, rate:"10Mbps"}' "$CONFIG_FILE" >/dev/null
+
+readonly QUOTA_ROLLBACK_CAPTURE="$TEST_DIR/quota-rollback.capture"
+(
+    show_port_list() { return 0; }
+    apply_nftables_quota() { printf 'apply:%s\n' "$2" >> "$QUOTA_ROLLBACK_CAPTURE"; }
+    update_config_file() { return 1; }
+    manage_traffic_limits() { :; }
+    sleep() { :; }
+    set_port_quota_limit <<< $'1\n2GB\nn'
+)
+[ "$(paste -sd, "$QUOTA_ROLLBACK_CAPTURE")" = "apply:2GB,apply:1GB" ]
+jq -e '.ports["3265"].quota == {enabled:true, monthly_limit:"1GB"}' "$CONFIG_FILE" >/dev/null
+
+readonly DELETE_FAILURE_CAPTURE="$TEST_DIR/delete-failure.capture"
+(
+    show_port_list() { return 0; }
+    save_traffic_data() { return 0; }
+    update_config_file() { return 1; }
+    remove_nftables_rules() { touch "$DELETE_FAILURE_CAPTURE"; }
+    remove_nftables_quota() { touch "$DELETE_FAILURE_CAPTURE"; }
+    remove_tc_limit() { touch "$DELETE_FAILURE_CAPTURE"; }
+    clear_port_conntrack_state() { touch "$DELETE_FAILURE_CAPTURE"; }
+    reconcile_orphaned_runtime_objects() { touch "$DELETE_FAILURE_CAPTURE"; }
+    refresh_notification_cron_from_config() { :; }
+    setup_traffic_snapshot_cron() { :; }
+    manage_port_monitoring() { :; }
+    sleep() { :; }
+    remove_port_monitoring <<< $'1\ny'
+)
+[ ! -e "$DELETE_FAILURE_CAPTURE" ]
+jq -e '.ports["3265"] != null' "$CONFIG_FILE" >/dev/null
+cp "$TEST_DIR/config.before-transaction-tests.json" "$CONFIG_FILE"
+
+printf '%s\n' 'not-json' > "$TRAFFIC_STATS_FILE"
+! ensure_traffic_stats_file
+[ ! -f "$TRAFFIC_STATS_FILE" ]
+compgen -G "${TRAFFIC_STATS_FILE}.corrupt.*" >/dev/null
+ensure_traffic_stats_file
+jq -e '.last_snapshot == {} and .daily == {}' "$TRAFFIC_STATS_FILE" >/dev/null
+rm -f "$TRAFFIC_STATS_FILE" "${TRAFFIC_STATS_FILE}.corrupt."*
 
 today=$(get_current_date)
 jq -n --arg port "3265" --arg date "$today" '
@@ -551,7 +623,7 @@ nft() {
             nftables:
                 ([range(0; $expected) |
                     {rule:{chain:"input",handle:(. + 1),expr:[{quota:"port_3265_quota"}]}}] +
-                 [{quota:{name:"port_3265_quota"}}])
+                 [{quota:{name:"port_3265_quota",bytes:107374182400}}])
         }'
     elif [ "${1:-}" = "-f" ]; then
         cat "$2" >> "$NFT_COMMAND_LOG"
@@ -575,6 +647,7 @@ count_counter_rules() {
     prefix=$(get_port_counter_prefix "$port")
     grep -c "counter name \"${prefix}_${direction}\"$" "$NFT_COMMAND_LOG" 2>/dev/null || true
 }
+original_nftables_quota_is_absent=$(declare -f nftables_quota_is_absent)
 nftables_quota_is_absent() { return 0; }
 
 : > "$NFT_COMMAND_LOG"
@@ -631,10 +704,13 @@ update_config_file '.ports["1-2"]={bandwidth_limit:{}} | .ports["721-898"]={band
 mark_one=$(get_or_create_port_range_mark 1-2 1:2)
 mark_two=$(get_or_create_port_range_mark 721-898 1:3)
 [ "$mark_one" != "$mark_two" ]
+[ $((mark_one & TC_MARK_PRESERVE_MASK)) -eq 0 ]
+[ $((mark_two & TC_MARK_PRESERVE_MASK)) -eq 0 ]
 update_config_file 'del(.ports["1-2"], .ports["721-898"])'
 
 unset -f count_quota_rules
 unset -f nftables_quota_is_absent
+eval "$original_nftables_quota_is_absent"
 unset -f nft
 
 readonly ORPHAN_BATCH_CAPTURE="$TEST_DIR/orphan-cleanup.batch"
@@ -872,6 +948,7 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
 
 (
     get_default_interface() { echo eth0; }
+    tc_root_is_owned() { return 0; }
     tc_class_added=false
     tc() {
         if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
@@ -885,6 +962,21 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
         return 0
     }
     apply_tc_limit 65535 1mbit
+)
+(
+    get_default_interface() { echo eth0; }
+    tc_root_is_owned() { return 1; }
+    tc_class_changed=false
+    tc() {
+        if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
+            echo 'qdisc htb 1: root refcnt 2'
+        elif [ "$1" = "class" ] && { [ "$2" = "replace" ] || [ "$2" = "del" ]; }; then
+            tc_class_changed=true
+        fi
+        return 0
+    }
+    ! apply_tc_limit 65535 1mbit
+    [ "$tc_class_changed" = "false" ]
 )
 (
     get_default_interface() { echo eth0; }
@@ -1010,7 +1102,12 @@ printf '%s\n' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知' \
     > "$CRON_FILE"
-nft() { :; }
+nft() {
+    if [ "${1:-}" = "list" ] && [ "${2:-}" = "quota" ]; then
+        return 1
+    fi
+    return 0
+}
 tc() { :; }
 ss() { :; }
 bc() { :; }

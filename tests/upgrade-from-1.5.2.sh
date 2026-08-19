@@ -114,6 +114,7 @@ run_current_phase() (
     [ "$(count_counter_rules 3265 out)" -eq 8 ]
     [ "$(count_quota_rules 3265)" -eq 16 ]
     tc_limit_runtime_complete 3265
+    [ -f "$(get_tc_root_owner_file)" ]
     [ "$(jq -r '.global.tc_runtime_model // empty' "$CONFIG_FILE")" = "$TC_RUNTIME_MODEL" ]
 
     save_traffic_data
