@@ -75,15 +75,15 @@ unzip() {
     cp -a "$PAYLOAD_ROOT" "$PWD/port-traffic-dog-main"
 }
 
-create_payload 1.5.11
+create_payload 1.5.12
 : > "$DOWNLOAD_COUNT_FILE"
 install_update_script false > "$TEST_DIR/update.out"
 [ "$(cat "$DOWNLOAD_COUNT_FILE")" -eq 1 ]
 [ -f "$PTD_UPDATE_TEST_MARKER" ]
-[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.11" ]
+[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.12" ]
 cmp -s "$PAYLOAD_ROOT/telegram.sh" "$TEST_CONFIG_DIR/notifications/telegram.sh"
 cmp -s "$PAYLOAD_ROOT/wecom.sh" "$TEST_CONFIG_DIR/notifications/wecom.sh"
-grep -Fq '版本: v1.5.9 -> v1.5.11' "$TEST_DIR/update.out"
+grep -Fq '版本: v1.5.9 -> v1.5.12' "$TEST_DIR/update.out"
 
 create_payload 1.5.8
 : > "$DOWNLOAD_COUNT_FILE"
@@ -92,7 +92,7 @@ if install_update_script false > "$TEST_DIR/downgrade.out"; then
     exit 1
 fi
 [ "$(cat "$DOWNLOAD_COUNT_FILE")" -eq 1 ]
-[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.11" ]
+[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.12" ]
 grep -Fq '已拒绝降级' "$TEST_DIR/downgrade.out"
 
 echo "update install integration test passed"

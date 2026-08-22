@@ -34,6 +34,8 @@ trap '
 
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
+    -e "s#^readonly TC_SHARED_LOCK_FILE=.*#readonly TC_SHARED_LOCK_FILE=\"$TEST_DIR/traffic-tools-tc.lock\"#" \
+    -e "s#^readonly TRAFFICCOP_TC_STATE_FILE=.*#readonly TRAFFICCOP_TC_STATE_FILE=\"$TEST_DIR/trafficcop-tc.state\"#" \
     -e '$d' \
     "$SCRIPT_FILE")
 
@@ -284,6 +286,17 @@ get_default_interface() {
     echo eth0
 }
 
+write_ntc_unified_state() {
+    local speed="$1"
+    {
+        printf 'SCHEMA=%s\n' "$TC_INTEROP_SCHEMA"
+        printf 'PROVIDER=trafficcop-lite\n'
+        printf 'INTERFACE=eth0\n'
+        printf 'LIMIT_SPEED=%s\n' "$speed"
+    } > "$TRAFFICCOP_TC_STATE_FILE"
+    chmod 600 "$TRAFFICCOP_TC_STATE_FILE"
+}
+
 wait_for_tc_state() {
     local object_type="$1"
     local pattern="$2"
@@ -306,7 +319,21 @@ apply_tc_limit 3265 10mbit
 class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
 [ "$(tc filter show dev eth0 protocol ipv6 parent 1:0 | grep -Fc "classid $class_id")" -eq 4 ]
 [ -f "$(get_tc_root_owner_file)" ]
+tc_class_rate_matches eth0 1:30 "$TC_DEFAULT_CLASS_RATE" "$TC_PARENT_RATE"
+tc_class_rate_matches eth0 "$class_id" "$TC_PORT_CLASS_RATE" 10mbit
 tc_limit_runtime_complete 3265
+
+# TrafficCop 状态是父类权威来源；Dog 只读状态并原地协调，不调用另一个项目。
+write_ntc_unified_state 5000
+ensure_owned_tc_hierarchy eth0
+tc_limit_runtime_complete 3265
+tc_class_rate_matches eth0 1:1 5mbit
+tc_class_rate_matches eth0 1:30 "$TC_DEFAULT_CLASS_RATE" 5mbit
+tc_class_rate_matches eth0 "$class_id" "$TC_PORT_CLASS_RATE" 10mbit
+rm -f "$TRAFFICCOP_TC_STATE_FILE"
+ensure_owned_tc_hierarchy eth0
+tc_limit_runtime_complete 3265
+tc_class_rate_matches eth0 1:1 "$TC_PARENT_RATE"
 
 # Missing IPv4 UDP filters and rate drift must both fail runtime validation.
 filter_prio=$((3265 % 1000 + 1))
@@ -321,12 +348,55 @@ remove_tc_limit 3265
 wait_for_tc_state qdisc "qdisc htb 1:" absent
 [ ! -f "$(get_tc_root_owner_file)" ]
 
+# tcpfit 在 Dog 之后删树重建同名 HTB 时，残留 owner 文件不得被当作归属证据。
+apply_tc_limit 3265 10mbit
+tc qdisc del dev eth0 root handle 1:
+tc qdisc add dev eth0 root handle 1: htb default 10
+tc class add dev eth0 parent 1: classid 1:10 htb rate 87mbit ceil 87mbit
+! apply_tc_limit 3265 10mbit
+[ ! -f "$(get_tc_root_owner_file)" ]
+! tc class show dev eth0 | grep -Eq '^class htb 1:1([[:space:]]|$)'
+tc qdisc del dev eth0 root handle 1:
+
 # An unrelated HTB hierarchy must remain untouched.
 tc qdisc add dev eth0 root handle 1: htb default 30
 tc class add dev eth0 parent 1: classid 1:1 htb rate 1mbit
+foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
 ! apply_tc_limit 3265 10mbit
+write_ntc_unified_state 5000
+! apply_tc_limit 3265 10mbit
+[ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+rm -f "$TRAFFICCOP_TC_STATE_FILE"
 tc class show dev eth0 | grep -Eq '^class htb 1:1 .*rate 1Mbit([[:space:]]|$)'
 tc qdisc del dev eth0 root handle 1:
+
+# 严格匹配 TrafficCop 状态的旧 TBF 可迁移；Dog 不改写 NTC 状态文件。
+tc qdisc add dev eth0 root tbf rate 5mbit burst 32kbit latency 400ms
+legacy_tbf_line="$(tc qdisc show dev eth0 root | head -n 1)"
+{
+    printf 'INTERFACE=eth0\n'
+    printf 'LIMIT_SPEED=5000\n'
+    printf 'QDISC_LINE=%s\n' "$legacy_tbf_line"
+    printf 'PROVIDER=trafficcop-lite\n'
+} > "$TRAFFICCOP_TC_STATE_FILE"
+chmod 600 "$TRAFFICCOP_TC_STATE_FILE"
+apply_tc_limit 3265 10mbit
+tc_root_matches_unified_contract eth0
+tc_class_rate_matches eth0 1:1 5mbit
+tc_limit_runtime_complete 3265
+! grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE"
+rm -f "$TRAFFICCOP_TC_STATE_FILE"
+remove_tc_limit 3265
+wait_for_tc_state qdisc "qdisc htb 1:" absent
+
+# 1:30 永远保留给默认叶；旧端口冲突 ID 必须先迁移到新 ID。
+update_config_file '.ports["3265"].bandwidth_limit.class_id = "1:30"'
+apply_tc_limit 3265 10mbit
+class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
+[ "$class_id" != "1:30" ]
+tc_class_rate_matches eth0 1:30 "$TC_DEFAULT_CLASS_RATE" "$TC_PARENT_RATE"
+tc_limit_runtime_complete 3265
+remove_tc_limit 3265
 
 # Port-range marks reserve only high bits and keep the low 12 skb-mark bits.
 update_config_file '

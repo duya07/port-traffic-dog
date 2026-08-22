@@ -27,6 +27,7 @@ apk add --no-cache \
     dcron \
     ca-certificates \
     curl \
+    util-linux-misc \
     tzdata
 
 echo "[2/4] Ensuring cron command compatibility..."
@@ -48,7 +49,7 @@ fi
 
 echo "[4/4] Verifying required commands..."
 missing=""
-for tool in nft tc ss jq awk bc unzip cron crontab curl bash conntrack; do
+for tool in nft tc ss jq awk bc unzip cron crontab curl bash conntrack flock; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing="$missing $tool"
     fi

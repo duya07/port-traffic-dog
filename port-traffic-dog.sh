@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.11"
+readonly SCRIPT_VERSION="1.5.12"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -15,10 +15,15 @@ readonly TRAFFIC_STATS_LOCK_DIR="$CONFIG_DIR/traffic_stats.lock"
 readonly CONFIG_LOCK_DIR="$CONFIG_DIR/config.lock"
 readonly RESET_LOCK_DIR="$CONFIG_DIR/reset.lock"
 readonly CRON_LOCK_DIR="$CONFIG_DIR/cron.lock"
+readonly TC_SHARED_LOCK_FILE="${TRAFFIC_TOOLS_TC_LOCK_FILE:-/run/lock/traffic-tools-tc.lock}"
+readonly TRAFFICCOP_TC_STATE_FILE="${TRAFFICCOP_TC_STATE_FILE:-/etc/trafficcop-lite/tc_limit_state}"
+readonly TC_INTEROP_SCHEMA="traffic-tools-unified-htb-v1"
 readonly TRAFFIC_ACCOUNTING_MODEL="upstream-weighted-v2"
-readonly TC_RUNTIME_MODEL="dual-stack-v2"
+readonly TC_RUNTIME_MODEL="unified-htb-v3"
 readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
 readonly TC_PARENT_RATE="100gbit"
+readonly TC_DEFAULT_CLASS_RATE="1kbit"
+readonly TC_PORT_CLASS_RATE="1kbit"
 readonly TC_MARK_MASK=0xfffff000
 readonly TC_MARK_PRESERVE_MASK=0x00000fff
 readonly LEGACY_LOCK_MAX_AGE=86400
@@ -87,6 +92,7 @@ install_missing_tools() {
             "bc") $pkg_cmd install -y bc ;;
             "curl") $pkg_cmd install -y curl ;;
             "conntrack") $pkg_cmd install -y conntrack ;;
+            "flock") $pkg_cmd install -y util-linux ;;
             "cron")
                 $pkg_cmd install -y cron
                 systemctl enable cron 2>/dev/null || true
@@ -102,7 +108,7 @@ install_missing_tools() {
 check_dependencies() {
     local silent_mode=${1:-false}
     local missing_tools=()
-    local required_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack")
+    local required_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack" "flock")
 
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
@@ -161,12 +167,27 @@ begin_cron_update() {
     acquire_directory_lock "$CRON_LOCK_DIR"
 }
 
+release_cron_update() {
+    release_directory_lock "$CRON_LOCK_DIR"
+}
+
+read_root_crontab_locked() {
+    local output=""
+    local result=0
+
+    begin_cron_update || return 1
+    output=$(read_current_crontab) || result=$?
+    release_cron_update
+    [ "$result" -eq 0 ] || return "$result"
+    printf '%s\n' "$output"
+}
+
 finish_cron_update() {
     local cron_file="$1"
     local result=0
     crontab "$cron_file" || result=1
     rm -f "$cron_file"
-    release_directory_lock "$CRON_LOCK_DIR"
+    release_cron_update
     return "$result"
 }
 
@@ -175,7 +196,7 @@ setup_cron_environment() {
     begin_cron_update || return 1
     local current_cron
     if ! current_cron=$(read_current_crontab); then
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     if ! echo "$current_cron" | grep -q "^PATH=.*sbin"; then
@@ -185,7 +206,7 @@ setup_cron_environment() {
         finish_cron_update "$temp_cron"
         return
     fi
-    release_directory_lock "$CRON_LOCK_DIR"
+    release_cron_update
 }
 
 check_root() {
@@ -432,6 +453,40 @@ release_directory_lock() {
     fi
     rm -f "$lock_dir/owner" 2>/dev/null || true
     rmdir "$lock_dir" 2>/dev/null || true
+}
+
+# Dog 与 TrafficCop 会修改同一网卡的 TC 层级。cron 锁仍归各项目所有，
+# 但 TC 事务必须共用这一把锁，避免父类和端口子类被并发改成半完成状态。
+TC_SHARED_LOCK_DEPTH=0
+TC_UPDATE_MIGRATED_LEGACY_TBF=false
+TC_UPDATE_LEGACY_TBF_RATE=""
+
+begin_tc_update() {
+    if [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ]; then
+        TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH + 1))
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$TC_SHARED_LOCK_FILE")" || return 1
+    exec 9>"$TC_SHARED_LOCK_FILE" || return 1
+    if ! flock -w 15 9; then
+        exec 9>&-
+        return 1
+    fi
+    TC_SHARED_LOCK_DEPTH=1
+    TC_UPDATE_MIGRATED_LEGACY_TBF=false
+    TC_UPDATE_LEGACY_TBF_RATE=""
+}
+
+finish_tc_update() {
+    [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ] || return 0
+    TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH - 1))
+    if [ "$TC_SHARED_LOCK_DEPTH" -eq 0 ]; then
+        TC_UPDATE_MIGRATED_LEGACY_TBF=false
+        TC_UPDATE_LEGACY_TBF_RATE=""
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+    fi
 }
 
 acquire_config_lock() {
@@ -1108,6 +1163,8 @@ restore_runtime_state() {
     mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
     local failed=false
     local port
+    local tc_ports=()
+    local tc_limits=()
 
     if ! reconcile_orphaned_runtime_objects; then
         log_notification "orphaned nftables runtime objects could not be reconciled"
@@ -1133,25 +1190,35 @@ restore_runtime_state() {
         limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
         rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
         if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
-            local tc_interface
-            tc_interface=$(get_default_interface 2>/dev/null || true)
-            if [ -n "$tc_interface" ] && \
-               tc qdisc show dev "$tc_interface" 2>/dev/null | grep -Eq '^qdisc htb 1:' && \
-               ! tc_root_is_owned "$tc_interface" && \
-               ! adopt_legacy_tc_root_if_safe "$tc_interface"; then
-                log_notification "无法确认现有HTB根队列归属，已停止恢复端口 $port 的限速"
-                failed=true
-                continue
-            fi
             local tc_limit
             tc_limit=$(convert_bandwidth_to_tc "$rate_limit")
             if [ -n "$tc_limit" ]; then
-                remove_tc_limit "$port" >/dev/null 2>&1 || true
-                apply_tc_limit "$port" "$tc_limit" >/dev/null 2>&1 || failed=true
+                tc_ports+=("$port")
+                tc_limits+=("$tc_limit")
             fi
         fi
     done
 
+    if [ ${#tc_ports[@]} -gt 0 ]; then
+        if begin_tc_update; then
+            local tc_index
+            for tc_index in "${!tc_ports[@]}"; do
+                remove_tc_limit_locked "${tc_ports[$tc_index]}" >/dev/null 2>&1 || true
+                apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}" >/dev/null 2>&1 || failed=true
+            done
+            if [ "$failed" = "true" ] && [ "$TC_UPDATE_MIGRATED_LEGACY_TBF" = "true" ]; then
+                local rollback_interface
+                rollback_interface=$(get_default_interface 2>/dev/null || true)
+                if [ -n "$rollback_interface" ]; then
+                    rollback_legacy_trafficcop_tbf "$rollback_interface" >/dev/null 2>&1 || true
+                fi
+            fi
+            finish_tc_update
+        else
+            log_notification "无法取得共享TC锁，已停止恢复端口限速"
+            failed=true
+        fi
+    fi
     [ "$failed" = "false" ]
 }
 
@@ -2485,8 +2552,6 @@ ensure_tc_runtime_model() {
     local active_ports=()
     mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
     local has_bandwidth_limits=false
-    local interface
-    interface=$(get_default_interface 2>/dev/null || true)
     local port
     for port in "${active_ports[@]}"; do
         local limit_enabled
@@ -2499,15 +2564,10 @@ ensure_tc_runtime_model() {
         fi
     done
 
-    if [ "$has_bandwidth_limits" = "true" ] && [ -n "$interface" ] && \
-       tc qdisc show dev "$interface" 2>/dev/null | grep -Eq '^qdisc htb 1:' && \
-       ! tc_root_is_owned "$interface"; then
-        adopt_legacy_tc_root_if_safe "$interface" || return 1
-    fi
-
-    [ "$current_model" = "$TC_RUNTIME_MODEL" ] && return 0
-
     local need_restore=false
+    if [ "$has_bandwidth_limits" = "true" ] && [ "$current_model" != "$TC_RUNTIME_MODEL" ]; then
+        need_restore=true
+    fi
     for port in "${active_ports[@]}"; do
         local limit_enabled
         local rate_limit
@@ -2524,6 +2584,7 @@ ensure_tc_runtime_model() {
         restore_runtime_state || return 1
     fi
 
+    [ "$current_model" = "$TC_RUNTIME_MODEL" ] && return 0
     update_config_file \
         '.global = (.global // {}) | .global.tc_runtime_model = $model' \
         --arg model "$TC_RUNTIME_MODEL"
@@ -3175,7 +3236,8 @@ generate_tc_class_id() {
     local stored_class_id
     stored_class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
     local stored_minor
-    if stored_minor=$(tc_class_id_minor "$stored_class_id" 2>/dev/null); then
+    if tc_port_class_id_valid "$stored_class_id" >/dev/null 2>&1 &&
+       stored_minor=$(tc_class_id_minor "$stored_class_id" 2>/dev/null); then
         if ! tc_minor_in_use "$port" "$stored_minor"; then
             echo "$stored_class_id"
             return
@@ -3213,9 +3275,22 @@ tc_class_id_minor() {
     echo "$minor"
 }
 
+tc_minor_is_reserved() {
+    local minor="$1"
+    [ "$minor" -eq 1 ] || [ "$minor" -eq $((16#30)) ]
+}
+
+tc_port_class_id_valid() {
+    local class_id="$1"
+    local minor
+    minor=$(tc_class_id_minor "$class_id") || return 1
+    ! tc_minor_is_reserved "$minor"
+}
+
 tc_minor_in_use() {
     local current_port="$1"
     local target_minor="$2"
+    tc_minor_is_reserved "$target_minor" && return 0
     local active_ports=()
     mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
     local other
@@ -3224,7 +3299,8 @@ tc_minor_in_use() {
         local class_id
         class_id=$(jq -r --arg port "$other" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
         local other_minor
-        if other_minor=$(tc_class_id_minor "$class_id" 2>/dev/null); then
+        if tc_port_class_id_valid "$class_id" >/dev/null 2>&1 &&
+           other_minor=$(tc_class_id_minor "$class_id" 2>/dev/null); then
             if [ "$other_minor" -eq "$target_minor" ]; then
                 return 0
             fi
@@ -3246,6 +3322,7 @@ save_tc_class_id() {
     local port="$1"
     local class_id="$2"
 
+    tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
     jq -e --arg port "$port" '.ports[$port] // empty' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
     update_config_file '
         if ([.ports | to_entries[] |
@@ -4601,11 +4678,12 @@ restore_previous_tc_limit() {
     local port="$1"
     local old_enabled="$2"
     local old_rate="$3"
-    remove_tc_limit "$port" >/dev/null 2>&1 || true
     if [ "$old_enabled" = "true" ] && [ "$old_rate" != "unlimited" ]; then
         local old_tc_limit
         old_tc_limit=$(convert_bandwidth_to_tc "$old_rate")
-        [ -n "$old_tc_limit" ] && apply_tc_limit "$port" "$old_tc_limit" >/dev/null 2>&1
+        [ -n "$old_tc_limit" ] && replace_tc_limit "$port" "$old_tc_limit" >/dev/null 2>&1
+    else
+        remove_tc_limit "$port" >/dev/null 2>&1
     fi
 }
 
@@ -4697,11 +4775,7 @@ set_port_bandwidth_limit() {
         # 转换为TC格式
         local tc_limit=$(convert_bandwidth_to_tc "$limit")
 
-        if ! remove_tc_limit "$port"; then
-            echo -e "${RED}端口 $port 原带宽限制无法安全移除，配置未修改${NC}"
-            continue
-        fi
-        if apply_tc_limit "$port" "$tc_limit"; then
+        if replace_tc_limit "$port" "$tc_limit"; then
             if update_config_file '
                 .ports[$port].bandwidth_limit.enabled = true |
                 .ports[$port].bandwidth_limit.rate = $rate
@@ -5228,7 +5302,7 @@ mark_tc_root_owned() {
     chmod 600 "$(get_tc_root_owner_file)" 2>/dev/null || true
 }
 
-tc_root_is_owned() {
+tc_root_owner_marker_matches() {
     local interface="$1"
     local owner_file
     owner_file=$(get_tc_root_owner_file)
@@ -5239,10 +5313,148 @@ tc_root_is_owned() {
     [ "$recorded_interface" = "$interface" ] && [ "$recorded_machine_id" = "$machine_id" ]
 }
 
+tc_state_file_is_secure() {
+    local state_file="$1"
+    local owner_uid
+    local mode
+
+    [ -f "$state_file" ] && [ ! -L "$state_file" ] || return 1
+    owner_uid=$(stat -c '%u' "$state_file" 2>/dev/null) || return 1
+    [ "$owner_uid" = "$(id -u)" ] || return 1
+    mode=$(stat -c '%a' "$state_file" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+tc_state_unique_value() {
+    local state_file="$1"
+    local key="$2"
+    local count
+    count=$(grep -Ec "^${key}=" "$state_file" 2>/dev/null || true)
+    [ "$count" -eq 1 ] || return 1
+    grep "^${key}=" "$state_file" | cut -d'=' -f2-
+}
+
+tc_state_optional_unique_value() {
+    local state_file="$1"
+    local key="$2"
+    local count
+    count=$(grep -Ec "^${key}=" "$state_file" 2>/dev/null || true)
+    [ "$count" -le 1 ] || return 1
+    [ "$count" -eq 1 ] && grep "^${key}=" "$state_file" | cut -d'=' -f2-
+}
+
+# 返回值：0=当前接口存在有效统一限速；1=无状态；2=状态无效；3=旧版状态；4=其他接口。
+trafficcop_unified_state_rate() {
+    local interface="$1"
+    local schema
+    local provider
+    local state_interface
+    local speed
+
+    [ -e "$TRAFFICCOP_TC_STATE_FILE" ] || return 1
+    tc_state_file_is_secure "$TRAFFICCOP_TC_STATE_FILE" || return 2
+    if ! schema=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "SCHEMA" 2>/dev/null); then
+        if ! grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE" 2>/dev/null; then
+            return 3
+        fi
+        return 2
+    fi
+    [ "$schema" = "$TC_INTEROP_SCHEMA" ] || return 2
+    provider=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "PROVIDER") || return 2
+    [ "$provider" = "trafficcop-lite" ] || return 2
+    state_interface=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "INTERFACE") || return 2
+    [[ "$state_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 2
+    speed=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "LIMIT_SPEED") || return 2
+    [[ "$speed" =~ ^[1-9][0-9]*$ ]] || return 2
+    [ "$state_interface" = "$interface" ] || return 4
+    printf '%skbit\n' "$speed"
+}
+
+trafficcop_legacy_state_rate() {
+    local interface="$1"
+    local provider
+    local state_interface
+    local speed
+
+    [ -e "$TRAFFICCOP_TC_STATE_FILE" ] || return 1
+    tc_state_file_is_secure "$TRAFFICCOP_TC_STATE_FILE" || return 1
+    ! grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE" 2>/dev/null || return 1
+    provider=$(tc_state_optional_unique_value "$TRAFFICCOP_TC_STATE_FILE" "PROVIDER") || return 1
+    [ -z "$provider" ] || [ "$provider" = "trafficcop-lite" ] || return 1
+    state_interface=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "INTERFACE") || return 1
+    [ "$state_interface" = "$interface" ] || return 1
+    speed=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "LIMIT_SPEED") || return 1
+    [[ "$speed" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%skbit\n' "$speed"
+}
+
+tc_rate_from_qdisc_line() {
+    local qdisc_line="$1"
+    printf '%s\n' "$qdisc_line" |
+        awk '{for (i=1; i<=NF; i++) if ($i == "rate") {print $(i+1); exit}}'
+}
+
+trafficcop_legacy_tbf_rate() {
+    local interface="$1"
+    local qdisc_line="$2"
+    local expected_rate
+    local recorded_qdisc
+    local actual_rate
+    local expected_bps
+    local actual_bps
+
+    grep -Eq '^qdisc tbf .* root([[:space:]]|$)' <<< "$qdisc_line" || return 1
+    expected_rate=$(trafficcop_legacy_state_rate "$interface") || return 1
+    recorded_qdisc=$(tc_state_optional_unique_value "$TRAFFICCOP_TC_STATE_FILE" "QDISC_LINE") || return 1
+    if [ -n "$recorded_qdisc" ]; then
+        [ "$recorded_qdisc" = "$qdisc_line" ] || return 1
+    fi
+    actual_rate=$(tc_rate_from_qdisc_line "$qdisc_line")
+    expected_bps=$(normalize_tc_rate_to_bps "$expected_rate") || return 1
+    actual_bps=$(normalize_tc_rate_to_bps "$actual_rate") || return 1
+    [ "$actual_bps" -eq "$expected_bps" ] || return 1
+    printf '%s\n' "$expected_rate"
+}
+
+tc_root_qdisc_line() {
+    tc qdisc show dev "$1" root 2>/dev/null | head -n 1
+}
+
+tc_root_matches_unified_contract() {
+    local interface="$1"
+    local qdisc_line
+    local class_state
+    qdisc_line=$(tc_root_qdisc_line "$interface") || return 1
+    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$qdisc_line" || return 1
+    grep -Eq ' default (0x)?30([[:space:]]|$)' <<< "$qdisc_line" || return 1
+    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 1
+    grep -Eq '^class htb 1:1 root([[:space:]]|$)' <<< "$class_state" || return 1
+    grep -Eq '^class htb 1:30 parent 1:1([[:space:]]|$)' <<< "$class_state"
+}
+
+tc_root_is_owned() {
+    local interface="$1"
+    tc_root_owner_marker_matches "$interface" || return 1
+    tc_root_matches_unified_contract "$interface"
+}
+
+tc_root_is_managed() {
+    local interface="$1"
+    tc_root_matches_unified_contract "$interface" || return 1
+    if tc_root_owner_marker_matches "$interface"; then
+        return 0
+    fi
+    trafficcop_unified_state_rate "$interface" >/dev/null 2>&1
+}
+
 adopt_legacy_tc_root_if_safe() {
     local interface="$1"
-    tc qdisc show dev "$interface" 2>/dev/null | grep -Eq '^qdisc htb 1:' || return 1
-    tc_root_is_owned "$interface" && return 0
+    local legacy_qdisc_line
+    legacy_qdisc_line=$(tc_root_qdisc_line "$interface") || return 1
+    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$legacy_qdisc_line" || return 1
+    grep -Eq ' default (0x)?30([[:space:]]|$)' <<< "$legacy_qdisc_line" || return 1
+    tc_root_is_managed "$interface" && return 0
 
     local configured_class_ids=()
     local configured_class_ports=()
@@ -5258,9 +5470,9 @@ adopt_legacy_tc_root_if_safe() {
         rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
         [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
         class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE")
-        if ! tc_class_id_minor "$class_id" >/dev/null 2>&1; then
+        if ! tc_port_class_id_valid "$class_id" >/dev/null 2>&1; then
             class_id=$(generate_legacy_tc_class_id "$port")
-            tc_class_id_minor "$class_id" >/dev/null 2>&1 || return 1
+            tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
             missing_class_id_ports+=("$port")
         fi
         configured_class_ids+=("$class_id")
@@ -5270,13 +5482,15 @@ adopt_legacy_tc_root_if_safe() {
 
     local class_state
     class_state=$(tc class show dev "$interface" 2>/dev/null) || return 1
-    grep -Eq '^class htb 1:1([[:space:]]|$)' <<< "$class_state" || return 1
+    grep -Eq '^class htb 1:1 root([[:space:]]|$)' <<< "$class_state" || return 1
     local actual_class_ids=()
     mapfile -t actual_class_ids < <(printf '%s\n' "$class_state" |
         awk '$1 == "class" && $2 == "htb" {print $3}')
     local actual_class_id
     for actual_class_id in "${actual_class_ids[@]}"; do
-        [ "$actual_class_id" = "1:1" ] && continue
+        if [ "$actual_class_id" = "1:1" ] || [ "$actual_class_id" = "1:30" ]; then
+            continue
+        fi
         [[ " ${configured_class_ids[*]} " == *" $actual_class_id "* ]] || return 1
     done
 
@@ -5284,6 +5498,7 @@ adopt_legacy_tc_root_if_safe() {
     filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 1
     local configured_class_id
     for configured_class_id in "${configured_class_ids[@]}"; do
+        [[ " ${actual_class_ids[*]} " == *" $configured_class_id "* ]] || return 1
         grep -Eq "(flowid|classid)[[:space:]]+$configured_class_id([[:space:]]|$)" <<< "$filter_state" || return 1
     done
     local filter_class_ids=()
@@ -5309,16 +5524,180 @@ adopt_legacy_tc_root_if_safe() {
     done
 }
 
-cleanup_owned_tc_root_if_unused() {
+tc_root_qdisc_is_replaceable() {
+    local qdisc_state="$1"
+    local qdisc_type
+    qdisc_type=$(printf '%s\n' "$qdisc_state" | awk 'NR == 1 {print $2}')
+    case "$qdisc_type" in
+        ""|noqueue|fq_codel|pfifo_fast|mq|fq) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ENSURE_TC_ROOT_CREATED=false
+ENSURE_TC_ROOT_MIGRATED=false
+
+desired_tc_parent_rate() {
+    local interface="$1"
+    local rate
+    local result=0
+    rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || result=$?
+    case "$result" in
+        0) printf '%s\n' "$rate" ;;
+        1|4) printf '%s\n' "$TC_PARENT_RATE" ;;
+        3)
+            if tc_root_owner_marker_matches "$interface" &&
+               tc_root_matches_unified_contract "$interface"; then
+                trafficcop_legacy_state_rate "$interface"
+            else
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+tc_class_rate_and_ceil() {
+    local interface="$1"
+    local class_id="$2"
+    tc class show dev "$interface" 2>/dev/null |
+        awk -v class_id="$class_id" '
+            $1 == "class" && $2 == "htb" && $3 == class_id {
+                rate=""; ceil=""
+                for (i=1; i<=NF; i++) {
+                    if ($i == "rate") rate=$(i+1)
+                    if ($i == "ceil") ceil=$(i+1)
+                }
+                if (ceil == "") ceil=rate
+                if (rate != "") print rate, ceil
+                exit
+            }'
+}
+
+rollback_legacy_trafficcop_tbf() {
+    local interface="$1"
+    [ "$TC_UPDATE_MIGRATED_LEGACY_TBF" = "true" ] || return 0
+    [ -n "$TC_UPDATE_LEGACY_TBF_RATE" ] || return 1
+    if tc qdisc replace dev "$interface" root tbf rate "$TC_UPDATE_LEGACY_TBF_RATE" \
+        burst 32kbit latency 400ms 2>/dev/null; then
+        rm -f "$(get_tc_root_owner_file)"
+        TC_UPDATE_MIGRATED_LEGACY_TBF=false
+        TC_UPDATE_LEGACY_TBF_RATE=""
+        return 0
+    fi
+    log_notification "统一HTB迁移失败且无法恢复TrafficCop旧TBF: $interface"
+    return 1
+}
+
+ensure_owned_tc_hierarchy_locked() {
+    local interface="$1"
+    local parent_rate=""
+    local qdisc_state
+    local qdisc_line
+    local previous_parent_rate=""
+    local previous_parent_ceil=""
+
+    ENSURE_TC_ROOT_CREATED=false
+    ENSURE_TC_ROOT_MIGRATED=false
+    [ -n "$interface" ] || return 1
+    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+    qdisc_line=$(printf '%s\n' "$qdisc_state" | head -n 1)
+
+    if grep -Eq '^qdisc tbf .* root([[:space:]]|$)' <<< "$qdisc_line"; then
+        parent_rate=$(trafficcop_legacy_tbf_rate "$interface" "$qdisc_line" 2>/dev/null) || {
+            log_notification "检测到无法确认归属的TBF根队列，已拒绝迁移: $interface"
+            return 1
+        }
+        if ! tc qdisc replace dev "$interface" root handle 1: htb default 30 2>/dev/null; then
+            log_notification "无法把TrafficCop旧TBF迁移为统一HTB: $interface"
+            return 1
+        fi
+        ENSURE_TC_ROOT_MIGRATED=true
+        TC_UPDATE_MIGRATED_LEGACY_TBF=true
+        TC_UPDATE_LEGACY_TBF_RATE="$parent_rate"
+    else
+        parent_rate=$(desired_tc_parent_rate "$interface" 2>/dev/null) || {
+            log_notification "TrafficCop TC状态无效，已拒绝修改统一HTB: $interface"
+            return 1
+        }
+    fi
+    normalize_tc_rate_to_bps "$parent_rate" >/dev/null 2>&1 || return 1
+
+    if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state"; then
+        if ! tc_root_is_managed "$interface" && ! adopt_legacy_tc_root_if_safe "$interface"; then
+            tc_root_owner_marker_matches "$interface" && rm -f "$(get_tc_root_owner_file)"
+            log_notification "检测到不属于Dog/TrafficCop统一协议的HTB根队列，已拒绝接管: $interface"
+            return 1
+        fi
+        read -r previous_parent_rate previous_parent_ceil < <(
+            tc_class_rate_and_ceil "$interface" "1:1"
+        ) || true
+    elif [ "$ENSURE_TC_ROOT_MIGRATED" != "true" ]; then
+        if ! tc_root_qdisc_is_replaceable "$qdisc_state"; then
+            log_notification "检测到不可安全替换的根qdisc，已拒绝创建统一HTB: $interface"
+            return 1
+        fi
+        if ! tc qdisc replace dev "$interface" root handle 1: htb default 30 2>/dev/null; then
+            log_notification "无法创建统一HTB根队列: $interface"
+            return 1
+        fi
+        ENSURE_TC_ROOT_CREATED=true
+    fi
+
+    if ! tc class replace dev "$interface" parent 1: classid 1:1 htb \
+        rate "$parent_rate" ceil "$parent_rate" 2>/dev/null; then
+        if [ "$ENSURE_TC_ROOT_MIGRATED" = "true" ]; then
+            rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
+        elif [ "$ENSURE_TC_ROOT_CREATED" = "true" ]; then
+            tc qdisc del dev "$interface" root handle 1: 2>/dev/null || true
+            rm -f "$(get_tc_root_owner_file)"
+        fi
+        log_notification "无法创建或更新统一HTB父类: $interface"
+        return 1
+    fi
+    if ! tc class replace dev "$interface" parent 1:1 classid 1:30 htb \
+        rate "$TC_DEFAULT_CLASS_RATE" ceil "$parent_rate" 2>/dev/null; then
+        if [ "$ENSURE_TC_ROOT_MIGRATED" = "true" ]; then
+            rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
+        elif [ "$ENSURE_TC_ROOT_CREATED" = "true" ]; then
+            tc qdisc del dev "$interface" root handle 1: 2>/dev/null || true
+            rm -f "$(get_tc_root_owner_file)"
+        elif [ -n "$previous_parent_rate" ]; then
+            tc class replace dev "$interface" parent 1: classid 1:1 htb \
+                rate "$previous_parent_rate" ceil "$previous_parent_ceil" 2>/dev/null || true
+        fi
+        log_notification "无法创建统一HTB默认子类: $interface"
+        return 1
+    fi
+    if ! tc_root_owner_marker_matches "$interface" && ! mark_tc_root_owned "$interface"; then
+        if [ "$ENSURE_TC_ROOT_MIGRATED" = "true" ]; then
+            rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
+        elif [ "$ENSURE_TC_ROOT_CREATED" = "true" ]; then
+            tc qdisc del dev "$interface" root handle 1: 2>/dev/null || true
+        fi
+        log_notification "无法记录统一HTB根队列归属，已撤销队列: $interface"
+        return 1
+    fi
+}
+
+ensure_owned_tc_hierarchy() {
+    local result=0
+    begin_tc_update || return 1
+    ensure_owned_tc_hierarchy_locked "$@" || result=$?
+    finish_tc_update
+    return "$result"
+}
+
+cleanup_owned_tc_root_if_unused_locked() {
     local interface="${1:-$(get_default_interface)}"
     [ -n "$interface" ] && tc_root_is_owned "$interface" || return 0
 
-    # 1:1 是脚本创建的根分类；存在其他分类或过滤器时说明仍在使用。
+    # 1:1 与 1:30 是统一层级的基础分类；其他分类或过滤器表示端口限速仍在使用。
     local class_output
     local filter_output
     class_output=$(tc class show dev "$interface" 2>/dev/null) || return 0
     if printf '%s\n' "$class_output" |
-       awk '$1 == "class" && $2 == "htb" && $3 != "1:1" { found=1 } END { exit found ? 0 : 1 }'; then
+       awk '$1 == "class" && $2 == "htb" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }'; then
         return 0
     fi
     filter_output=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 0
@@ -5326,9 +5705,29 @@ cleanup_owned_tc_root_if_unused() {
         return 0
     fi
 
+    local ntc_rate=""
+    local ntc_status=0
+    ntc_rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || ntc_status=$?
+    if [ "$ntc_status" -eq 0 ]; then
+        rm -f "$(get_tc_root_owner_file)"
+        return 0
+    fi
+    if [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_status" -ne 1 ] && [ "$ntc_status" -ne 4 ]; then
+        # NTC 状态存在但无法安全解释时宁可保留基础层级，也不删除其全局限速。
+        return 1
+    fi
+
     if tc qdisc del dev "$interface" root handle 1: 2>/dev/null; then
         rm -f "$(get_tc_root_owner_file)"
     fi
+}
+
+cleanup_owned_tc_root_if_unused() {
+    local result=0
+    begin_tc_update || return 1
+    cleanup_owned_tc_root_if_unused_locked "$@" || result=$?
+    finish_tc_update
+    return "$result"
 }
 
 get_tc_ipv6_filter_handle() {
@@ -5337,7 +5736,7 @@ get_tc_ipv6_filter_handle() {
     printf '0x%x\n' $((port * 4 + offset))
 }
 
-apply_tc_limit() {
+apply_tc_limit_locked() {
     local port=$1
     local total_limit=$2
     local interface=$(get_default_interface)
@@ -5347,61 +5746,26 @@ apply_tc_limit() {
         return 1
     fi
 
-    local created_root=false
-    local qdisc_state
-    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
-    if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state"; then
-        if ! tc_root_is_owned "$interface"; then
-            log_notification "端口 $port 检测到未归属本脚本的HTB根队列，已拒绝修改: $interface"
-            return 1
-        fi
-    else
-        if ! tc qdisc add dev "$interface" root handle 1: htb default 30 2>/dev/null; then
-            log_notification "端口 $port 无法创建HTB根队列，网卡可能已有其他根qdisc: $interface"
-            return 1
-        fi
-        created_root=true
-        if ! mark_tc_root_owned "$interface"; then
-            tc qdisc del dev "$interface" root handle 1: 2>/dev/null || true
-            log_notification "端口 $port 无法记录TC根队列归属，已撤销限速队列"
-            return 1
-        fi
-    fi
+    ensure_owned_tc_hierarchy_locked "$interface" || return 1
+    local created_root="$ENSURE_TC_ROOT_CREATED"
     local class_state
-    class_state=$(tc class show dev "$interface" 2>/dev/null || true)
-    if grep -Eq '^class htb 1:1([[:space:]]|$)' <<< "$class_state"; then
-        if ! tc class replace dev "$interface" parent 1: classid 1:1 htb rate "$TC_PARENT_RATE" 2>/dev/null; then
-            log_notification "端口 $port 无法更新HTB根分类: $interface"
-            return 1
-        fi
-    else
-        if ! tc class add dev "$interface" parent 1: classid 1:1 htb rate "$TC_PARENT_RATE" 2>/dev/null; then
-            [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused "$interface"
-            log_notification "端口 $port 无法创建HTB根分类: $interface"
-            return 1
-        fi
-    fi
 
     local class_id
     if ! class_id=$(generate_tc_class_id "$port"); then
-        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused "$interface"
+        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused_locked "$interface"
         log_notification "端口 $port 无法分配TC class ID，已跳过带宽限制"
         return 1
     fi
     local legacy_class_id
     legacy_class_id=$(generate_legacy_tc_class_id "$port")
-    tc class del dev $interface classid $class_id 2>/dev/null || true
-    if [ "$legacy_class_id" != "$class_id" ]; then
-        tc class del dev $interface classid $legacy_class_id 2>/dev/null || true
-    fi
-
     # 计算burst参数以优化性能
     local base_rate=$(parse_tc_rate_to_kbps "$total_limit")
     local burst_bytes=$(calculate_tc_burst "$base_rate")
     local burst_size=$(format_tc_burst "$burst_bytes")
 
-    if ! tc class add dev "$interface" parent 1:1 classid "$class_id" htb rate "$total_limit" ceil "$total_limit" burst "$burst_size" 2>/dev/null; then
-        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused "$interface"
+    if ! tc class replace dev "$interface" parent 1:1 classid "$class_id" htb \
+        rate "$TC_PORT_CLASS_RATE" ceil "$total_limit" burst "$burst_size" 2>/dev/null; then
+        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused_locked "$interface"
         log_notification "端口 $port 无法创建TC限速分类: $class_id"
         return 1
     fi
@@ -5439,7 +5803,7 @@ apply_tc_limit() {
             match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
            ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
             match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null; then
-            remove_tc_limit "$port" >/dev/null 2>&1 || true
+            remove_tc_limit_locked "$port" >/dev/null 2>&1 || true
             log_notification "端口 $port 无法创建完整TC过滤器"
             return 1
         fi
@@ -5460,7 +5824,7 @@ apply_tc_limit() {
             handle "$ipv6_udp_sport_handle" flower ip_proto udp src_port "$port" flowid "$class_id" 2>/dev/null ||
            ! tc filter add dev "$interface" protocol ipv6 parent 1:0 prio 2 \
             handle "$ipv6_udp_dport_handle" flower ip_proto udp dst_port "$port" flowid "$class_id" 2>/dev/null; then
-            remove_tc_limit "$port" >/dev/null 2>&1 || true
+            remove_tc_limit_locked "$port" >/dev/null 2>&1 || true
             log_notification "端口 $port 无法创建完整IPv6 TC过滤器"
             return 1
         fi
@@ -5468,6 +5832,9 @@ apply_tc_limit() {
 
     class_state=$(tc class show dev "$interface" 2>/dev/null || true)
     grep -Fq "class htb $class_id " <<< "$class_state" || return 1
+    if [ "$legacy_class_id" != "$class_id" ]; then
+        tc class del dev "$interface" classid "$legacy_class_id" 2>/dev/null || true
+    fi
     if is_port_range "$port"; then
         local comment
         comment=$(get_port_range_mark_comment "$port")
@@ -5476,8 +5843,39 @@ apply_tc_limit() {
     fi
 }
 
+apply_tc_limit() {
+    local result=0
+    local interface
+    interface=$(get_default_interface 2>/dev/null || true)
+    begin_tc_update || return 1
+    apply_tc_limit_locked "$@" || result=$?
+    if [ "$result" -ne 0 ] && [ -n "$interface" ]; then
+        rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
+    fi
+    finish_tc_update
+    return "$result"
+}
+
+replace_tc_limit() {
+    local port="$1"
+    local total_limit="$2"
+    local result=0
+    local interface
+    interface=$(get_default_interface 2>/dev/null || true)
+    begin_tc_update || return 1
+    remove_tc_limit_locked "$port" >/dev/null 2>&1 || result=$?
+    if [ "$result" -eq 0 ]; then
+        apply_tc_limit_locked "$port" "$total_limit" || result=$?
+    fi
+    if [ "$result" -ne 0 ] && [ -n "$interface" ]; then
+        rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
+    fi
+    finish_tc_update
+    return "$result"
+}
+
 # 删除TC带宽限制
-remove_tc_limit() {
+remove_tc_limit_locked() {
     local port=$1
     local interface=$(get_default_interface)
     local class_id="${2:-}"
@@ -5486,15 +5884,17 @@ remove_tc_limit() {
     [ -n "$interface" ] || return 1
     local qdisc_state
     qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
-    if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state" && ! tc_root_is_owned "$interface"; then
-        log_notification "端口 $port 检测到未归属本脚本的HTB根队列，已拒绝删除TC对象: $interface"
+    if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state" &&
+       ! tc_root_is_managed "$interface" &&
+       ! adopt_legacy_tc_root_if_safe "$interface"; then
+        log_notification "端口 $port 检测到不属于Dog/TrafficCop统一协议的HTB，已拒绝删除TC对象: $interface"
         return 1
     fi
 
     if [ -z "$class_id" ]; then
         class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
     fi
-    tc_class_id_minor "$class_id" >/dev/null 2>&1 || class_id=""
+    tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || class_id=""
     local legacy_class_id
     legacy_class_id=$(generate_legacy_tc_class_id "$port")
 
@@ -5556,7 +5956,7 @@ remove_tc_limit() {
     if [ "$legacy_class_id" != "$class_id" ]; then
         tc class del dev $interface classid $legacy_class_id 2>/dev/null || true
     fi
-    cleanup_owned_tc_root_if_unused "$interface"
+    cleanup_owned_tc_root_if_unused_locked "$interface"
 
     local cleanup_ok=true
     if [ -n "$class_id" ] && tc_class_id_exists "$class_id"; then
@@ -5578,6 +5978,14 @@ remove_tc_limit() {
     [ "$cleanup_ok" = "true" ]
 }
 
+remove_tc_limit() {
+    local result=0
+    begin_tc_update || return 1
+    remove_tc_limit_locked "$@" || result=$?
+    finish_tc_update
+    return "$result"
+}
+
 normalize_tc_rate_to_bps() {
     local rate
     rate=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -5595,6 +6003,7 @@ tc_class_rate_matches() {
     local interface="$1"
     local class_id="$2"
     local expected_rate="$3"
+    local expected_ceil="${4:-$expected_rate}"
     local class_line
     class_line=$(tc class show dev "$interface" 2>/dev/null |
         awk -v class_id="$class_id" '$1 == "class" && $2 == "htb" && $3 == class_id {print; exit}')
@@ -5609,12 +6018,14 @@ tc_class_rate_matches() {
     [ -n "$actual_ceil" ] || actual_ceil="$actual_rate"
 
     local expected_bps
+    local expected_ceil_bps
     local actual_rate_bps
     local actual_ceil_bps
     expected_bps=$(normalize_tc_rate_to_bps "$expected_rate") || return 1
+    expected_ceil_bps=$(normalize_tc_rate_to_bps "$expected_ceil") || return 1
     actual_rate_bps=$(normalize_tc_rate_to_bps "$actual_rate") || return 1
     actual_ceil_bps=$(normalize_tc_rate_to_bps "$actual_ceil") || return 1
-    [ "$actual_rate_bps" -eq "$expected_bps" ] && [ "$actual_ceil_bps" -eq "$expected_bps" ]
+    [ "$actual_rate_bps" -eq "$expected_bps" ] && [ "$actual_ceil_bps" -eq "$expected_ceil_bps" ]
 }
 
 tc_single_port_filters_complete() {
@@ -5684,15 +6095,18 @@ tc_limit_runtime_rules_complete() {
     local class_id
     interface=$(get_default_interface)
     class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    [ -n "$interface" ] && tc_class_id_minor "$class_id" >/dev/null 2>&1 || return 1
-    tc_class_rate_matches "$interface" "1:1" "$TC_PARENT_RATE" || return 1
+    [ -n "$interface" ] && tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
+    local expected_parent_rate
+    expected_parent_rate=$(desired_tc_parent_rate "$interface") || return 1
+    tc_class_rate_matches "$interface" "1:1" "$expected_parent_rate" || return 1
+    tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$expected_parent_rate" || return 1
 
     local rate_limit
     local expected_rate
     rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
     expected_rate=$(convert_bandwidth_to_tc "$rate_limit")
     [ -n "$expected_rate" ] || return 1
-    tc_class_rate_matches "$interface" "$class_id" "$expected_rate" || return 1
+    tc_class_rate_matches "$interface" "$class_id" "$TC_PORT_CLASS_RATE" "$expected_rate" || return 1
 
     if is_port_range "$port"; then
         local mark_id
@@ -6912,7 +7326,7 @@ install_update_script() {
     [ -f "$INSTALLED_SCRIPT_PATH" ] && cp -a "$INSTALLED_SCRIPT_PATH" "$backup_dir/port-traffic-dog.sh"
     [ -f "$shortcut_path" ] && cp -a "$shortcut_path" "$backup_dir/dog"
     [ -d "$CONFIG_DIR" ] && cp -a "$CONFIG_DIR" "$backup_dir/config"
-    if ! read_current_crontab > "$backup_dir/root.crontab"; then
+    if ! read_root_crontab_locked > "$backup_dir/root.crontab"; then
         echo -e "${RED}无法备份 root crontab，已停止更新${NC}"
         rm -rf "$temp_dir"
         return 1
@@ -6972,7 +7386,12 @@ install_update_script() {
             rollback_ok=false
         fi
         rm -rf "$CONFIG_LOCK_DIR" "$TRAFFIC_STATS_LOCK_DIR" "$RESET_LOCK_DIR" "$CRON_LOCK_DIR"
-        crontab "$backup_dir/root.crontab" >/dev/null 2>&1 || rollback_ok=false
+        if begin_cron_update; then
+            crontab "$backup_dir/root.crontab" >/dev/null 2>&1 || rollback_ok=false
+            release_cron_update
+        else
+            rollback_ok=false
+        fi
         if [ "$rollback_ok" = "true" ] && [ -f "$INSTALLED_SCRIPT_PATH" ]; then
             bash "$INSTALLED_SCRIPT_PATH" --restore-runtime >/dev/null 2>&1 || rollback_ok=false
         fi
@@ -7048,18 +7467,26 @@ uninstall_script() {
         local active_ports=()
         if [ "$config_valid" = "true" ]; then
             mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+        fi
+        if begin_tc_update; then
             local uninstall_interface
             uninstall_interface=$(get_default_interface 2>/dev/null || true)
             if [ -n "$uninstall_interface" ] && \
                tc qdisc show dev "$uninstall_interface" 2>/dev/null | grep -Eq '^qdisc htb 1:' && \
-               ! tc_root_is_owned "$uninstall_interface"; then
+               ! tc_root_is_managed "$uninstall_interface"; then
                 adopt_legacy_tc_root_if_safe "$uninstall_interface" >/dev/null 2>&1 || true
             fi
+            for port in "${active_ports[@]}"; do
+                remove_nftables_rules "$port" 2>/dev/null || true
+                remove_tc_limit_locked "$port" 2>/dev/null || true
+            done
+            finish_tc_update
+        else
+            log_notification "卸载时无法取得共享TC锁，已保留现有qdisc避免并发破坏"
+            for port in "${active_ports[@]}"; do
+                remove_nftables_rules "$port" 2>/dev/null || true
+            done
         fi
-        for port in "${active_ports[@]}"; do
-            remove_nftables_rules "$port" 2>/dev/null || true
-            remove_tc_limit "$port" 2>/dev/null || true
-        done
 
         local table_name="port_traffic_monitor"
         local family="inet"
@@ -7073,7 +7500,16 @@ uninstall_script() {
             if [ -r "$owner_file" ]; then
                 IFS='|' read -r owner_interface _ < "$owner_file" || true
                 if [ -n "$owner_interface" ] && tc_root_is_owned "$owner_interface"; then
-                    tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null || true
+                    local ntc_uninstall_status=0
+                    trafficcop_unified_state_rate "$owner_interface" >/dev/null 2>&1 || ntc_uninstall_status=$?
+                    if [ "$ntc_uninstall_status" -eq 0 ] ||
+                       { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ]; }; then
+                        rm -f "$owner_file"
+                        log_notification "卸载Dog时保留TrafficCop正在使用的统一HTB: $owner_interface"
+                    elif begin_tc_update; then
+                        tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null || true
+                        finish_tc_update
+                    fi
                 fi
             fi
         fi
@@ -7312,7 +7748,7 @@ setup_telegram_notification_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
@@ -7339,7 +7775,7 @@ setup_wecom_notification_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
@@ -7389,7 +7825,7 @@ remove_telegram_notification_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
@@ -7402,7 +7838,7 @@ remove_wecom_notification_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
@@ -7415,7 +7851,7 @@ remove_all_port_auto_reset_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | \
@@ -7480,7 +7916,7 @@ setup_traffic_snapshot_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
@@ -7503,7 +7939,7 @@ remove_traffic_snapshot_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
@@ -7529,7 +7965,7 @@ setup_runtime_restore_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
@@ -7545,7 +7981,7 @@ remove_runtime_restore_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
@@ -7571,7 +8007,7 @@ setup_auto_reset_cron() {
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
-        release_directory_lock "$CRON_LOCK_DIR"
+        release_cron_update
         return 1
     fi
     printf '%s\n' "$current_cron" | \
@@ -7618,12 +8054,14 @@ refresh_all_cron_from_config() {
 
 legacy_cron_needs_migration() {
     command -v crontab >/dev/null 2>&1 || return 1
-    if crontab -l 2>/dev/null | grep -Eq \
+    local cron_content=""
+    cron_content=$(read_root_crontab_locked 2>/dev/null) || return 1
+    if printf '%s\n' "$cron_content" | grep -Eq \
         'port-traffic-dog(\.sh)?.*--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'; then
         return 0
     fi
     if has_active_ports &&
-       ! crontab -l 2>/dev/null | grep -q 'port-traffic-dog.*--restore-runtime'; then
+       ! printf '%s\n' "$cron_content" | grep -q 'port-traffic-dog.*--restore-runtime'; then
         return 0
     fi
     return 1
@@ -7922,13 +8360,52 @@ self_check() {
         else
             check_fail "带宽限制规则不完整: ${invalid_tc_ports[*]}"
         fi
+
+        local self_tc_interface
+        local ntc_rate=""
+        local ntc_state_status=0
+        self_tc_interface=$(get_default_interface 2>/dev/null || true)
+        if [ -z "$self_tc_interface" ]; then
+            check_fail "无法确定统一HTB使用的默认网卡"
+        else
+            ntc_rate=$(trafficcop_unified_state_rate "$self_tc_interface" 2>/dev/null) || ntc_state_status=$?
+            case "$ntc_state_status" in
+                0)
+                    if tc_root_is_managed "$self_tc_interface" &&
+                       tc_class_rate_matches "$self_tc_interface" "1:1" "$ntc_rate" &&
+                       tc_class_rate_matches "$self_tc_interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate"; then
+                        check_ok "TrafficCop整机上限优先，父类与Dog端口子类共用统一HTB"
+                    else
+                        check_fail "TrafficCop统一状态与1:1/1:30运行层级不一致"
+                    fi
+                    ;;
+                1|4)
+                    check_ok "当前网卡没有TrafficCop整机限速状态"
+                    ;;
+                3)
+                    local legacy_qdisc
+                    legacy_qdisc=$(tc_root_qdisc_line "$self_tc_interface" 2>/dev/null || true)
+                    if trafficcop_legacy_tbf_rate "$self_tc_interface" "$legacy_qdisc" >/dev/null 2>&1; then
+                        check_warn "检测到TrafficCop旧TBF；启用Dog端口限速时会安全迁移为统一HTB"
+                    elif tc_root_is_owned "$self_tc_interface" &&
+                         desired_tc_parent_rate "$self_tc_interface" >/dev/null 2>&1; then
+                        check_warn "TrafficCop仍是旧状态格式，统一HTB已迁移，建议运行NTC自检升级状态"
+                    else
+                        check_fail "TrafficCop旧TC状态与当前root qdisc不一致"
+                    fi
+                    ;;
+                *)
+                    check_fail "TrafficCop TC状态文件格式、归属或权限无效"
+                    ;;
+            esac
+        fi
     else
         check_warn "nft 命令不可用，跳过流量规则核对"
     fi
 
     if command -v crontab >/dev/null 2>&1; then
         local cron_content
-        cron_content=$(crontab -l 2>/dev/null || true)
+        cron_content=$(read_root_crontab_locked 2>/dev/null || true)
         local expected_reset_count=0
         local has_reset_policy=false
         local cron_matches_config=true
@@ -8022,7 +8499,7 @@ self_check() {
         check_warn "主脚本安装路径不存在，当前使用: $SCRIPT_PATH"
     fi
 
-    local dep_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack")
+    local dep_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack" "flock")
     local missing_dep=()
     local dep
     for dep in "${dep_tools[@]}"; do
