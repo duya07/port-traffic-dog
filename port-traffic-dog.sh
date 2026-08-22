@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.12"
+readonly SCRIPT_VERSION="1.5.13"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -17,6 +17,10 @@ readonly RESET_LOCK_DIR="$CONFIG_DIR/reset.lock"
 readonly CRON_LOCK_DIR="$CONFIG_DIR/cron.lock"
 readonly TC_SHARED_LOCK_FILE="${TRAFFIC_TOOLS_TC_LOCK_FILE:-/run/lock/traffic-tools-tc.lock}"
 readonly TRAFFICCOP_TC_STATE_FILE="${TRAFFICCOP_TC_STATE_FILE:-/etc/trafficcop-lite/tc_limit_state}"
+readonly TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
+readonly TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
+readonly TC_RECOVERY_SERVICE="traffic-tools-tc-recovery.service"
+readonly TC_RECOVERY_SYSTEMCTL="${TRAFFIC_TOOLS_SYSTEMCTL:-systemctl}"
 readonly TC_INTEROP_SCHEMA="traffic-tools-unified-htb-v1"
 readonly TRAFFIC_ACCOUNTING_MODEL="upstream-weighted-v2"
 readonly TC_RUNTIME_MODEL="unified-htb-v3"
@@ -1201,11 +1205,20 @@ restore_runtime_state() {
 
     if [ ${#tc_ports[@]} -gt 0 ]; then
         if begin_tc_update; then
-            local tc_index
-            for tc_index in "${!tc_ports[@]}"; do
-                remove_tc_limit_locked "${tc_ports[$tc_index]}" >/dev/null 2>&1 || true
-                apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}" >/dev/null 2>&1 || failed=true
-            done
+            local restore_interface
+            restore_interface=$(get_default_interface 2>/dev/null || true)
+            # 先在完整旧层级仍可验证时认领/规范化，再删除端口对象。否则从
+            # v1.5.2 直接升级时会先销毁归属证据，导致后续安全检查拒绝恢复。
+            if [ -z "$restore_interface" ] ||
+               ! ensure_owned_tc_hierarchy_locked "$restore_interface"; then
+                failed=true
+            else
+                local tc_index
+                for tc_index in "${!tc_ports[@]}"; do
+                    remove_tc_limit_locked "${tc_ports[$tc_index]}" >/dev/null 2>&1 || true
+                    apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}" >/dev/null 2>&1 || failed=true
+                done
+            fi
             if [ "$failed" = "true" ] && [ "$TC_UPDATE_MIGRATED_LEGACY_TBF" = "true" ]; then
                 local rollback_interface
                 rollback_interface=$(get_default_interface 2>/dev/null || true)
@@ -4101,6 +4114,216 @@ ${total_formatted}/${monthly_limit} | ${percent_text} | ${cycle_range}
     fi
 }
 
+# Dog 与 NTC 共用同一个恢复入口和同一个 systemd oneshot，避免两边各自抢 root。
+tc_recovery_systemd_available() {
+    command -v "$TC_RECOVERY_SYSTEMCTL" >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+install_tc_recovery_service_files() {
+    local runner_dir unit_dir runner_tmp unit_tmp
+    runner_dir=$(dirname "$TC_RECOVERY_RUNNER")
+    unit_dir=$(dirname "$TC_RECOVERY_UNIT_FILE")
+    runner_tmp="${TC_RECOVERY_RUNNER}.tmp.$$"
+    unit_tmp="${TC_RECOVERY_UNIT_FILE}.tmp.$$"
+
+    if [ -e "$TC_RECOVERY_RUNNER" ] &&
+       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
+        echo "共享 TC 恢复入口已被其他文件占用: $TC_RECOVERY_RUNNER" >&2
+        return 1
+    fi
+    mkdir -p "$runner_dir" || return 1
+    cat > "$runner_tmp" <<'EOF'
+#!/bin/bash
+# traffic-tools-tc-recovery-v1
+set -euo pipefail
+
+mode="${1:---auto}"
+case "$mode" in
+    --auto|--manual) ;;
+    *) echo "usage: $0 [--auto|--manual]" >&2; exit 2 ;;
+esac
+
+dog_script=/usr/local/bin/port-traffic-dog.sh
+dog_config=/etc/port-traffic-dog/config.json
+ntc_monitor=/etc/trafficcop-lite/trafficcop-lite-monitor.sh
+ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
+handled=false
+
+if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
+    bash "$dog_script" --recover-tc "$mode"
+    handled=true
+fi
+if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
+    bash "$ntc_monitor" --tc-recover-owned "$mode"
+    handled=true
+fi
+
+$handled || exit 0
+EOF
+    chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
+    if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
+        mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
+    else
+        rm -f "$runner_tmp"
+    fi
+
+    tc_recovery_systemd_available || return 0
+    if [ -e "$TC_RECOVERY_UNIT_FILE" ] &&
+       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
+        echo "共享 TC 恢复服务名已被其他 unit 占用: $TC_RECOVERY_UNIT_FILE" >&2
+        return 1
+    fi
+    mkdir -p "$unit_dir" || return 1
+    cat > "$unit_tmp" <<EOF
+# traffic-tools-tc-recovery-v1
+[Unit]
+Description=Recover Dog and TrafficCop Lite unified HTB after other TC services
+Wants=network-online.target
+After=network-online.target vnstat.service tcpfit.service tcpfit-qdisc.service
+
+[Service]
+Type=oneshot
+ExecStart=$TC_RECOVERY_RUNNER --auto
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
+    if ! cmp -s "$unit_tmp" "$TC_RECOVERY_UNIT_FILE"; then
+        mv -f "$unit_tmp" "$TC_RECOVERY_UNIT_FILE" || { rm -f "$unit_tmp"; return 1; }
+    else
+        rm -f "$unit_tmp"
+    fi
+    "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1
+}
+
+tc_auto_recovery_state() {
+    if ! tc_recovery_systemd_available; then
+        echo "不可用（当前系统未运行 systemd）"
+    elif "$TC_RECOVERY_SYSTEMCTL" is-enabled --quiet "$TC_RECOVERY_SERVICE" 2>/dev/null; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
+}
+
+enable_tc_auto_recovery() {
+    tc_recovery_systemd_available || {
+        echo -e "${RED}当前系统未运行 systemd，无法启用开机自动恢复。${NC}"
+        return 1
+    }
+    install_tc_recovery_service_files || return 1
+    "$TC_RECOVERY_SYSTEMCTL" enable "$TC_RECOVERY_SERVICE" >/dev/null
+}
+
+disable_tc_auto_recovery() {
+    tc_recovery_systemd_available || return 0
+    "$TC_RECOVERY_SYSTEMCTL" disable "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+}
+
+cleanup_tc_recovery_files_if_unused() {
+    if { [ -r /usr/local/bin/port-traffic-dog.sh ] && [ -r /etc/port-traffic-dog/config.json ]; } ||
+       { [ -r /etc/trafficcop-lite/trafficcop-lite-monitor.sh ] && [ -r /etc/trafficcop-lite/traffic_monitor_config.txt ]; }; then
+        return 0
+    fi
+    if tc_recovery_systemd_available; then
+        "$TC_RECOVERY_SYSTEMCTL" disable --now "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
+        rm -f "$TC_RECOVERY_UNIT_FILE"
+    fi
+    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
+        rm -f "$TC_RECOVERY_RUNNER"
+    fi
+    tc_recovery_systemd_available && "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
+}
+
+dog_tc_status_label() {
+    local status_output=""
+    status_output=$(dog_tc_status 2>/dev/null || true)
+    case "$status_output" in
+        TC_STATUS=OK*) echo "正常" ;;
+        TC_STATUS=IDLE*) echo "空闲" ;;
+        *REASON=external-root-qdisc*) echo "冲突（外部/未知 TC）" ;;
+        TC_STATUS=CONFLICT*) echo "异常（自身规则已失效）" ;;
+        *) echo "无法检测" ;;
+    esac
+}
+
+show_tc_takeover_warning() {
+    echo -e "${RED}检测到当前 TC 配置可能已被其他程序修改。${NC}"
+    echo "继续操作将删除当前冲突的 TC/qdisc 配置，"
+    echo "并只重新建立 Dog/NTC 体系自身管理的规则。"
+    echo "其他程序创建的 TC 配置不会被保留。"
+    echo
+    echo -e "${YELLOW}如果其他 TC 管理脚本或服务仍然存在，其之后再次启动或重启时，"
+    echo -e "仍可能覆盖 Dog/NTC。建议卸载、关闭或禁用这些冲突程序。${NC}"
+}
+
+run_shared_tc_recovery() {
+    local mode="${1:---manual}"
+    install_tc_recovery_service_files || return 1
+    bash "$TC_RECOVERY_RUNNER" "$mode"
+}
+
+manage_tc_recovery() {
+    clear 2>/dev/null || true
+    echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
+    echo "TC 状态: $(dog_tc_status_label)"
+    echo "自动恢复: $(tc_auto_recovery_state)"
+    echo "恢复方式: 单一 systemd oneshot；在 tcpfit 服务之后排序，无固定延迟"
+    echo
+    echo "1. 立即检测并重建 Dog/NTC 规则"
+    echo "2. 立即重建，并启用开机自动恢复"
+    echo "3. 启用开机自动恢复"
+    echo "4. 关闭开机自动恢复"
+    echo "0. 返回主菜单"
+    echo
+    read -r -p "请选择操作 [0-4]: " tc_choice
+    case "$tc_choice" in
+        1|2)
+            show_tc_takeover_warning
+            echo
+            read -r -p "确认继续请输入 REBUILD: " confirm
+            if [ "$confirm" = "REBUILD" ] && run_shared_tc_recovery --manual; then
+                echo -e "${GREEN}TC 检测/重建完成。${NC}"
+                if [ "$tc_choice" = "2" ]; then
+                    if enable_tc_auto_recovery; then
+                        echo -e "${GREEN}开机自动恢复已启用。${NC}"
+                    else
+                        echo -e "${RED}TC 已重建，但开机自动恢复启用失败。${NC}"
+                    fi
+                fi
+            elif [ "$confirm" != "REBUILD" ]; then
+                echo "已取消。"
+            else
+                echo -e "${RED}TC 重建失败，请运行 dog --self-check 查看详情。${NC}"
+            fi
+            ;;
+        3)
+            show_tc_takeover_warning
+            echo
+            echo "启用后，恢复服务在开机时检测到既有 Dog/NTC 规则失效，"
+            echo "会按上述授权删除冲突 root 并重建；运行期间不会高频轮询或抢占。"
+            read -r -p "确认启用请输入 ENABLE: " confirm
+            if [ "$confirm" = "ENABLE" ] && enable_tc_auto_recovery; then
+                echo -e "${GREEN}开机自动恢复已启用。${NC}"
+            else
+                echo "未启用。"
+            fi
+            ;;
+        4)
+            disable_tc_auto_recovery
+            echo -e "${GREEN}开机自动恢复已关闭。${NC}"
+            ;;
+        0) show_main_menu; return ;;
+        *) echo -e "${RED}无效选择。${NC}" ;;
+    esac
+    echo
+    read -r -p "按回车键返回主菜单..."
+    show_main_menu
+}
+
 # 显示主界面
 show_main_menu() {
     clear 2>/dev/null || true
@@ -4113,6 +4336,7 @@ show_main_menu() {
     echo
 
     echo -e "${GREEN}状态: 监控中${NC} | ${BLUE}守护端口: ${port_count}个${NC} | ${YELLOW}端口总流量: $daily_total${NC}"
+    echo -e "${BLUE}TC 状态:${NC} $(dog_tc_status_label) | ${BLUE}自动恢复:${NC} $(tc_auto_recovery_state)"
     echo "────────────────────────────────────────────────────────"
 
     if [ $port_count -gt 0 ]; then
@@ -4127,9 +4351,10 @@ show_main_menu() {
     echo -e "${BLUE}3.${NC} 流量重置管理          ${BLUE}4.${NC} 一键导出/导入配置"
     echo -e "${BLUE}5.${NC} 安装依赖(更新)脚本    ${BLUE}6.${NC} 卸载脚本"
     echo -e "${BLUE}7.${NC} 通知管理              ${BLUE}8.${NC} 系统自检/修复"
+    echo -e "${BLUE}9.${NC} TC 冲突处理/自动恢复"
     echo -e "${BLUE}0.${NC} 退出"
     echo
-    read -p "请选择操作 [0-8]: " choice
+    read -p "请选择操作 [0-9]: " choice
 
     case $choice in
         1) manage_port_monitoring ;;
@@ -4140,8 +4365,9 @@ show_main_menu() {
         6) uninstall_script ;;
         7) manage_notifications ;;
         8) system_check_and_repair ;;
+        9) manage_tc_recovery ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选择，请输入0-8${NC}"; sleep 1; show_main_menu ;;
+        *) echo -e "${RED}无效选择，请输入0-9${NC}"; sleep 1; show_main_menu ;;
     esac
 }
 
@@ -5418,7 +5644,9 @@ trafficcop_legacy_tbf_rate() {
 }
 
 tc_root_qdisc_line() {
-    tc qdisc show dev "$1" root 2>/dev/null | head -n 1
+    local qdisc_state
+    qdisc_state=$(tc qdisc show dev "$1" root 2>/dev/null) || return 1
+    awk 'NR == 1 { print }' <<< "$qdisc_state"
 }
 
 tc_root_matches_unified_contract() {
@@ -5560,8 +5788,9 @@ desired_tc_parent_rate() {
 tc_class_rate_and_ceil() {
     local interface="$1"
     local class_id="$2"
-    tc class show dev "$interface" 2>/dev/null |
-        awk -v class_id="$class_id" '
+    local class_state
+    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 1
+    awk -v class_id="$class_id" '
             $1 == "class" && $2 == "htb" && $3 == class_id {
                 rate=""; ceil=""
                 for (i=1; i<=NF; i++) {
@@ -5571,7 +5800,7 @@ tc_class_rate_and_ceil() {
                 if (ceil == "") ceil=rate
                 if (rate != "") print rate, ceil
                 exit
-            }'
+            }' <<< "$class_state"
 }
 
 rollback_legacy_trafficcop_tbf() {
@@ -5705,9 +5934,8 @@ cleanup_owned_tc_root_if_unused_locked() {
         return 0
     fi
 
-    local ntc_rate=""
     local ntc_status=0
-    ntc_rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || ntc_status=$?
+    trafficcop_unified_state_rate "$interface" >/dev/null 2>&1 || ntc_status=$?
     if [ "$ntc_status" -eq 0 ]; then
         rm -f "$(get_tc_root_owner_file)"
         return 0
@@ -6005,8 +6233,10 @@ tc_class_rate_matches() {
     local expected_rate="$3"
     local expected_ceil="${4:-$expected_rate}"
     local class_line
-    class_line=$(tc class show dev "$interface" 2>/dev/null |
-        awk -v class_id="$class_id" '$1 == "class" && $2 == "htb" && $3 == class_id {print; exit}')
+    local class_state
+    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 1
+    class_line=$(awk -v class_id="$class_id" \
+        '$1 == "class" && $2 == "htb" && $3 == class_id {print; exit}' <<< "$class_state")
     [ -n "$class_line" ] || return 1
 
     local actual_rate
@@ -6130,6 +6360,212 @@ tc_limit_runtime_complete() {
     interface=$(get_default_interface)
     [ -n "$interface" ] && tc_root_is_owned "$interface" || return 1
     tc_limit_runtime_rules_complete "$port"
+}
+
+# 返回值：0=存在且完整；1=存在但失效/状态不可解释；2=当前不需要 TC。
+dog_tc_runtime_complete_all() {
+    local interface="$1"
+    local expected=false
+    local ntc_rate=""
+    local ntc_status=0
+
+    ntc_rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || ntc_status=$?
+    case "$ntc_status" in
+        0)
+            expected=true
+            tc_root_is_managed "$interface" || return 1
+            tc_class_rate_matches "$interface" "1:1" "$ntc_rate" "$ntc_rate" || return 1
+            tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate" || return 1
+            ;;
+        1|4) ;;
+        *)
+            [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && return 1
+            ;;
+    esac
+
+    local active_ports=()
+    local port
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    for port in "${active_ports[@]}"; do
+        local limit_enabled
+        local rate_limit
+        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
+        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
+        [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
+        expected=true
+        tc_limit_runtime_complete "$port" || return 1
+    done
+
+    [ "$expected" = "true" ] && return 0
+    return 2
+}
+
+dog_tc_status() {
+    local interface
+    interface=$(get_default_interface 2>/dev/null || true)
+    if [ -z "$interface" ]; then
+        echo "TC_STATUS=ERROR REASON=interface-unresolved"
+        return 1
+    fi
+    if ! begin_tc_update; then
+        echo "TC_STATUS=ERROR INTERFACE=$interface REASON=lock-timeout"
+        return 1
+    fi
+
+    local runtime_status=0
+    local qdisc_state
+    dog_tc_runtime_complete_all "$interface" || runtime_status=$?
+    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+
+    local result=0
+    case "$runtime_status" in
+        0)
+            echo "TC_STATUS=OK INTERFACE=$interface MODEL=$TC_INTEROP_SCHEMA"
+            ;;
+        1)
+            echo "TC_STATUS=CONFLICT INTERFACE=$interface REASON=managed-rules-invalid"
+            result=1
+            ;;
+        2)
+            if tc_root_qdisc_is_replaceable "$qdisc_state"; then
+                echo "TC_STATUS=IDLE INTERFACE=$interface"
+            elif tc_root_is_managed "$interface"; then
+                echo "TC_STATUS=CONFLICT INTERFACE=$interface REASON=orphaned-managed-root"
+                result=1
+            else
+                echo "TC_STATUS=CONFLICT INTERFACE=$interface REASON=external-root-qdisc"
+                result=1
+            fi
+            ;;
+        *)
+            echo "TC_STATUS=ERROR INTERFACE=$interface REASON=status-unavailable"
+            result=1
+            ;;
+    esac
+    finish_tc_update
+    return "$result"
+}
+
+# 仅供用户确认后的共享恢复入口调用。--auto 只恢复已有 Dog/NTC TC 状态；
+# --manual 还允许清除首次安装时发现的外部 root，之后由用户重新配置限速。
+recover_tc_runtime() {
+    local mode="${1:---manual}"
+    case "$mode" in
+        --auto|--manual) ;;
+        *)
+            echo "不支持的 TC 恢复模式: $mode" >&2
+            return 2
+            ;;
+    esac
+
+    validate_config_file "$CONFIG_FILE" >/dev/null || {
+        echo "Dog 配置无效，拒绝修改 TC。" >&2
+        return 1
+    }
+    local interface
+    interface=$(get_default_interface 2>/dev/null || true)
+    [ -n "$interface" ] || {
+        echo "无法确定默认网卡，未修改 TC。" >&2
+        return 1
+    }
+    if ! begin_tc_update; then
+        echo "无法取得共享 TC 锁，未修改 qdisc。" >&2
+        return 1
+    fi
+
+    local runtime_status=0
+    dog_tc_runtime_complete_all "$interface" || runtime_status=$?
+    if [ "$runtime_status" -eq 0 ]; then
+        finish_tc_update
+        echo "Dog/NTC TC 规则完整，无需重建。"
+        return 0
+    fi
+
+    local ntc_status=0
+    trafficcop_unified_state_rate "$interface" >/dev/null 2>&1 || ntc_status=$?
+    if [ -e "$TRAFFICCOP_TC_STATE_FILE" ] &&
+       [ "$ntc_status" -ne 0 ] && [ "$ntc_status" -ne 1 ] && [ "$ntc_status" -ne 4 ]; then
+        finish_tc_update
+        echo "TrafficCop TC 状态文件无法安全解释，拒绝自动删除 qdisc。" >&2
+        return 1
+    fi
+    if [ "$mode" = "--auto" ] && [ "$runtime_status" -eq 2 ]; then
+        finish_tc_update
+        echo "当前没有需要自动恢复的 Dog/NTC TC 规则。"
+        return 0
+    fi
+
+    local qdisc_state
+    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+    if [ "$runtime_status" -eq 2 ] && tc_root_qdisc_is_replaceable "$qdisc_state"; then
+        finish_tc_update
+        echo "当前 TC 为空闲状态，无需处理。"
+        return 0
+    fi
+
+    local tc_ports=()
+    local tc_limits=()
+    local active_ports=()
+    local port
+    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
+    for port in "${active_ports[@]}"; do
+        local limit_enabled
+        local rate_limit
+        local tc_limit
+        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
+        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
+        [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
+        tc_limit=$(convert_bandwidth_to_tc "$rate_limit")
+        [ -n "$tc_limit" ] || {
+            finish_tc_update
+            echo "端口 $port 的带宽配置无效，未删除当前 qdisc。" >&2
+            return 1
+        }
+        tc_ports+=("$port")
+        tc_limits+=("$tc_limit")
+    done
+
+    if ! tc_root_qdisc_is_replaceable "$qdisc_state" &&
+       ! tc qdisc del dev "$interface" root 2>/dev/null; then
+        finish_tc_update
+        echo "无法删除当前冲突 root qdisc，Dog/NTC 规则未重建。" >&2
+        return 1
+    fi
+    rm -f "$(get_tc_root_owner_file)"
+
+    local rebuild_ok=true
+    local tc_index
+    if [ ${#tc_ports[@]} -gt 0 ]; then
+        for tc_index in "${!tc_ports[@]}"; do
+            if ! apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}"; then
+                rebuild_ok=false
+                break
+            fi
+        done
+    elif [ "$ntc_status" -eq 0 ]; then
+        ensure_owned_tc_hierarchy_locked "$interface" || rebuild_ok=false
+    fi
+
+    if [ "$rebuild_ok" = "true" ]; then
+        local verify_status=0
+        dog_tc_runtime_complete_all "$interface" || verify_status=$?
+        if [ ${#tc_ports[@]} -gt 0 ] || [ "$ntc_status" -eq 0 ]; then
+            [ "$verify_status" -eq 0 ] || rebuild_ok=false
+        else
+            [ "$verify_status" -eq 2 ] || rebuild_ok=false
+        fi
+    fi
+    finish_tc_update
+
+    if [ "$rebuild_ok" != "true" ]; then
+        echo "冲突 qdisc 已清除，但 Dog/NTC TC 规则未能完整重建；请运行 dog --self-check。" >&2
+        return 1
+    fi
+    if [ ${#tc_ports[@]} -eq 0 ] && [ "$ntc_status" -ne 0 ]; then
+        echo "外部 TC 冲突已清除；当前没有需要创建的 Dog 端口限速规则。"
+    else
+        echo "Dog/NTC 统一 HTB 已按现有配置重建。"
+    fi
 }
 
 manage_traffic_reset() {
@@ -7234,6 +7670,9 @@ finalize_script_update() {
         echo -e "${RED}新版本配置初始化失败${NC}"
         return 1
     fi
+    if ! install_tc_recovery_service_files; then
+        echo -e "${YELLOW}共享 TC 恢复入口安装失败；不影响现有监控，但自动恢复暂不可用。${NC}"
+    fi
 
     echo -e "${YELLOW}[2/3] 刷新定时任务...${NC}"
     if ! refresh_all_cron_from_config; then
@@ -7433,12 +7872,14 @@ EOF
 ensure_installation_files() {
     local shortcut_path="/usr/local/bin/$SHORTCUT_COMMAND"
     if [ -f "$INSTALLED_SCRIPT_PATH" ] && [ -f "$shortcut_path" ]; then
+        install_tc_recovery_service_files >/dev/null 2>&1 || true
         return 0
     fi
 
     # 首次直接运行下载脚本时，保留原有的安装与快捷命令行为。
     create_shortcut_command >/dev/null
     download_notification_modules >/dev/null 2>&1 || true
+    install_tc_recovery_service_files >/dev/null 2>&1 || true
 }
 
 cleanup_owned_tc_root_without_config() {
@@ -7539,6 +7980,7 @@ uninstall_script() {
         rm -rf "$CONFIG_DIR" 2>/dev/null || true
         rm -f "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
         rm -f "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+        cleanup_tc_recovery_files_if_unused
 
         echo -e "${GREEN}卸载完成！${NC}"
         echo -e "${YELLOW}感谢使用端口流量狗！${NC}"
@@ -8607,6 +9049,7 @@ system_check_and_repair() {
     setup_script_permissions
     setup_cron_environment
     create_shortcut_command >/dev/null
+    install_tc_recovery_service_files >/dev/null 2>&1 || true
     echo -e "${GREEN}基础运行环境已就绪${NC}"
 
     echo -e "${YELLOW}[2/6] 检查通知模块...${NC}"
@@ -8691,6 +9134,22 @@ main() {
                 validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
                 restore_runtime_state
                 exit $?
+                ;;
+            --tc-status)
+                [ -f "$CONFIG_FILE" ] || {
+                    echo "TC_STATUS=ERROR REASON=config-missing"
+                    exit 1
+                }
+                validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
+                local tc_status=0
+                dog_tc_status || tc_status=$?
+                exit "$tc_status"
+                ;;
+            --recover-tc)
+                [ -f "$CONFIG_FILE" ] || exit 0
+                local recovery_status=0
+                recover_tc_runtime "${2:---manual}" || recovery_status=$?
+                exit "$recovery_status"
                 ;;
             --snapshot-traffic)
                 if ! has_active_ports; then
@@ -8820,6 +9279,8 @@ main() {
                 echo "  --send-telegram-status    发送Telegram状态通知"
                 echo "  --send-wecom-status       发送企业wx 状态通知"
                 echo "  --self-check              执行一键自检"
+                echo "  --tc-status               检查 Dog/NTC TC 运行状态"
+                echo "  --recover-tc [--auto|--manual]  由共享恢复入口重建统一 HTB"
                 echo "  --validate-config FILE    只校验指定配置文件"
                 echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
                 echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"

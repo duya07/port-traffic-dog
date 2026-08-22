@@ -149,14 +149,16 @@ readonly FINALIZE_UPDATE_TRACE="$TEST_DIR/finalize-update.trace"
 (
     check_dependencies() { printf 'dependencies\n' >> "$FINALIZE_UPDATE_TRACE"; }
     init_config() { printf 'init\n' >> "$FINALIZE_UPDATE_TRACE"; }
+    install_tc_recovery_service_files() { printf 'recovery\n' >> "$FINALIZE_UPDATE_TRACE"; }
     refresh_all_cron_from_config() { printf 'cron\n' >> "$FINALIZE_UPDATE_TRACE"; }
     restore_runtime_state() { printf 'runtime\n' >> "$FINALIZE_UPDATE_TRACE"; }
     finalize_script_update >/dev/null
 )
-[ "$(paste -sd, "$FINALIZE_UPDATE_TRACE")" = "dependencies,init,cron,runtime" ]
+[ "$(paste -sd, "$FINALIZE_UPDATE_TRACE")" = "dependencies,init,recovery,cron,runtime" ]
 (
     check_dependencies() { :; }
     init_config() { :; }
+    install_tc_recovery_service_files() { :; }
     refresh_all_cron_from_config() { return 1; }
     restore_runtime_state() { touch "$TEST_DIR/finalize-restore-should-not-run"; }
     ! finalize_script_update >/dev/null
@@ -1202,6 +1204,7 @@ check_dependencies() { trace_startup_call check_dependencies; }
 init_config() { trace_startup_call init_config; }
 ensure_installation_files() { trace_startup_call ensure_installation_files; }
 create_shortcut_command() { trace_startup_call create_shortcut_command; }
+install_tc_recovery_service_files() { trace_startup_call install_tc_recovery_service_files; }
 setup_script_permissions() { trace_startup_call setup_script_permissions; }
 setup_cron_environment() { trace_startup_call setup_cron_environment; }
 migrate_legacy_cron_if_needed() { trace_startup_call migrate_legacy_cron_if_needed; }
@@ -1317,7 +1320,7 @@ grep -Fq -- 'conntrack-tools' "$PROJECT_DIR/alpine-port-traffic-dog-preinstall.s
 system_check_and_repair >/dev/null
 for expected_call in \
     check_dependencies init_config setup_script_permissions setup_cron_environment \
-    create_shortcut_command download_notification_modules \
+    create_shortcut_command install_tc_recovery_service_files download_notification_modules \
     refresh_all_cron_from_config repair_duplicate_traffic_rules \
     restore_runtime_state record_traffic_snapshot self_check show_main_menu; do
     [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
