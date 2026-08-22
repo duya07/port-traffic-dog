@@ -15,17 +15,21 @@ trap 'echo "regression failed at line $LINENO" >&2' ERR
 # Load function definitions without running main, and redirect all state to a temp directory.
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
+    -e "s#^readonly CRON_LOCK_DIR=.*#readonly CRON_LOCK_DIR=\"$TEST_DIR/cron.lock\"#" \
+    -e "s#^readonly TC_SHARED_LOCK_FILE=.*#readonly TC_SHARED_LOCK_FILE=\"$TEST_DIR/traffic-tools-tc.lock\"#" \
+    -e "s#^readonly TRAFFICCOP_TC_STATE_FILE=.*#readonly TRAFFICCOP_TC_STATE_FILE=\"$TEST_DIR/trafficcop-tc.state\"#" \
     -e '$d' \
     "$SCRIPT_FILE")
 
 mkdir -p "$CONFIG_DIR/logs"
+flock() { :; }
 
 write_base_config() {
     jq -n '{
         global: {
             billing_mode: "double",
             traffic_accounting_model: "upstream-weighted-v2",
-            tc_runtime_model: "dual-stack-v2"
+            tc_runtime_model: "unified-htb-v3"
         },
         ports: {},
         nftables: {table_name: "port_traffic_monitor", family: "inet"},
@@ -176,14 +180,13 @@ update_config_file '
 readonly TC_ROLLBACK_CAPTURE="$TEST_DIR/tc-rollback.capture"
 (
     show_port_list() { return 0; }
-    remove_tc_limit() { printf 'remove\n' >> "$TC_ROLLBACK_CAPTURE"; }
-    apply_tc_limit() { printf 'apply:%s\n' "$2" >> "$TC_ROLLBACK_CAPTURE"; }
+    replace_tc_limit() { printf 'replace:%s\n' "$2" >> "$TC_ROLLBACK_CAPTURE"; }
     update_config_file() { return 1; }
     manage_traffic_limits() { :; }
     sleep() { :; }
     set_port_bandwidth_limit <<< $'1\n20Mbps'
 )
-[ "$(paste -sd, "$TC_ROLLBACK_CAPTURE")" = "remove,apply:20mbit,remove,apply:10mbit" ]
+[ "$(paste -sd, "$TC_ROLLBACK_CAPTURE")" = "replace:20mbit,replace:10mbit" ]
 jq -e '.ports["3265"].bandwidth_limit == {enabled:true, rate:"10Mbps"}' "$CONFIG_FILE" >/dev/null
 
 readonly QUOTA_ROLLBACK_CAPTURE="$TEST_DIR/quota-rollback.capture"
@@ -977,15 +980,18 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
 
 (
     get_default_interface() { echo eth0; }
-    tc_root_is_owned() { return 0; }
+    tc_root_is_managed() { return 0; }
+    tc_root_owner_marker_matches() { return 0; }
     tc_class_added=false
     tc() {
         if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
-            echo 'qdisc htb 1: root refcnt 2'
+            echo 'qdisc htb 1: root refcnt 2 default 30'
         elif [ "$1" = "class" ] && [ "$2" = "show" ]; then
-            echo 'class htb 1:1 root rate 1000Mbit'
-            [ "$tc_class_added" = "true" ] && echo "class htb $class_id parent 1:1 rate 1Mbit"
-        elif [ "$1" = "class" ] && [ "$2" = "add" ]; then
+            echo 'class htb 1:1 root rate 100Gbit ceil 100Gbit'
+            echo 'class htb 1:30 parent 1:1 rate 1Kbit ceil 100Gbit'
+            [ "$tc_class_added" = "true" ] && echo "class htb $class_id parent 1:1 rate 1Kbit ceil 1Mbit"
+        elif [ "$1" = "class" ] && [ "$2" = "replace" ] &&
+             [[ " $* " == *" classid $class_id "* ]]; then
             tc_class_added=true
         fi
         return 0
@@ -994,11 +1000,12 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
 )
 (
     get_default_interface() { echo eth0; }
-    tc_root_is_owned() { return 1; }
+    tc_root_is_managed() { return 1; }
+    adopt_legacy_tc_root_if_safe() { return 1; }
     tc_class_changed=false
     tc() {
         if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
-            echo 'qdisc htb 1: root refcnt 2'
+            echo 'qdisc htb 1: root refcnt 2 default 30'
         elif [ "$1" = "class" ] && { [ "$2" = "replace" ] || [ "$2" = "del" ]; }; then
             tc_class_changed=true
         fi
@@ -1014,7 +1021,7 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
             echo 'qdisc fq_codel 0: root refcnt 2'
             return 0
         fi
-        if [ "$1" = "qdisc" ] && [ "$2" = "add" ]; then
+        if [ "$1" = "qdisc" ] && [ "$2" = "replace" ]; then
             return 1
         fi
         return 0
@@ -1141,6 +1148,9 @@ tc() { :; }
 ss() { :; }
 bc() { :; }
 cron() { :; }
+flock() { :; }
+conntrack() { :; }
+get_default_interface() { echo eth0; }
 count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
 get_invalid_counter_order_directions() { :; }
@@ -1260,6 +1270,10 @@ readonly EXPORT_SAVE_CAPTURE="$TEST_DIR/export-save.capture"
 grep -q -- '--refresh-all-cron' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/cron.lock' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'CRON_LOCK_DIR="${CONFIG_DIR}/cron.lock"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq '"${current_pid}" "$(date +%s)" "${current_boot_id}" "${current_start_time}"' "$PROJECT_DIR/migrate-to-custom.sh"
+! grep -Fq '"${CONFIG_DIR}/reset.lock" "${CONFIG_DIR}/cron.lock"' "$PROJECT_DIR/migrate-to-custom.sh"
+[ "$(grep -c 'crontab -l' "$SCRIPT_FILE")" -eq 1 ]
 grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime' "$PROJECT_DIR/migrate-to-custom.sh"

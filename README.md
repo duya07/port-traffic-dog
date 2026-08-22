@@ -40,7 +40,7 @@
 28. TC 单端口限速同时安装 IPv4 与 IPv6 分类器；脚本自建父分类预留 100Gbps，避免旧版固定 1Gbps 父分类压低高速端口配置。
 29. 自动重置历史记录包含本次到期日期；若 counter 已清零但下一到期日写入失败，下次检查只补推进日期，不会重复清零。
 30. counter 与 quota 使用同一个 nftables 事务重置；目标端口的命名 counter 和 quota 会先解除规则引用再以零值重建，规避部分内核中 `reset counter` 或 `reset quota` 返回成功但未清零的问题。高流量端口在事务提交后立即产生的新流量仍会计入新周期。
-31. 所有 root crontab 更新共用独立锁；读取失败时停止写入，避免覆盖 DDNS、备份等无关定时任务。
+31. 本项目所有 root crontab 更新共用 Dog 自身的独立锁；读取失败时停止写入，避免覆盖 DDNS、备份等无关定时任务。
 32. 菜单更新和迁移会先校验主脚本、通知模块及旧配置，后续维护失败时恢复更新前的脚本、配置、快捷命令和定时任务。
 33. 脚本只修改或清理由本机脚本明确拥有的 TC 根队列；无法确认归属时拒绝接管，旧版完整且仅包含脚本配置对象的 HTB 可在升级时安全认领。
 34. 迁移和“系统自检/修复”会同时恢复 nftables 与 TC；旧版本已启用的 IPv4 限速会按当前配置补齐 IPv6 分类器。
@@ -50,6 +50,9 @@
 38. 新增有限额端口后会立即刷新统一的五分钟重置检查任务；旧版 `*/N` 日期步长任务会被迁移清理，自定义天数仍由真实日期计算，不依赖 cron 日期字段。
 39. 流量 counter 会插入在同链外来 `accept/drop` 之前；自检/修复可识别不可达的计数规则，并在仅一个方向受影响时按同周期 quota 差额恢复漏计流量，自动重置后仍保持 `quota → counter → 外来规则` 的执行顺序。
 40. 菜单更新只下载一次仓库快照，主脚本与通知模块来自同一版本；更新过程会显示版本变化和维护阶段，拒绝把已安装脚本降级，并在安装后核验实际运行版本。
+41. TC 运行模型升级为统一 HTB：`1:1` 父类承担整机总速率，`1:30` 承接未命中端口规则的默认流量，各端口限速类仍作为 `1:1` 子类，因而整机上限和分端口上限可同时生效。
+42. Dog 与 TrafficCop Lite 均可独立创建或识别 `traffic-tools-unified-htb-v1` 层级，不要求固定安装顺序，也不会调用对方程序。两者同时存在时，TrafficCop Lite 的 `/etc/trafficcop-lite/tc_limit_state` 是 `1:1` 整机上限的权威来源，Dog 只维护端口子类。
+43. 两个项目各自维护 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`，避免父类和端口子类并发重建。
 
 ## 下载方式说明
 
@@ -106,7 +109,7 @@ REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "h
 REPO="duya07/port-traffic-dog"; wget -O alpine-port-traffic-dog-preinstall.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/alpine-port-traffic-dog-preinstall.sh" && chmod +x alpine-port-traffic-dog-preinstall.sh && ./alpine-port-traffic-dog-preinstall.sh && wget -O port-traffic-dog.sh "https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/main/port-traffic-dog.sh" && chmod +x port-traffic-dog.sh && ./port-traffic-dog.sh
 ```
 
-Alpine 预装脚本会补齐 `bash/nftables/conntrack-tools/iproute2/jq/gawk/bc/unzip/dcron/ca-certificates/curl/tzdata` 等依赖，创建 `cron -> crond` 兼容命令，启动并注册 `crond`，并检查 `nft/tc/ss/jq/awk/bc/unzip/cron/crontab/curl/bash/conntrack` 是否可用。
+Alpine 预装脚本会补齐 `bash/nftables/conntrack-tools/iproute2/jq/gawk/bc/unzip/dcron/ca-certificates/curl/util-linux-misc/tzdata` 等依赖，创建 `cron -> crond` 兼容命令，启动并注册 `crond`，并检查 `nft/tc/ss/jq/awk/bc/unzip/cron/crontab/curl/bash/conntrack/flock` 是否可用。
 
 ## 3) 旧 VPS 迁移到定制版
 
@@ -310,7 +313,7 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 │   ├── config.lock/                     # 配置写入锁目录，运行中临时出现
 │   ├── traffic_stats.lock/              # 快照写入锁目录，运行中临时出现
 │   ├── reset.lock/                      # 流量重置锁目录，运行中临时出现
-│   ├── cron.lock/                       # crontab 更新锁目录，运行中临时出现
+│   ├── cron.lock/                       # Dog 的 crontab 更新锁目录，运行中临时出现
 │   ├── tc-root-qdisc.owner              # 本机脚本创建的 TC 根队列归属标记
 │   ├── logs/
 │   │   ├── traffic.log                  # 运行日志
@@ -336,3 +339,6 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 - 使用通知功能前，请先完成 Telegram / 企业微信配置。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
 - `tc qdisc del dev <iface> root` 会清理该网卡根队列，若同机有其他 QoS 业务请先确认。
+- Dog 的 root crontab 锁位于 `/etc/port-traffic-dog/cron.lock/`；TrafficCop Lite 使用自己的锁，两者互不依赖。
+- Dog 与 TrafficCop Lite 修改同一网卡的统一 HTB 时共用 `/run/lock/traffic-tools-tc.lock`。TrafficCop Lite 的有效状态存在时，其整机速率优先，Dog 会在该父类下恢复端口限速。
+- tcpfit 现有服务会删除并重建整棵 root qdisc，当前不能与统一 HTB 同时管理同一网卡。Dog 会把 tcpfit 或其他无法证明归属的 qdisc 视为外部配置并拒绝覆盖；切换前请先停用对应服务，并用 `sudo dog --self-check` 复查。

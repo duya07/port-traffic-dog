@@ -14,6 +14,8 @@ INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
 DOG_PATH="/usr/local/bin/dog"
 CONFIG_DIR="/etc/port-traffic-dog"
 NOTIFICATIONS_DIR="${CONFIG_DIR}/notifications"
+CRON_LOCK_DIR="${CONFIG_DIR}/cron.lock"
+CRON_LOCK_MAX_AGE=86400
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/etc/port-traffic-dog-migration-backup/${timestamp}"
@@ -25,6 +27,7 @@ install_started=false
 migration_complete=false
 nft_family="inet"
 nft_table="port_traffic_monitor"
+cron_lock_held=false
 
 download_to() {
     local url="$1"
@@ -40,6 +43,97 @@ download_to() {
     fi
 }
 
+acquire_cron_lock() {
+    local current_pid="${BASHPID:-$$}"
+    mkdir -p "${CONFIG_DIR}"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if mkdir "${CRON_LOCK_DIR}" 2>/dev/null; then
+            local current_boot_id="-"
+            local current_start_time="-"
+            [ -r /proc/sys/kernel/random/boot_id ] && \
+                current_boot_id=$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)
+            [ -r "/proc/${current_pid}/stat" ] && \
+                current_start_time=$(awk '{print $22}' "/proc/${current_pid}/stat" 2>/dev/null || echo "-")
+            if printf '%s %s %s %s\n' \
+                "${current_pid}" "$(date +%s)" "${current_boot_id}" "${current_start_time}" \
+                > "${CRON_LOCK_DIR}/owner"; then
+                cron_lock_held=true
+                return 0
+            fi
+            rm -f "${CRON_LOCK_DIR}/owner" 2>/dev/null || true
+            rmdir "${CRON_LOCK_DIR}" 2>/dev/null || true
+        else
+            local owner_pid=""
+            local owner_time=""
+            local owner_boot_id=""
+            local owner_start_time=""
+            local stale_lock=false
+            if read -r owner_pid owner_time owner_boot_id owner_start_time \
+                2>/dev/null < "${CRON_LOCK_DIR}/owner"; then
+                local now current_boot_id="" current_start_time="" boot_epoch=""
+                now=$(date +%s)
+                if ! [[ "${owner_pid}" =~ ^[0-9]+$ ]] || \
+                   ! [[ "${owner_time}" =~ ^[0-9]+$ ]] || \
+                   ! kill -0 "${owner_pid}" 2>/dev/null || \
+                   [ "${now}" -lt "${owner_time}" ]; then
+                    stale_lock=true
+                else
+                    [ -r /proc/sys/kernel/random/boot_id ] && \
+                        current_boot_id=$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)
+                    [ -r "/proc/${owner_pid}/stat" ] && \
+                        current_start_time=$(awk '{print $22}' "/proc/${owner_pid}/stat" 2>/dev/null || true)
+                    if [ -n "${owner_boot_id}" ] && [ "${owner_boot_id}" != "-" ] && \
+                       [ -n "${current_boot_id}" ] && [ "${owner_boot_id}" != "${current_boot_id}" ]; then
+                        stale_lock=true
+                    elif [ -n "${owner_start_time}" ] && [ "${owner_start_time}" != "-" ] && \
+                         [ -n "${current_start_time}" ] && [ "${owner_start_time}" != "${current_start_time}" ]; then
+                        stale_lock=true
+                    elif [ -z "${owner_boot_id}" ] || [ "${owner_boot_id}" = "-" ]; then
+                        boot_epoch=$(awk '$1 == "btime" {print $2; exit}' /proc/stat 2>/dev/null || true)
+                        if [[ "${boot_epoch}" =~ ^[0-9]+$ ]] && [ "${owner_time}" -lt "${boot_epoch}" ]; then
+                            stale_lock=true
+                        elif [ $((now - owner_time)) -gt "${CRON_LOCK_MAX_AGE}" ]; then
+                            stale_lock=true
+                        fi
+                    fi
+                fi
+            else
+                sleep 1
+                [ -s "${CRON_LOCK_DIR}/owner" ] || stale_lock=true
+            fi
+            if [ "${stale_lock}" = "true" ]; then
+                rm -f "${CRON_LOCK_DIR}/owner" 2>/dev/null || true
+                rmdir "${CRON_LOCK_DIR}" 2>/dev/null || true
+                continue
+            fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+release_cron_lock() {
+    local current_pid="${BASHPID:-$$}"
+    local owner_pid=""
+    local owner_time=""
+    local owner_boot_id=""
+    local owner_start_time=""
+    [ "${cron_lock_held}" = "true" ] || return 0
+    read -r owner_pid owner_time owner_boot_id owner_start_time \
+        2>/dev/null < "${CRON_LOCK_DIR}/owner" || true
+    if [ "${owner_pid}" = "${current_pid}" ] && \
+       { [ -z "${owner_boot_id}" ] || [ "${owner_boot_id}" = "-" ] || \
+         [ ! -r /proc/sys/kernel/random/boot_id ] || \
+         [ "${owner_boot_id}" = "$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)" ]; } && \
+       { [ -z "${owner_start_time}" ] || [ "${owner_start_time}" = "-" ] || \
+         [ ! -r "/proc/${current_pid}/stat" ] || \
+         [ "${owner_start_time}" = "$(awk '{print $22}' "/proc/${current_pid}/stat" 2>/dev/null)" ]; }; then
+        rm -f "${CRON_LOCK_DIR}/owner" 2>/dev/null || true
+        rmdir "${CRON_LOCK_DIR}" 2>/dev/null || true
+    fi
+    cron_lock_held=false
+}
+
 if [ "${EUID}" -ne 0 ]; then
     echo "错误: 请使用 root 运行"
     exit 1
@@ -48,6 +142,7 @@ fi
 TMP_DIR="$(mktemp -d)"
 cleanup() {
     local result=$?
+    release_cron_lock
     if [ "${install_started}" = "true" ] && [ "${migration_complete}" != "true" ]; then
         set +e
         echo
@@ -61,12 +156,15 @@ cleanup() {
         [ "${had_config}" = "true" ] &&
             cp -a "${BACKUP_DIR}/port-traffic-dog-config" "${CONFIG_DIR}"
         rm -rf "${CONFIG_DIR}/config.lock" "${CONFIG_DIR}/traffic_stats.lock" \
-            "${CONFIG_DIR}/reset.lock" "${CONFIG_DIR}/cron.lock"
+            "${CONFIG_DIR}/reset.lock"
 
-        if [ "${had_crontab}" = "true" ]; then
-            crontab "${BACKUP_DIR}/root.crontab.bak"
-        else
-            crontab -r 2>/dev/null || true
+        if acquire_cron_lock; then
+            if [ "${had_crontab}" = "true" ]; then
+                crontab "${BACKUP_DIR}/root.crontab.bak"
+            else
+                crontab -r 2>/dev/null || true
+            fi
+            release_cron_lock
         fi
 
         if command -v nft >/dev/null 2>&1; then
@@ -115,12 +213,14 @@ if [ -f "${DOG_PATH}" ]; then
     echo "已备份: ${DOG_PATH} -> ${BACKUP_DIR}/dog.bak"
 fi
 
+acquire_cron_lock || { echo "错误: 无法取得Dog crontab锁"; exit 1; }
 if crontab -l > "${BACKUP_DIR}/root.crontab.bak" 2>/dev/null; then
     had_crontab=true
     echo "已备份: root crontab -> ${BACKUP_DIR}/root.crontab.bak"
 else
     rm -f "${BACKUP_DIR}/root.crontab.bak"
 fi
+release_cron_lock
 
 ports_before="[]"
 if [ -f "${CONFIG_DIR}/config.json" ]; then
@@ -203,7 +303,10 @@ echo "已执行: --refresh-all-cron"
 echo "已执行: --repair-traffic-rules"
 echo "已执行: --restore-runtime"
 
-if crontab -l 2>/dev/null | grep -Eq \
+acquire_cron_lock || { echo "错误: 无法取得Dog crontab锁"; exit 1; }
+current_root_cron=$(crontab -l 2>/dev/null || true)
+release_cron_lock
+if printf '%s\n' "${current_root_cron}" | grep -Eq \
     'port-traffic-dog.*--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'; then
     echo "错误: 仍检测到旧快照定时任务，已停止并保留备份供排查"
     exit 1
@@ -220,7 +323,7 @@ if [ "${ports_before}" != "${ports_after}" ]; then
     exit 1
 fi
 if [ "$(jq 'length' <<< "${ports_after}")" -gt 0 ] &&
-   ! crontab -l 2>/dev/null | grep -q 'port-traffic-dog.*--restore-runtime'; then
+   ! printf '%s\n' "${current_root_cron}" | grep -q 'port-traffic-dog.*--restore-runtime'; then
     echo "错误: 迁移后缺少开机运行时恢复任务"
     exit 1
 fi
