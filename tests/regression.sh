@@ -978,6 +978,35 @@ class_minor=$(tc_class_id_minor "$class_id")
 jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $class_id' \
     "$CONFIG_FILE" >/dev/null
 
+# 无有效配置卸载时，必须先取得共享锁再复核归属；锁内出现的 NTC 状态不得被删除。
+(
+    owner_file=$(get_tc_root_owner_file)
+    printf '%s\n' 'eth0|test-machine' > "$owner_file"
+    lock_held=false
+    ntc_claimed=false
+    begin_tc_update() {
+        lock_held=true
+        ntc_claimed=true
+    }
+    finish_tc_update() { lock_held=false; }
+    tc_root_is_owned() { [ "$lock_held" = "true" ]; }
+    trafficcop_unified_state_rate() {
+        [ "$lock_held" = "true" ] && [ "$ntc_claimed" = "true" ] || return 1
+        printf '%s\n' '5mbit'
+    }
+    tc() {
+        if [ "${1:-}" = "qdisc" ] && [ "${2:-}" = "del" ]; then
+            touch "$TEST_DIR/uninstall-qdisc-deleted"
+        fi
+    }
+    log_notification() { :; }
+
+    cleanup_owned_tc_root_without_config
+    [ "$lock_held" = "false" ]
+    [ ! -e "$owner_file" ]
+    [ ! -e "$TEST_DIR/uninstall-qdisc-deleted" ]
+)
+
 (
     get_default_interface() { echo eth0; }
     tc_root_is_managed() { return 0; }

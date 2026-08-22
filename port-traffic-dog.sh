@@ -7441,6 +7441,36 @@ ensure_installation_files() {
     download_notification_modules >/dev/null 2>&1 || true
 }
 
+cleanup_owned_tc_root_without_config() {
+    local owner_file
+    local owner_interface=""
+    local ntc_uninstall_status=0
+
+    owner_file=$(get_tc_root_owner_file)
+    [ -r "$owner_file" ] || return 0
+    IFS='|' read -r owner_interface _ < "$owner_file" || true
+    [ -n "$owner_interface" ] || return 0
+
+    if ! begin_tc_update; then
+        log_notification "卸载时无法取得共享TC锁，已保留现有qdisc避免并发破坏"
+        return 1
+    fi
+
+    # 归属与 NTC 状态必须在共享锁内重新确认，避免检查后另一项目接管层级。
+    if tc_root_is_owned "$owner_interface"; then
+        trafficcop_unified_state_rate "$owner_interface" >/dev/null 2>&1 || ntc_uninstall_status=$?
+        if [ "$ntc_uninstall_status" -eq 0 ] ||
+           { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ]; }; then
+            rm -f "$owner_file"
+            log_notification "卸载Dog时保留TrafficCop正在使用的统一HTB: $owner_interface"
+        else
+            tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null || true
+        fi
+    fi
+
+    finish_tc_update
+}
+
 # 卸载脚本
 uninstall_script() {
     echo -e "${BLUE}卸载脚本${NC}"
@@ -7494,24 +7524,7 @@ uninstall_script() {
             table_name=$(jq -r '.nftables.table_name // "port_traffic_monitor"' "$CONFIG_FILE")
             family=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE")
         else
-            local owner_file
-            local owner_interface=""
-            owner_file=$(get_tc_root_owner_file)
-            if [ -r "$owner_file" ]; then
-                IFS='|' read -r owner_interface _ < "$owner_file" || true
-                if [ -n "$owner_interface" ] && tc_root_is_owned "$owner_interface"; then
-                    local ntc_uninstall_status=0
-                    trafficcop_unified_state_rate "$owner_interface" >/dev/null 2>&1 || ntc_uninstall_status=$?
-                    if [ "$ntc_uninstall_status" -eq 0 ] ||
-                       { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ]; }; then
-                        rm -f "$owner_file"
-                        log_notification "卸载Dog时保留TrafficCop正在使用的统一HTB: $owner_interface"
-                    elif begin_tc_update; then
-                        tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null || true
-                        finish_tc_update
-                    fi
-                fi
-            fi
+            cleanup_owned_tc_root_without_config || true
         fi
         nft delete table "$family" "$table_name" >/dev/null 2>&1 || true
 
@@ -8389,7 +8402,7 @@ self_check() {
                         check_warn "检测到TrafficCop旧TBF；启用Dog端口限速时会安全迁移为统一HTB"
                     elif tc_root_is_owned "$self_tc_interface" &&
                          desired_tc_parent_rate "$self_tc_interface" >/dev/null 2>&1; then
-                        check_warn "TrafficCop仍是旧状态格式，统一HTB已迁移，建议运行NTC自检升级状态"
+                        check_warn "TrafficCop仍是旧状态格式，统一HTB已迁移，请让NTC重新应用整机限速以升级状态"
                     else
                         check_fail "TrafficCop旧TC状态与当前root qdisc不一致"
                     fi
