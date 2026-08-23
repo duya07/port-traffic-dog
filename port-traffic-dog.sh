@@ -4250,6 +4250,15 @@ dog_tc_status_label() {
     esac
 }
 
+dog_tc_status_kind() {
+    case "${1:-}" in
+        TC_STATUS=OK*) echo "ok" ;;
+        TC_STATUS=IDLE*) echo "idle" ;;
+        TC_STATUS=CONFLICT*) echo "conflict" ;;
+        *) echo "error" ;;
+    esac
+}
+
 show_tc_takeover_warning() {
     echo -e "${RED}检测到当前 TC 配置可能已被其他程序修改。${NC}"
     echo "继续操作将删除当前冲突的 TC/qdisc 配置，"
@@ -4260,6 +4269,31 @@ show_tc_takeover_warning() {
     echo -e "仍可能覆盖 Dog/NTC。建议卸载、关闭或禁用这些冲突程序。${NC}"
 }
 
+show_tc_auto_recovery_notice() {
+    echo "启用后，恢复服务会在开机网络就绪时检查 Dog/NTC TC 规则。"
+    echo "规则正常或当前没有需要恢复的规则时，不会修改 TC。"
+    echo "只有 Dog/NTC 自身规则失效时，才会删除冲突配置并按现有状态重建。"
+    echo "外部 TC 规则不会被保留。"
+}
+
+confirm_enable_tc_auto_recovery() {
+    local confirm=""
+
+    show_tc_auto_recovery_notice
+    echo
+    read -r -p "确认启用请输入 ENABLE: " confirm
+    if [ "$confirm" != "ENABLE" ]; then
+        echo "未启用。"
+        return 0
+    fi
+    if enable_tc_auto_recovery; then
+        echo -e "${GREEN}开机自动恢复已启用。${NC}"
+    else
+        echo -e "${RED}开机自动恢复启用失败。${NC}"
+        return 1
+    fi
+}
+
 run_shared_tc_recovery() {
     local mode="${1:---manual}"
     install_tc_recovery_service_files || return 1
@@ -4267,14 +4301,19 @@ run_shared_tc_recovery() {
 }
 
 manage_tc_recovery() {
+    local tc_choice=""
+    local confirm=""
+    local status_output=""
+    local status_kind=""
+
     clear 2>/dev/null || true
     echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
     echo "TC 状态: $(dog_tc_status_label)"
     echo "自动恢复: $(tc_auto_recovery_state)"
     echo "恢复方式: 单一 systemd oneshot；启用后在网络就绪时执行一次"
     echo
-    echo "1. 立即检测并重建 Dog/NTC 规则"
-    echo "2. 立即重建，并启用开机自动恢复"
+    echo "1. 检测并按需重建 Dog/NTC 规则"
+    echo "2. 检测并按需重建，同时启用开机自动恢复"
     echo "3. 启用开机自动恢复"
     echo "4. 关闭开机自动恢复"
     echo "0. 返回主菜单"
@@ -4282,35 +4321,49 @@ manage_tc_recovery() {
     read -r -p "请选择操作 [0-4]: " tc_choice
     case "$tc_choice" in
         1|2)
-            show_tc_takeover_warning
-            echo
-            read -r -p "确认继续请输入 REBUILD: " confirm
-            if [ "$confirm" = "REBUILD" ] && run_shared_tc_recovery --manual; then
-                echo -e "${GREEN}TC 检测/重建完成。${NC}"
-                if [ "$tc_choice" = "2" ]; then
-                    if enable_tc_auto_recovery; then
-                        echo -e "${GREEN}开机自动恢复已启用。${NC}"
-                    else
-                        echo -e "${RED}TC 已重建，但开机自动恢复启用失败。${NC}"
+            status_output=$(dog_tc_status 2>/dev/null || true)
+            status_kind=$(dog_tc_status_kind "$status_output")
+            case "$status_kind" in
+                ok)
+                    echo -e "${GREEN}当前 TC 状态正常，无需强制重建。${NC}"
+                    if [ "$tc_choice" = "2" ]; then
+                        echo
+                        confirm_enable_tc_auto_recovery || true
                     fi
-                fi
-            elif [ "$confirm" != "REBUILD" ]; then
-                echo "已取消。"
-            else
-                echo -e "${RED}TC 重建失败，请运行 dog --self-check 查看详情。${NC}"
-            fi
+                    ;;
+                idle)
+                    echo -e "${YELLOW}当前没有需要恢复的 Dog/NTC TC 规则。${NC}"
+                    if [ "$tc_choice" = "2" ]; then
+                        echo
+                        confirm_enable_tc_auto_recovery || true
+                    fi
+                    ;;
+                conflict)
+                    show_tc_takeover_warning
+                    echo
+                    read -r -p "确认继续请输入 REBUILD: " confirm
+                    if [ "$confirm" = "REBUILD" ] && run_shared_tc_recovery --manual; then
+                        echo -e "${GREEN}TC 检测/重建完成。${NC}"
+                        if [ "$tc_choice" = "2" ]; then
+                            if enable_tc_auto_recovery; then
+                                echo -e "${GREEN}开机自动恢复已启用。${NC}"
+                            else
+                                echo -e "${RED}TC 已重建，但开机自动恢复启用失败。${NC}"
+                            fi
+                        fi
+                    elif [ "$confirm" != "REBUILD" ]; then
+                        echo "已取消。"
+                    else
+                        echo -e "${RED}TC 重建失败，请运行 dog --self-check 查看详情。${NC}"
+                    fi
+                    ;;
+                *)
+                    echo -e "${RED}无法确认当前 TC 状态，未修改 qdisc。请先运行 dog --self-check。${NC}"
+                    ;;
+            esac
             ;;
         3)
-            show_tc_takeover_warning
-            echo
-            echo "启用后，恢复服务在开机时检测到既有 Dog/NTC 规则失效，"
-            echo "会按上述授权删除冲突 root 并重建；运行期间不会高频轮询或抢占。"
-            read -r -p "确认启用请输入 ENABLE: " confirm
-            if [ "$confirm" = "ENABLE" ] && enable_tc_auto_recovery; then
-                echo -e "${GREEN}开机自动恢复已启用。${NC}"
-            else
-                echo "未启用。"
-            fi
+            confirm_enable_tc_auto_recovery || true
             ;;
         4)
             disable_tc_auto_recovery
