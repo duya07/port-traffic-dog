@@ -4177,9 +4177,9 @@ EOF
     cat > "$unit_tmp" <<EOF
 # traffic-tools-tc-recovery-v1
 [Unit]
-Description=Recover Dog and TrafficCop Lite unified HTB after other TC services
+Description=Recover Dog and TrafficCop Lite unified HTB
 Wants=network-online.target
-After=network-online.target vnstat.service tcpfit.service tcpfit-qdisc.service
+After=network-online.target vnstat.service
 
 [Service]
 Type=oneshot
@@ -4271,7 +4271,7 @@ manage_tc_recovery() {
     echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
     echo "TC 状态: $(dog_tc_status_label)"
     echo "自动恢复: $(tc_auto_recovery_state)"
-    echo "恢复方式: 单一 systemd oneshot；在 tcpfit 服务之后排序，无固定延迟"
+    echo "恢复方式: 单一 systemd oneshot；启用后在网络就绪时执行一次"
     echo
     echo "1. 立即检测并重建 Dog/NTC 规则"
     echo "2. 立即重建，并启用开机自动恢复"

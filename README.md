@@ -54,7 +54,7 @@
 42. Dog 与 TrafficCop Lite 均可独立创建或识别 `traffic-tools-unified-htb-v1` 层级，不要求固定安装顺序。日常应用各自维护所负责的规则；共享恢复入口在两者并存时按顺序调用两边的恢复接口。TrafficCop Lite 的 `/etc/trafficcop-lite/tc_limit_state` 是 `1:1` 整机上限的权威来源，Dog 只维护端口子类。
 43. 两个项目各自维护 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`，避免父类和端口子类并发重建。
 44. 主菜单增加“TC 冲突处理/自动恢复”：主页只读检测统一 HTB 是否完整；用户明确确认后，可删除冲突 root 并按现有 Dog/NTC 配置重建。第三方 TC 配置不会被读取、迁移或保留。
-45. Dog 与 TrafficCop Lite 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认不启用；用户启用后通过 systemd 排在 `tcpfit.service` / `tcpfit-qdisc.service` 之后执行，不依赖固定延迟，也不会在运行期间高频轮询抢占。
+45. Dog 与 TrafficCop Lite 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认不启用；用户启用后在网络就绪时执行一次，不依赖固定延迟，也不会在运行期间高频轮询抢占。
 
 ## 下载方式说明
 
@@ -347,5 +347,5 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 - `tc qdisc del dev <iface> root` 会清理该网卡根队列，若同机有其他 QoS 业务请先确认。
 - Dog 的 root crontab 锁位于 `/etc/port-traffic-dog/cron.lock/`；TrafficCop Lite 使用自己的锁，两者互不依赖。
 - Dog 与 TrafficCop Lite 修改同一网卡的统一 HTB 时共用 `/run/lock/traffic-tools-tc.lock`。TrafficCop Lite 的有效状态存在时，其整机速率优先，Dog 会在该父类下恢复端口限速。
-- tcpfit 或其他工具重建 root qdisc 后，Dog 会在主页报告外部/未知 TC 冲突，普通 cron 和限速操作仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
-- 可选的 `traffic-tools-tc-recovery.service` 只解决开机阶段的最终执行顺序。运行期间手动重启 tcpfit 仍会覆盖 Dog/NTC，需要再次手动恢复；建议卸载或禁用其他 TC 管理服务。
+- 外部程序重建 root qdisc 后，Dog 会在主页报告外部/未知 TC 冲突，普通 cron 和限速操作仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
+- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次。运行期间若 root qdisc 再次被其他程序覆盖，需要用户再次手动恢复；建议关闭其他 TC 管理服务。

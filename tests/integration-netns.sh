@@ -348,7 +348,7 @@ remove_tc_limit 3265
 wait_for_tc_state qdisc "qdisc htb 1:" absent
 [ ! -f "$(get_tc_root_owner_file)" ]
 
-# tcpfit 在 Dog 之后删树重建同名 HTB 时，残留 owner 文件不得被当作归属证据。
+# 外部程序在 Dog 之后删树重建同名 HTB 时，残留 owner 文件不得被当作归属证据。
 apply_tc_limit 3265 10mbit
 tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
