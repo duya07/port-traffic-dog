@@ -1326,4 +1326,56 @@ for expected_call in \
     [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
 done
 
+[ "$(dog_tc_status_kind 'TC_STATUS=OK INTERFACE=eth0')" = "ok" ]
+[ "$(dog_tc_status_kind 'TC_STATUS=IDLE INTERFACE=eth0')" = "idle" ]
+[ "$(dog_tc_status_kind 'TC_STATUS=CONFLICT REASON=external-root-qdisc')" = "conflict" ]
+[ "$(dog_tc_status_kind 'TC_STATUS=ERROR REASON=tc-unavailable')" = "error" ]
+
+tc_menu_output=$(
+    (
+        unset -f read
+        clear() { :; }
+        dog_tc_status() { echo 'TC_STATUS=OK INTERFACE=eth0'; }
+        tc_auto_recovery_state() { echo '未启用'; }
+        show_tc_takeover_warning() { echo 'TAKEOVER_WARNING'; }
+        run_shared_tc_recovery() { echo 'RECOVERY_CALLED'; }
+        show_main_menu() { :; }
+        manage_tc_recovery
+    ) <<< $'1\n\n'
+)
+grep -Fq '当前 TC 状态正常，无需强制重建。' <<< "$tc_menu_output"
+! grep -Fq 'TAKEOVER_WARNING' <<< "$tc_menu_output"
+! grep -Fq 'RECOVERY_CALLED' <<< "$tc_menu_output"
+
+tc_menu_output=$(
+    (
+        unset -f read
+        clear() { :; }
+        dog_tc_status() { echo 'TC_STATUS=CONFLICT REASON=external-root-qdisc'; }
+        tc_auto_recovery_state() { echo '未启用'; }
+        show_tc_takeover_warning() { echo 'TAKEOVER_WARNING'; }
+        run_shared_tc_recovery() { echo 'RECOVERY_CALLED'; }
+        show_main_menu() { :; }
+        manage_tc_recovery
+    ) <<< $'1\nREBUILD\n\n'
+)
+grep -Fq 'TAKEOVER_WARNING' <<< "$tc_menu_output"
+grep -Fq 'RECOVERY_CALLED' <<< "$tc_menu_output"
+
+tc_menu_output=$(
+    (
+        unset -f read
+        clear() { :; }
+        dog_tc_status() { echo 'TC_STATUS=OK INTERFACE=eth0'; }
+        tc_auto_recovery_state() { echo '未启用'; }
+        show_tc_takeover_warning() { echo 'TAKEOVER_WARNING'; }
+        enable_tc_auto_recovery() { echo 'AUTO_RECOVERY_ENABLED'; }
+        show_main_menu() { :; }
+        manage_tc_recovery
+    ) <<< $'3\nNO\n\n'
+)
+grep -Fq '规则正常或当前没有需要恢复的规则时，不会修改 TC。' <<< "$tc_menu_output"
+! grep -Fq 'TAKEOVER_WARNING' <<< "$tc_menu_output"
+! grep -Fq 'AUTO_RECOVERY_ENABLED' <<< "$tc_menu_output"
+
 echo "regression tests passed"
