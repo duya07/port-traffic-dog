@@ -29,7 +29,9 @@ declare -A FLOW_SOURCE=()
 declare -A ACTIVE_COUNT=()
 declare -A ADMITTED=()
 declare -A FIRST_SEEN=()
+declare -A ADMISSION_CHANGED_PORTS=()
 SEQUENCE=0
+ADMISSION_CHANGED=false
 PARSED_EVENT=""
 PARSED_SOURCE=""
 PARSED_DESTINATION=""
@@ -439,16 +441,37 @@ rebuild_firewall() {
 sync_admitted_sets() {
     local batch_file
     local port key address
+    local ports=()
+    local -A selected_ports=()
+
+    if [ "$#" -gt 0 ]; then
+        for port in "$@"; do
+            validate_port "$port" && [ -n "${POLICY_LIMIT[$port]:-}" ] || {
+                echo "拒绝同步未配置的 IP 上限端口: $port" >&2
+                return 1
+            }
+            [ -n "${selected_ports[$port]:-}" ] && continue
+            selected_ports["$port"]=1
+            ports+=("$port")
+        done
+    else
+        for port in "${!POLICY_LIMIT[@]}"; do
+            selected_ports["$port"]=1
+            ports+=("$port")
+        done
+    fi
+    [ "${#ports[@]}" -gt 0 ] || return 0
+
     require_owned_table || return 1
     batch_file=$(mktemp "$CONFIG_DIR/.ip-guard-sets.XXXXXX") || return 1
-    for port in $(printf '%s\n' "${!POLICY_LIMIT[@]}" | sort -n); do
+    for port in "${ports[@]}"; do
         printf 'flush set inet %s %s\n' "$TABLE_NAME" "$(set_name_v4 "$port")" >> "$batch_file"
         printf 'flush set inet %s %s\n' "$TABLE_NAME" "$(set_name_v6 "$port")" >> "$batch_file"
     done
     for key in "${!ADMITTED[@]}"; do
         port=${key%%|*}
         address=${key#*|}
-        [ -n "${POLICY_LIMIT[$port]:-}" ] || continue
+        [ -n "${selected_ports[$port]:-}" ] || continue
         validate_address_token "$address" || {
             echo "拒绝把无效来源地址写入 nftables: $address" >&2
             rm -f "$batch_file"
@@ -525,8 +548,13 @@ recalculate_port_admission() {
     local max_ips="${POLICY_LIMIT[$port]}"
     local key
     local candidates=()
+    local -A previous_admitted=()
+    ADMISSION_CHANGED=false
     for key in "${!ADMITTED[@]}"; do
-        [[ "$key" == "$port|"* ]] && unset 'ADMITTED[$key]'
+        if [[ "$key" == "$port|"* ]]; then
+            previous_admitted["$key"]=1
+            unset 'ADMITTED[$key]'
+        fi
     done
     mapfile -t candidates < <(
         for key in "${!ACTIVE_COUNT[@]}"; do
@@ -540,16 +568,30 @@ recalculate_port_admission() {
         key=${item#* }
         if [ "$index" -lt "$max_ips" ]; then
             ADMITTED["$key"]=1
+            [ -n "${previous_admitted[$key]:-}" ] || ADMISSION_CHANGED=true
         fi
         index=$((index + 1))
+    done
+    for key in "${!previous_admitted[@]}"; do
+        [ -n "${ADMITTED[$key]:-}" ] || ADMISSION_CHANGED=true
     done
 }
 
 recalculate_all_admission() {
     local port
+    ADMISSION_CHANGED_PORTS=()
     for port in "${!POLICY_LIMIT[@]}"; do
         recalculate_port_admission "$port"
+        [ "$ADMISSION_CHANGED" = "true" ] && ADMISSION_CHANGED_PORTS["$port"]=1
     done
+    return 0
+}
+
+sync_changed_admitted_sets() {
+    [ "${#ADMISSION_CHANGED_PORTS[@]}" -gt 0 ] || return 0
+    local changed_ports=()
+    mapfile -t changed_ports < <(printf '%s\n' "${!ADMISSION_CHANGED_PORTS[@]}" | sort -n)
+    sync_admitted_sets "${changed_ports[@]}"
 }
 
 load_conntrack_snapshot() {
@@ -594,7 +636,8 @@ process_conntrack_event() {
         *) return 0 ;;
     esac
     recalculate_port_admission "$PARSED_DPORT"
-    sync_admitted_sets
+    [ "$ADMISSION_CHANGED" = "true" ] || return 0
+    sync_admitted_sets "$PARSED_DPORT"
 }
 
 current_ssh_server_port() {
@@ -670,7 +713,10 @@ cleanup_daemon() {
         kill "$DAEMON_LISTENER_PID" >/dev/null 2>&1 || true
         wait "$DAEMON_LISTENER_PID" 2>/dev/null || true
     fi
-    [ -z "$DAEMON_EVENT_FIFO" ] || rm -f "$DAEMON_EVENT_FIFO"
+    if [ -n "$DAEMON_EVENT_FIFO" ]; then
+        exec 8>&- 2>/dev/null || true
+        rm -f "$DAEMON_EVENT_FIFO"
+    fi
     fail_open_firewall || true
 }
 
@@ -693,6 +739,12 @@ run_daemon() {
 
     DAEMON_EVENT_FIFO="$CONFIG_DIR/.ip-guard-events.$$"
     mkfifo "$DAEMON_EVENT_FIFO"
+    # 先持有 FIFO 读写端，再启动 conntrack 监听。否则写端会一直等待读端，
+    # 全量快照和规则重建期间产生的 NEW/DESTROY 事件会形成监听空窗。
+    if ! exec 8<>"$DAEMON_EVENT_FIFO"; then
+        echo "无法打开 conntrack 事件通道。" >&2
+        return 1
+    fi
     conntrack -E -p tcp -e NEW,DESTROY -o timestamp,extended > "$DAEMON_EVENT_FIFO" &
     DAEMON_LISTENER_PID=$!
 
@@ -709,7 +761,6 @@ run_daemon() {
     local last_reconcile
     last_reconcile=$(date +%s)
     local line now
-    exec 8<"$DAEMON_EVENT_FIFO"
     while kill -0 "$DAEMON_LISTENER_PID" 2>/dev/null; do
         if IFS= read -r -t 1 line <&8; then
             process_conntrack_event "$line" || return 1
@@ -717,11 +768,12 @@ run_daemon() {
         now=$(date +%s)
         if [ $((now - last_reconcile)) -ge "$RECONCILE_SECONDS" ]; then
             if load_conntrack_snapshot; then
-                sync_admitted_sets || return 1
-                last_reconcile="$now"
+                sync_changed_admitted_sets || return 1
             else
                 echo "conntrack 全量校准失败，保留当前准入集合。" >&2
             fi
+            # 无论成功与否均按配置间隔执行下一次校准，避免故障时每秒扫描全表。
+            last_reconcile="$now"
         fi
     done
     wait "$DAEMON_LISTENER_PID" || true

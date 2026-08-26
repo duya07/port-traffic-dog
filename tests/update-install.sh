@@ -131,9 +131,9 @@ mkdir -p "$(dirname "$TEST_IP_GUARD_SERVICE_FILE")"
 : > "$TEST_IP_GUARD_SERVICE_FILE"
 : > "$SYSTEMCTL_LOG"
 export PTD_GUARD_SELF_CHECK_COUNTER="$TEST_DIR/guard-self-check-count"
-create_payload 1.5.14
+create_payload 1.5.15
 install_update_script false > "$TEST_DIR/active-guard-update.out"
-[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.14" ]
+[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.15" ]
 grep -Fq "restart $IP_GUARD_SERVICE" "$SYSTEMCTL_LOG"
 grep -Fq "is-active --quiet $IP_GUARD_SERVICE" "$SYSTEMCTL_LOG"
 [ "$(cat "$PTD_GUARD_SELF_CHECK_COUNTER")" -eq 2 ]
