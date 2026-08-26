@@ -19,7 +19,7 @@
 7. Alpine 预装脚本同步维护: `alpine-port-traffic-dog-preinstall.sh`。
 8. 增加通知定时任务刷新命令: `dog --refresh-notification-cron`。
 9. 卸载时会清理通知 cron 和端口自动重置 cron。
-10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定到期日期一次性重置。
+10. 流量配额支持更灵活的自动重置策略：每月、每 N 天、每 N 个月、每年、指定日期一次性清零。
 11. 流量计费规则继承上游双向权重：双向为 `入站×2 + 出站×2`；定制单向模式为双向规则减半，即 `入站 + 出站`，修正上游单向只统计 out 的缺口。
 12. 当前周期流量、配额进度和限额初始化沿用 nftables counter 口径，counter 与 quota 使用完全一致的规则倍率；额外增加北京时间自然日快照统计，避免统计文件反向影响限额规则。
 13. 通知和自然日快照 cron 只在存在监控端口时运行；删除最后一个端口后会自动清理任务，残留旧任务也会在下次触发时自行退出并移除。
@@ -55,6 +55,9 @@
 43. 两个项目各自维护 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`，避免父类和端口子类并发重建。
 44. 主菜单增加“TC 冲突处理/自动恢复”：主页只读检测统一 HTB 是否完整；用户明确确认后，可删除冲突 root 并按现有 Dog/NTC 配置重建。第三方 TC 配置不会被读取、迁移或保留。
 45. Dog 与 TrafficCop Lite 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认不启用；用户启用后在网络就绪时执行一次，不依赖固定延迟，也不会在运行期间高频轮询抢占。
+46. 每个端口可单独设置服务到期日 `YYYY-MM-DD`。到期前流量周期照常重置；北京时间到期日当天起独立封锁该端口的 TCP/UDP 入站、出站和转发流量，延期或取消后立即解锁。
+47. 服务到期检查每分钟运行，并通过独立 `@reboot` 任务在开机时立即恢复；设置、导入、删除和卸载均与检查任务共用到期锁，避免留下孤儿封锁规则。
+48. 主菜单增加“来源 IP 并发限制（测试中）”。该功能位于独立的 `port-ip-guard.sh`，主脚本只负责校验、安装和调用，未启用时不会创建额外防火墙规则或服务。
 
 ## 下载方式说明
 
@@ -157,6 +160,7 @@ sudo dog --refresh-all-cron
 sudo dog --repair-traffic-rules
 sudo dog --snapshot-traffic
 sudo dog --restore-runtime
+sudo dog --check-port-expirations
 sudo dog --recover-tc --manual
 sudo dog --uninstall
 ```
@@ -172,6 +176,7 @@ sudo dog --uninstall
 - `--repair-traffic-rules`: 按当前计费模式检查并重建 counter/quota 规则；双向目标为每个方向 8 条 counter 引用、16 条 quota 引用，单向目标为每个方向 4 条 counter 引用、8 条 quota 引用。升级时会按旧规则倍率换算已有 counter，避免已有流量丢失或再次翻倍。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
 - `--restore-runtime`: 按当前配置和 `traffic_data.json` 恢复 nftables/TC 运行状态；脚本会通过 `@reboot` 自动调用，一般无需手动执行。
+- `--check-port-expirations`: 按北京时间检查全部端口的服务到期日，并只同步 Dog 自己带固定 comment 的封锁规则；正常情况下由每分钟 cron 和独立 `@reboot` 任务调用。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron、开机恢复 cron 和端口自动重置 cron。
 
 主菜单选择 `8. 系统自检/修复`，可主动补齐依赖和通知模块、修正权限与快捷命令、按当前配置重建 cron、恢复 nftables/TC 运行状态、更新自然日快照并执行最终自检。普通打开 `dog` 时不会重复执行这些重操作；只有检测到 nftables 监控规则确实缺失时，才会按原配置自动恢复。
@@ -186,14 +191,14 @@ sudo dog --uninstall
 - 每隔多少天重置：例如每 30 天重置一次。
 - 每隔多少个月重置：例如每 3 个月重置一次，可指定每次按几号结算。
 - 每年几月几号重置：适合年度流量包。
-- 指定到期日期重置一次：到期重置后会自动关闭该端口的自动重置。
+- 指定日期清零一次：执行后会自动关闭该端口的自动重置。
 
 日期处理规则:
 
 - 旧配置里的 `quota.reset_day` 会自动继承为“每月几号重置”，例如原来设置每月 2 日重置，会继续按每月 2 日执行。
 - 新增或修改周期型策略时，下一次自动重置会从未来日期开始计算，避免刚添加端口就被当天任务重置。
 - 第一次批量添加多个有限配额端口时，可选择为每个端口分别设置自动重置策略。
-- 指定到期日期为当天时，脚本会询问是否立即重置当前流量；不立即重置则等待下一次周期检查。
+- 指定清零日期为当天时，脚本会询问是否立即重置当前流量；不立即重置则等待下一次周期检查。
 - 31 号遇到没有 31 号的月份，会按该月最后一天处理。
 - 2 月 29 日遇到非闰年，会按 2 月 28 日处理。
 - 自动任务每 5 分钟按北京时间检查一次所有端口，只有到期端口才会真正重置，不依赖 VPS 的系统时区。
@@ -201,6 +206,26 @@ sudo dog --uninstall
 - 已成功清零的到期日会写入重置历史；即使下一到期日期暂时保存失败，也不会在五分钟后重复清零。
 - cron、手动命令和即时重置共用重置锁，避免同一端口被并发清零两次。
 - 手动“立即重置”只清零当前流量，不会自动改变下一次到期日期。
+
+### 5.1 服务到期封锁
+
+服务到期日和上面的流量配额重置是两套独立状态。假设端口每月 1 日重置、服务到期日为 `2026-03-02`，3 月 1 日仍会正常清零，3 月 2 日北京时间 `00:00` 起才封锁端口。
+
+- 设置入口：`流量重置管理 → 服务到期日设置`，格式固定为真实日期 `YYYY-MM-DD`；输入 `0` 取消。
+- 到期当天算作已到期。封锁覆盖 TCP/UDP 的 input、output 和 forward，不删除流量、配额或重置配置。
+- 延后日期或取消到期会立即删除该端口的到期封锁；删除端口、导入配置和卸载也会清理对应规则。
+- 每分钟 cron 负责跨日检查；独立 `@reboot` 检查不等待网络或 TC。若规则被删除，下一次检查会按现有配置恢复。
+- 到期规则使用 `ptd_expiry_<端口>` 固定 comment。自检发现缺失、重复、附加了未知条件或存在孤儿规则时会报告异常，不会把外部规则当成自身规则。
+
+### 5.2 来源 IP 并发限制（测试中）
+
+主菜单 `10` 会按需安装并调用独立脚本 `/etc/port-traffic-dog/port-ip-guard.sh`。它限制的是单个 TCP 端口当前 conntrack 中允许准入的来源 IP 数，不是账号数，也不支持 UDP。
+
+- NAT、CDN、反向代理或四层转发后的多名用户可能共享同一个来源 IP。
+- 半开连接、conntrack 超时和地址伪造会影响统计；新来源的首个 SYN 会被丢弃，准入后依靠 TCP 重传建立连接。
+- 组件使用独立 nftables 表和 systemd 服务；进程停止时会尝试 fail-open 解封。无法确认同名表归属时会拒绝覆盖或删除。
+- 对当前 SSH 服务端口设置限制需要双重确认。建议先在有控制台或备用管理入口的机器测试。
+- Dog 卸载时会先调用独立组件的安全卸载；若无法确认能解除其规则，Dog 会中止卸载而不是遗留封锁。
 
 ## 6) 流量统计口径
 
@@ -316,10 +341,6 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 │   ├── traffic_data.json                # nftables 计数器灾备数据
 │   ├── traffic_stats.json               # 自然日快照统计
 │   ├── reset_history.log                # 流量重置历史
-│   ├── config.lock/                     # 配置写入锁目录，运行中临时出现
-│   ├── traffic_stats.lock/              # 快照写入锁目录，运行中临时出现
-│   ├── reset.lock/                      # 流量重置锁目录，运行中临时出现
-│   ├── cron.lock/                       # Dog 的 crontab 更新锁目录，运行中临时出现
 │   ├── tc-root-qdisc.owner              # 本机脚本创建的 TC 根队列归属标记
 │   ├── logs/
 │   │   ├── traffic.log                  # 运行日志
@@ -345,7 +366,7 @@ sudo crontab -l | grep -E 'port-traffic-dog|--send-telegram-status|--send-wecom-
 - 使用通知功能前，请先完成 Telegram / 企业微信配置。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
 - `tc qdisc del dev <iface> root` 会清理该网卡根队列，若同机有其他 QoS 业务请先确认。
-- Dog 的 root crontab 锁位于 `/etc/port-traffic-dog/cron.lock/`；TrafficCop Lite 使用自己的锁，两者互不依赖。
+- Dog 的 root crontab 锁位于 `/run/lock/port-traffic-dog-root-crontab.lock/`；TrafficCop Lite 使用自己的锁，两者互不依赖。Dog 的配置、流量快照和重置事务也各自使用 `/run/lock/port-traffic-dog-*.lock/`，因此导入、更新或卸载配置目录时不会把仍在持有的锁一并删除。
 - Dog 与 TrafficCop Lite 修改同一网卡的统一 HTB 时共用 `/run/lock/traffic-tools-tc.lock`。TrafficCop Lite 的有效状态存在时，其整机速率优先，Dog 会在该父类下恢复端口限速。
 - 外部程序重建 root qdisc 后，Dog 会在主页报告外部/未知 TC 冲突，普通 cron 和限速操作仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
-- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次。运行期间若 root qdisc 再次被其他程序覆盖，需要用户再次手动恢复；建议关闭其他 TC 管理服务。
+- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次，只会在 root qdisc 为空闲/默认状态时恢复已有 Dog/NTC 规则；遇到外部或未知 root qdisc 会拒绝自动删除，须从主菜单 `9` 明确确认。运行期间若再次被其他程序覆盖，也需要用户手动恢复；建议关闭其他 TC 管理服务。

@@ -34,6 +34,7 @@ trap '
 
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
+    -e "s#^readonly EXPIRY_LOCK_FILE=.*#readonly EXPIRY_LOCK_FILE=\"$TEST_DIR/expiry.lock\"#" \
     -e "s#^readonly TC_SHARED_LOCK_FILE=.*#readonly TC_SHARED_LOCK_FILE=\"$TEST_DIR/traffic-tools-tc.lock\"#" \
     -e "s#^readonly TRAFFICCOP_TC_STATE_FILE=.*#readonly TRAFFICCOP_TC_STATE_FILE=\"$TEST_DIR/trafficcop-tc.state\"#" \
     -e '$d' \
@@ -62,6 +63,105 @@ init_nftables
 add_nftables_rules 3265
 apply_nftables_quota 3265 1GB
 [ "$(get_nftables_quota_limit_bytes 3265)" -eq 1073741824 ]
+
+# 服务到期独立于配额重置：未来可用，到期日 TCP/UDP 均封锁，延期/取消立即解锁。
+original_get_current_date=$(declare -f get_current_date)
+get_current_date() { echo "2026-03-01"; }
+update_config_file '.ports["3265"].expiry_date = "2026-03-02"'
+sync_port_expiry_state 3265
+[ "$(count_port_expiry_rules 3265)" -eq 0 ]
+
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 3265))
+s.listen(1)
+s.settimeout(2)
+c, _ = s.accept()
+c.close()
+' &
+future_tcp_server=$!
+sleep 0.2
+python3 -c 'import socket; socket.create_connection(("127.0.0.1", 3265), 1).close()'
+wait "$future_tcp_server"
+
+python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 3265))
+s.settimeout(2)
+data, _ = s.recvfrom(16)
+raise SystemExit(0 if data == b"future" else 1)
+' &
+future_udp_server=$!
+sleep 0.2
+python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"future", ("127.0.0.1", 3265)); s.close()'
+wait "$future_udp_server"
+
+get_current_date() { echo "2026-03-02"; }
+sync_port_expiry_state 3265
+port_expiry_rule_layout_complete 3265
+[ "$(count_port_expiry_rules 3265)" -eq 8 ]
+
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 3265))
+s.listen(1)
+s.settimeout(1)
+try:
+    s.accept()
+except TimeoutError:
+    raise SystemExit(0)
+raise SystemExit(1)
+' &
+expired_tcp_server=$!
+sleep 0.2
+python3 -c '
+import socket
+try:
+    socket.create_connection(("127.0.0.1", 3265), .5).close()
+except OSError:
+    raise SystemExit(0)
+raise SystemExit(1)
+'
+wait "$expired_tcp_server"
+
+python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 3265))
+s.settimeout(1)
+try:
+    s.recvfrom(16)
+except TimeoutError:
+    raise SystemExit(0)
+raise SystemExit(1)
+' &
+expired_udp_server=$!
+sleep 0.2
+python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"expired", ("127.0.0.1", 3265)); s.close()'
+wait "$expired_udp_server"
+
+update_config_file '.ports["3265"].expiry_date = "2026-03-03"'
+sync_port_expiry_state 3265
+[ "$(count_port_expiry_rules 3265)" -eq 0 ]
+update_config_file 'del(.ports["3265"].expiry_date)'
+sync_port_expiry_state 3265
+[ "$(count_port_expiry_rules 3265)" -eq 0 ]
+
+# 模拟重启后 nftables 表丢失，独立到期检查必须重建全部封锁规则。
+update_config_file '.ports["3265"].expiry_date = "2026-03-02"'
+nft delete table inet port_traffic_monitor
+check_port_expirations
+port_expiry_rule_layout_complete 3265
+update_config_file 'del(.ports["3265"].expiry_date)'
+sync_port_expiry_state 3265
+eval "$original_get_current_date"
+add_nftables_rules 3265
+apply_nftables_quota 3265 1GB
 
 # Correct rule counts must not hide a quota object with the wrong runtime limit.
 apply_nftables_quota 3265 2GB

@@ -7,8 +7,10 @@ readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SCRIPT_FILE="$PROJECT_DIR/port-traffic-dog.sh"
 readonly TEST_CONFIG_DIR="$TEST_DIR/config"
 readonly TEST_INSTALL_PATH="$TEST_DIR/bin/port-traffic-dog.sh"
+readonly TEST_IP_GUARD_SERVICE_FILE="$TEST_DIR/systemd/port-traffic-dog-ip-guard.service"
 readonly PAYLOAD_ROOT="$TEST_DIR/payload"
 readonly DOWNLOAD_COUNT_FILE="$TEST_DIR/download-count"
+readonly SYSTEMCTL_LOG="$TEST_DIR/systemctl.log"
 export PTD_UPDATE_TEST_MARKER="$TEST_DIR/finalized"
 
 cleanup() {
@@ -27,8 +29,16 @@ jq -n '{
 
 source <(sed \
     -e 's/^readonly SCRIPT_VERSION=.*/readonly SCRIPT_VERSION="1.5.9"/' \
+    -e "s#^readonly SCRIPT_PATH=.*#readonly SCRIPT_PATH=\"$SCRIPT_FILE\"#" \
     -e "s#^readonly INSTALLED_SCRIPT_PATH=.*#readonly INSTALLED_SCRIPT_PATH=\"$TEST_INSTALL_PATH\"#" \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_CONFIG_DIR\"#" \
+    -e "s#^readonly CONFIG_LOCK_DIR=.*#readonly CONFIG_LOCK_DIR=\"$TEST_DIR/config.lock\"#" \
+    -e "s#^readonly TRAFFIC_STATS_LOCK_DIR=.*#readonly TRAFFIC_STATS_LOCK_DIR=\"$TEST_DIR/traffic-stats.lock\"#" \
+    -e "s#^readonly CRON_LOCK_DIR=.*#readonly CRON_LOCK_DIR=\"$TEST_DIR/cron.lock\"#" \
+    -e "s#^readonly RESET_LOCK_DIR=.*#readonly RESET_LOCK_DIR=\"$TEST_DIR/reset.lock\"#" \
+    -e "s#^readonly EXPIRY_LOCK_FILE=.*#readonly EXPIRY_LOCK_FILE=\"$TEST_DIR/expiry.lock\"#" \
+    -e "s#^readonly IP_GUARD_SERVICE_FILE=.*#readonly IP_GUARD_SERVICE_FILE=\"$TEST_IP_GUARD_SERVICE_FILE\"#" \
+    -e 's#^readonly IP_GUARD_SYSTEMCTL=.*#readonly IP_GUARD_SYSTEMCTL="mock_systemctl"#' \
     -e "s#^readonly SHORTCUT_COMMAND=.*#readonly SHORTCUT_COMMAND=\"ptd-update-test-$BASHPID\"#" \
     -e '$d' \
     "$SCRIPT_FILE")
@@ -52,6 +62,19 @@ esac
 EOF
     printf '%s\n' '#!/bin/bash' 'telegram_fixture() { :; }' > "$PAYLOAD_ROOT/telegram.sh"
     printf '%s\n' '#!/bin/bash' 'wecom_fixture() { :; }' > "$PAYLOAD_ROOT/wecom.sh"
+    cat > "$PAYLOAD_ROOT/port-ip-guard.sh" <<'EOF'
+#!/bin/bash
+# PORT_TRAFFIC_DOG_IP_GUARD
+if [ "${1:-}" = "--self-check" ] && [ -n "${PTD_GUARD_SELF_CHECK_COUNTER:-}" ]; then
+    count=0
+    [ -f "$PTD_GUARD_SELF_CHECK_COUNTER" ] && count=$(cat "$PTD_GUARD_SELF_CHECK_COUNTER")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$PTD_GUARD_SELF_CHECK_COUNTER"
+    [ "$count" -ge 2 ]
+    exit $?
+fi
+exit 0
+EOF
 }
 
 printf '%s\n' '#!/bin/bash' 'exit 0' > "$TEST_INSTALL_PATH"
@@ -74,6 +97,13 @@ download_with_sources() {
 unzip() {
     cp -a "$PAYLOAD_ROOT" "$PWD/port-traffic-dog-main"
 }
+mock_systemctl() {
+    printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+    if [ "${1:-}" = "show" ]; then
+        printf '%s\n' "active"
+    fi
+    return 0
+}
 
 create_payload 1.5.12
 : > "$DOWNLOAD_COUNT_FILE"
@@ -83,6 +113,7 @@ install_update_script false > "$TEST_DIR/update.out"
 [ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.12" ]
 cmp -s "$PAYLOAD_ROOT/telegram.sh" "$TEST_CONFIG_DIR/notifications/telegram.sh"
 cmp -s "$PAYLOAD_ROOT/wecom.sh" "$TEST_CONFIG_DIR/notifications/wecom.sh"
+cmp -s "$PAYLOAD_ROOT/port-ip-guard.sh" "$TEST_CONFIG_DIR/port-ip-guard.sh"
 grep -Fq '版本: v1.5.9 -> v1.5.12' "$TEST_DIR/update.out"
 
 create_payload 1.5.8
@@ -94,5 +125,17 @@ fi
 [ "$(cat "$DOWNLOAD_COUNT_FILE")" -eq 1 ]
 [ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.12" ]
 grep -Fq '已拒绝降级' "$TEST_DIR/downgrade.out"
+
+# 独立组件服务正在运行时，替换脚本后必须重启并核验，不能留下旧进程继续运行。
+mkdir -p "$(dirname "$TEST_IP_GUARD_SERVICE_FILE")"
+: > "$TEST_IP_GUARD_SERVICE_FILE"
+: > "$SYSTEMCTL_LOG"
+export PTD_GUARD_SELF_CHECK_COUNTER="$TEST_DIR/guard-self-check-count"
+create_payload 1.5.14
+install_update_script false > "$TEST_DIR/active-guard-update.out"
+[ "$(bash "$TEST_INSTALL_PATH" --version)" = "端口流量狗 v1.5.14" ]
+grep -Fq "restart $IP_GUARD_SERVICE" "$SYSTEMCTL_LOG"
+grep -Fq "is-active --quiet $IP_GUARD_SERVICE" "$SYSTEMCTL_LOG"
+[ "$(cat "$PTD_GUARD_SELF_CHECK_COUNTER")" -eq 2 ]
 
 echo "update install integration test passed"
