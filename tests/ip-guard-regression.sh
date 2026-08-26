@@ -66,22 +66,88 @@ cp "$OWNER_TABLES_JSON" "$OWNER_TABLE_JSON"
     ADMITTED=()
     FIRST_SEEN=()
     SEQUENCE=0
-    sync_admitted_sets() { :; }
+    SYNC_CALLS=()
+    sync_admitted_sets() { SYNC_CALLS+=("$*"); }
     process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265'
     process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.2 dst=192.0.2.10 sport=40002 dport=3265'
     process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265'
     process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.3 dst=192.0.2.10 sport=40003 dport=3265'
+    [ "${#SYNC_CALLS[@]}" -eq 2 ]
+    [ "${SYNC_CALLS[0]}" = "3265" ]
+    [ "${SYNC_CALLS[1]}" = "3265" ]
     [ -n "${ADMITTED[3265|198.51.100.1]:-}" ]
     [ -n "${ADMITTED[3265|198.51.100.2]:-}" ]
     [ -z "${ADMITTED[3265|198.51.100.3]:-}" ]
     [ "${ACTIVE_COUNT[3265|198.51.100.1]}" -eq 2 ]
     process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265'
+    [ "${#SYNC_CALLS[@]}" -eq 2 ]
     [ "${ACTIVE_COUNT[3265|198.51.100.1]}" -eq 1 ]
     [ -n "${ADMITTED[3265|198.51.100.1]:-}" ]
     process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265'
+    [ "${#SYNC_CALLS[@]}" -eq 3 ]
+    [ "${SYNC_CALLS[2]}" = "3265" ]
     [ -z "${ADMITTED[3265|198.51.100.1]:-}" ]
     [ -n "${ADMITTED[3265|198.51.100.2]:-}" ]
     [ -n "${ADMITTED[3265|198.51.100.3]:-}" ]
+)
+
+# 增量同步只刷新发生变化的端口，不得清空其他端口的准入集合。
+SYNC_BATCH_CAPTURE="$TEST_DIR/sync-batch.capture"
+(
+    POLICY_LIMIT=([3265]=2 [8080]=3)
+    declare -A ADMITTED=()
+    ADMITTED["3265|198.51.100.1"]=1
+    ADMITTED["8080|198.51.100.8"]=1
+    mkdir -p "$CONFIG_DIR"
+    require_owned_table() { :; }
+    apply_nft_batch() { cp "$1" "$SYNC_BATCH_CAPTURE"; }
+    sync_admitted_sets 3265
+)
+grep -Fq "flush set inet $TABLE_NAME p3265_v4" "$SYNC_BATCH_CAPTURE"
+grep -Fq "198.51.100.1" "$SYNC_BATCH_CAPTURE"
+! grep -Fq "p8080_" "$SYNC_BATCH_CAPTURE"
+! grep -Fq "198.51.100.8" "$SYNC_BATCH_CAPTURE"
+
+# 空快照或名单完全未变化也必须被视为成功，且不得触发 nftables 写入。
+(
+    POLICY_LIMIT=([3265]=2)
+    ACTIVE_COUNT=()
+    ADMITTED=()
+    FIRST_SEEN=()
+    recalculate_all_admission
+    [ "${#ADMISSION_CHANGED_PORTS[@]}" -eq 0 ]
+    sync_admitted_sets() { return 1; }
+    sync_changed_admitted_sets
+)
+
+# conntrack 监听必须在全量快照开始前真正启动，避免启动期间丢失 NEW/DESTROY。
+LISTENER_STARTED="$TEST_DIR/listener.started"
+LISTENER_EVENT_PROCESSED="$TEST_DIR/listener.processed"
+(
+    POLICY_LIMIT=([3265]=2)
+    check_dependencies() { :; }
+    init_config() { :; }
+    load_policies() { :; }
+    require_current_ssh_confirmation() { :; }
+    flock() { :; }
+    conntrack() {
+        touch "$LISTENER_STARTED"
+        printf '%s\n' '[NEW] tcp 6 120 SYN_SENT src=198.51.100.9 dst=192.0.2.10 sport=40999 dport=3265'
+        sleep 2
+    }
+    load_conntrack_snapshot() {
+        local attempt
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            [ -f "$LISTENER_STARTED" ] && return 0
+            sleep 0.1
+        done
+        return 1
+    }
+    rebuild_firewall() { :; }
+    process_conntrack_event() { touch "$LISTENER_EVENT_PROCESSED"; }
+    fail_open_firewall() { :; }
+    ! run_daemon >/dev/null 2>&1
+    [ -f "$LISTENER_EVENT_PROCESSED" ]
 )
 MOCK_LOAD_STATE="loaded"
 MOCK_ACTIVE_STATE="active"
