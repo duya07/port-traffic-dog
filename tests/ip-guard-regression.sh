@@ -21,6 +21,17 @@ export PTD_IP_GUARD_SCRIPT_PATH="$TEST_DIR/config/port-ip-guard.sh"
 export PTD_IP_GUARD_SYSTEMCTL="mock_systemctl"
 
 source "$SCRIPT_FILE"
+
+# 当前实验功能只保护本机 INPUT；不得对无法可靠识别来源的 FORWARD/DNAT 流量下发 drop。
+(
+    POLICY_LIMIT=([3265]=2)
+    ADMITTED=()
+    render_ruleset false > "$TEST_DIR/rendered-rules.nft"
+)
+grep -Fq 'hook input' "$TEST_DIR/rendered-rules.nft"
+! grep -Fq 'guard_forward' "$TEST_DIR/rendered-rules.nft"
+! grep -Fq 'hook forward' "$TEST_DIR/rendered-rules.nft"
+
 # nftables 1.0.x 的 JSON 可能省略表 comment；只接受表顶层精确所有权标记。
 OWNER_TABLES_JSON="$TEST_DIR/owner-tables.json"
 OWNER_TABLE_JSON="$TEST_DIR/owner-table.json"
@@ -61,6 +72,7 @@ cp "$OWNER_TABLES_JSON" "$OWNER_TABLE_JSON"
 # conntrack 事件按来源 IP 去重；较早来源释放后，下一个等待来源自动准入。
 (
     POLICY_LIMIT=([3265]=2)
+    LOCAL_ADDRESSES=([192.0.2.10]=1)
     FLOW_SOURCE=()
     ACTIVE_COUNT=()
     ADMITTED=()
@@ -68,10 +80,12 @@ cp "$OWNER_TABLES_JSON" "$OWNER_TABLE_JSON"
     SEQUENCE=0
     SYNC_CALLS=()
     sync_admitted_sets() { SYNC_CALLS+=("$*"); }
-    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265'
-    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.2 dst=192.0.2.10 sport=40002 dport=3265'
-    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265'
-    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.3 dst=192.0.2.10 sport=40003 dport=3265'
+    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=192.0.2.10 dst=203.0.113.20 sport=45000 dport=3265 [UNREPLIED] src=203.0.113.20 dst=192.0.2.10 sport=3265 dport=45000'
+    [ "${#ACTIVE_COUNT[@]}" -eq 0 ]
+    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265 [UNREPLIED] src=192.0.2.10 dst=198.51.100.1 sport=3265 dport=40001'
+    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.2 dst=192.0.2.10 sport=40002 dport=3265 [UNREPLIED] src=192.0.2.10 dst=198.51.100.2 sport=3265 dport=40002'
+    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265 [UNREPLIED] src=192.0.2.10 dst=198.51.100.1 sport=3265 dport=41001'
+    process_conntrack_event '[NEW] tcp 6 120 SYN_SENT src=198.51.100.3 dst=192.0.2.10 sport=40003 dport=3265 [UNREPLIED] src=192.0.2.10 dst=198.51.100.3 sport=3265 dport=40003'
     [ "${#SYNC_CALLS[@]}" -eq 2 ]
     [ "${SYNC_CALLS[0]}" = "3265" ]
     [ "${SYNC_CALLS[1]}" = "3265" ]
@@ -79,16 +93,35 @@ cp "$OWNER_TABLES_JSON" "$OWNER_TABLE_JSON"
     [ -n "${ADMITTED[3265|198.51.100.2]:-}" ]
     [ -z "${ADMITTED[3265|198.51.100.3]:-}" ]
     [ "${ACTIVE_COUNT[3265|198.51.100.1]}" -eq 2 ]
-    process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265'
+    process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=40001 dport=3265 src=192.0.2.10 dst=198.51.100.1 sport=3265 dport=40001'
     [ "${#SYNC_CALLS[@]}" -eq 2 ]
     [ "${ACTIVE_COUNT[3265|198.51.100.1]}" -eq 1 ]
     [ -n "${ADMITTED[3265|198.51.100.1]:-}" ]
-    process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265'
+    process_conntrack_event '[DESTROY] tcp 6 0 src=198.51.100.1 dst=192.0.2.10 sport=41001 dport=3265 src=192.0.2.10 dst=198.51.100.1 sport=3265 dport=41001'
     [ "${#SYNC_CALLS[@]}" -eq 3 ]
     [ "${SYNC_CALLS[2]}" = "3265" ]
     [ -z "${ADMITTED[3265|198.51.100.1]:-}" ]
     [ -n "${ADMITTED[3265|198.51.100.2]:-}" ]
     [ -n "${ADMITTED[3265|198.51.100.3]:-}" ]
+)
+
+# 本机地址必须来自 iproute2 的当前接口快照；读取失败时清空旧集合并中止本轮识别。
+(
+    LOCAL_ADDRESSES=([203.0.113.99]=1)
+    ip() {
+        printf '%s\n' \
+            '1: lo    inet 127.0.0.1/8 scope host lo' \
+            '1: lo    inet6 ::1/128 scope host' \
+            '2: eth0  inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0'
+    }
+    load_local_addresses
+    [ -n "${LOCAL_ADDRESSES[127.0.0.1]:-}" ]
+    [ -n "${LOCAL_ADDRESSES[::1]:-}" ]
+    [ -n "${LOCAL_ADDRESSES[192.0.2.10]:-}" ]
+    [ -z "${LOCAL_ADDRESSES[203.0.113.99]:-}" ]
+    ip() { return 1; }
+    ! load_local_addresses
+    [ "${#LOCAL_ADDRESSES[@]}" -eq 0 ]
 )
 
 # 增量同步只刷新发生变化的端口，不得清空其他端口的准入集合。
@@ -249,15 +282,11 @@ jq -n '
         nftables: [
             {metainfo:{version:"1.0.6"}},
             {chain:{name:"guard_input",type:"filter",hook:"input",prio:-20,policy:"accept"}},
-            {chain:{name:"guard_forward",type:"filter",hook:"forward",prio:-20,policy:"accept"}},
             {set:{name:"p3265_v4",type:"ipv4_addr"}},
             {set:{name:"p3265_v6",type:"ipv6_addr"}},
             allow("guard_input";"ptd_ip_guard_3265_v4_allow";"ip";"p3265_v4"),
             allow("guard_input";"ptd_ip_guard_3265_v6_allow";"ip6";"p3265_v6"),
-            block("guard_input"),
-            allow("guard_forward";"ptd_ip_guard_3265_v4_allow";"ip";"p3265_v4"),
-            allow("guard_forward";"ptd_ip_guard_3265_v6_allow";"ip6";"p3265_v6"),
-            block("guard_forward")
+            block("guard_input")
         ]
     }
 ' > "$SELF_CHECK_FIXTURE"

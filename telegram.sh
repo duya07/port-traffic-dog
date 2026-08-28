@@ -57,12 +57,13 @@ get_telegram_api_base() {
     local custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
     custom_base=$(normalize_telegram_api_base "$custom_base")
 
-    if [ "$route" = "custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ] &&
-       telegram_api_base_is_secure "$custom_base"; then
-        echo "$custom_base"
-    else
+    if [ "$route" = "official" ]; then
         echo "https://api.telegram.org"
+        return 0
     fi
+    [ -n "$custom_base" ] && [ "$custom_base" != "null" ] &&
+        telegram_api_base_is_secure "$custom_base" || return 1
+    echo "$custom_base"
 }
 
 build_telegram_send_url() {
@@ -156,13 +157,18 @@ send_telegram_message() {
 
     local bot_token=$(jq -r '.notifications.telegram.bot_token // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
     local chat_id=$(jq -r '.notifications.telegram.chat_id // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
-    local api_base=$(get_telegram_api_base)
-    local send_url=$(build_telegram_send_url "$api_base" "$bot_token")
-
     if [ -z "$bot_token" ] || [ -z "$chat_id" ]; then
         log_notification "Telegram配置不完整"
         return 1
     fi
+
+    local api_base
+    if ! api_base=$(get_telegram_api_base); then
+        log_notification "Telegram自定义线路无效，已拒绝发送"
+        return 1
+    fi
+    local send_url
+    send_url=$(build_telegram_send_url "$api_base" "$bot_token")
 
     local route=$(get_telegram_api_route)
     local send_url_preview
@@ -538,6 +544,11 @@ telegram_switch_api_route() {
             normalized_custom=$(normalize_telegram_api_base "$input_custom")
             if [[ ! "$normalized_custom" =~ ^https?:// ]]; then
                 echo -e "${RED}地址格式错误，必须以 http:// 或 https:// 开头${NC}"
+                sleep 2
+                return 1
+            fi
+            if ! telegram_api_base_is_secure "$normalized_custom"; then
+                echo -e "${RED}地址不安全：远程线路必须使用 HTTPS，HTTP 仅允许本机回环地址${NC}"
                 sleep 2
                 return 1
             fi

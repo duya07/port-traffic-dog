@@ -30,6 +30,7 @@ declare -A ACTIVE_COUNT=()
 declare -A ADMITTED=()
 declare -A FIRST_SEEN=()
 declare -A ADMISSION_CHANGED_PORTS=()
+declare -A LOCAL_ADDRESSES=()
 SEQUENCE=0
 ADMISSION_CHANGED=false
 PARSED_EVENT=""
@@ -37,6 +38,10 @@ PARSED_SOURCE=""
 PARSED_DESTINATION=""
 PARSED_SPORT=""
 PARSED_DPORT=""
+PARSED_REPLY_SOURCE=""
+PARSED_REPLY_DESTINATION=""
+PARSED_REPLY_SPORT=""
+PARSED_REPLY_DPORT=""
 TABLE_STATE="error"
 DAEMON_LISTENER_PID=""
 DAEMON_EVENT_FIFO=""
@@ -112,11 +117,11 @@ validate_runtime_settings() {
 check_dependencies() {
     local missing=()
     local command_name
-    for command_name in nft jq conntrack flock; do
+    for command_name in nft jq conntrack flock ip; do
         command_exists "$command_name" || missing+=("$command_name")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "缺少依赖: ${missing[*]}（Debian/Ubuntu 可安装 nftables jq conntrack）" >&2
+        echo "缺少依赖: ${missing[*]}（Debian/Ubuntu 可安装 nftables jq conntrack iproute2）" >&2
         return 1
     fi
 }
@@ -383,7 +388,6 @@ render_ruleset() {
     # create 会在同名表于检查后被其他程序建立时失败，不会接管未知表。
     printf 'create table inet %s { comment "%s"; }\n' "$TABLE_NAME" "$TABLE_OWNER_MARKER"
     printf 'add chain inet %s guard_input { type filter hook input priority -20; policy accept; }\n' "$TABLE_NAME"
-    printf 'add chain inet %s guard_forward { type filter hook forward priority -20; policy accept; }\n' "$TABLE_NAME"
 
     for port in $(printf '%s\n' "${!POLICY_LIMIT[@]}" | sort -n); do
         printf 'add set inet %s %s { type ipv4_addr; }\n' "$TABLE_NAME" "$(set_name_v4 "$port")"
@@ -406,12 +410,6 @@ render_ruleset() {
         printf 'add rule inet %s guard_input ip6 saddr @%s tcp dport %s accept comment "ptd_ip_guard_%s_v6_allow"\n' \
             "$TABLE_NAME" "$(set_name_v6 "$port")" "$port" "$port"
         printf 'add rule inet %s guard_input tcp dport %s drop comment "ptd_ip_guard_%s_drop"\n' \
-            "$TABLE_NAME" "$port" "$port"
-        printf 'add rule inet %s guard_forward ip saddr @%s tcp dport %s accept comment "ptd_ip_guard_%s_v4_allow"\n' \
-            "$TABLE_NAME" "$(set_name_v4 "$port")" "$port" "$port"
-        printf 'add rule inet %s guard_forward ip6 saddr @%s tcp dport %s accept comment "ptd_ip_guard_%s_v6_allow"\n' \
-            "$TABLE_NAME" "$(set_name_v6 "$port")" "$port" "$port"
-        printf 'add rule inet %s guard_forward tcp dport %s drop comment "ptd_ip_guard_%s_drop"\n' \
             "$TABLE_NAME" "$port" "$port"
     done
 }
@@ -499,19 +497,75 @@ parse_conntrack_line() {
     PARSED_DESTINATION=""
     PARSED_SPORT=""
     PARSED_DPORT=""
+    PARSED_REPLY_SOURCE=""
+    PARSED_REPLY_DESTINATION=""
+    PARSED_REPLY_SPORT=""
+    PARSED_REPLY_DPORT=""
     read -r -a tokens <<< "$line"
     for token in "${tokens[@]}"; do
         case "$token" in
             '[NEW]') PARSED_EVENT="NEW" ;;
             '[DESTROY]') PARSED_EVENT="DESTROY" ;;
-            src=*) [ -z "$PARSED_SOURCE" ] && PARSED_SOURCE=${token#src=} ;;
-            dst=*) [ -z "$PARSED_DESTINATION" ] && PARSED_DESTINATION=${token#dst=} ;;
-            sport=*) [ -z "$PARSED_SPORT" ] && PARSED_SPORT=${token#sport=} ;;
-            dport=*) [ -z "$PARSED_DPORT" ] && PARSED_DPORT=${token#dport=} ;;
+            src=*)
+                if [ -z "$PARSED_SOURCE" ]; then
+                    PARSED_SOURCE=${token#src=}
+                elif [ -z "$PARSED_REPLY_SOURCE" ]; then
+                    PARSED_REPLY_SOURCE=${token#src=}
+                fi
+                ;;
+            dst=*)
+                if [ -z "$PARSED_DESTINATION" ]; then
+                    PARSED_DESTINATION=${token#dst=}
+                elif [ -z "$PARSED_REPLY_DESTINATION" ]; then
+                    PARSED_REPLY_DESTINATION=${token#dst=}
+                fi
+                ;;
+            sport=*)
+                if [ -z "$PARSED_SPORT" ]; then
+                    PARSED_SPORT=${token#sport=}
+                elif [ -z "$PARSED_REPLY_SPORT" ]; then
+                    PARSED_REPLY_SPORT=${token#sport=}
+                fi
+                ;;
+            dport=*)
+                if [ -z "$PARSED_DPORT" ]; then
+                    PARSED_DPORT=${token#dport=}
+                elif [ -z "$PARSED_REPLY_DPORT" ]; then
+                    PARSED_REPLY_DPORT=${token#dport=}
+                fi
+                ;;
         esac
     done
     validate_address_token "$PARSED_SOURCE" && validate_address_token "$PARSED_DESTINATION" &&
-        validate_port "$PARSED_SPORT" && validate_port "$PARSED_DPORT"
+        validate_port "$PARSED_SPORT" && validate_port "$PARSED_DPORT" &&
+        validate_address_token "$PARSED_REPLY_SOURCE" &&
+        validate_address_token "$PARSED_REPLY_DESTINATION" &&
+        validate_port "$PARSED_REPLY_SPORT" && validate_port "$PARSED_REPLY_DPORT"
+}
+
+load_local_addresses() {
+    local address_output index interface_name family address remainder
+
+    LOCAL_ADDRESSES=()
+    address_output=$(ip -o address show 2>/dev/null) || return 1
+    while read -r index interface_name family address remainder; do
+        case "$family" in
+            inet|inet6) ;;
+            *) continue ;;
+        esac
+        address=${address%/*}
+        validate_address_token "$address" || continue
+        LOCAL_ADDRESSES["$address"]=1
+    done <<< "$address_output"
+    [ "${#LOCAL_ADDRESSES[@]}" -gt 0 ]
+}
+
+parsed_inbound_policy_port() {
+    local policy_port="$PARSED_REPLY_SPORT"
+
+    [ -n "${POLICY_LIMIT[$policy_port]:-}" ] || return 1
+    [ -n "${LOCAL_ADDRESSES[$PARSED_REPLY_SOURCE]:-}" ] || return 1
+    printf '%s\n' "$policy_port"
 }
 
 flow_key_from_parsed() {
@@ -596,6 +650,7 @@ sync_changed_admitted_sets() {
 
 load_conntrack_snapshot() {
     local snapshot_file
+    load_local_addresses || return 1
     snapshot_file=$(mktemp "$CONFIG_DIR/.ip-guard-conntrack.XXXXXX") || return 1
     if ! conntrack -L -p tcp -o extended > "$snapshot_file" 2>/dev/null; then
         rm -f "$snapshot_file"
@@ -603,12 +658,12 @@ load_conntrack_snapshot() {
     fi
     FLOW_SOURCE=()
     ACTIVE_COUNT=()
-    local line flow_key active_key
+    local line flow_key active_key policy_port
     while IFS= read -r line; do
         parse_conntrack_line "$line" || continue
-        [ -n "${POLICY_LIMIT[$PARSED_DPORT]:-}" ] || continue
+        policy_port=$(parsed_inbound_policy_port) || continue
         flow_key=$(flow_key_from_parsed)
-        active_key="$PARSED_DPORT|$PARSED_SOURCE"
+        active_key="$policy_port|$PARSED_SOURCE"
         record_flow "$flow_key" "$active_key"
     done < "$snapshot_file"
     rm -f "$snapshot_file"
@@ -622,9 +677,10 @@ load_conntrack_snapshot() {
 process_conntrack_event() {
     local line="$1"
     parse_conntrack_line "$line" || return 0
-    [ -n "${POLICY_LIMIT[$PARSED_DPORT]:-}" ] || return 0
+    local policy_port
+    policy_port=$(parsed_inbound_policy_port) || return 0
     local flow_key
-    local active_key="$PARSED_DPORT|$PARSED_SOURCE"
+    local active_key="$policy_port|$PARSED_SOURCE"
     flow_key=$(flow_key_from_parsed)
     case "$PARSED_EVENT" in
         NEW)
@@ -635,9 +691,9 @@ process_conntrack_event() {
             ;;
         *) return 0 ;;
     esac
-    recalculate_port_admission "$PARSED_DPORT"
+    recalculate_port_admission "$policy_port"
     [ "$ADMISSION_CHANGED" = "true" ] || return 0
-    sync_admitted_sets "$PARSED_DPORT"
+    sync_admitted_sets "$policy_port"
 }
 
 current_ssh_server_port() {
@@ -941,7 +997,8 @@ show_status() {
     init_config
     load_policies
     echo -e "${BLUE}=== 同时在线来源 IP 上限（测试中） ===${NC}"
-    echo "口径: TCP conntrack 活跃来源 IP；IPv4/IPv6 合并计数。"
+    echo "口径: 本机 TCP 服务的 conntrack 活跃来源 IP；IPv4/IPv6 合并计数。"
+    echo "范围: 仅保护本机 INPUT，不处理内核 FORWARD/DNAT 流量。"
     echo "未知来源先丢弃首个 SYN，准入后由 TCP 重传建立连接。"
     echo
     if [ ${#POLICY_LIMIT[@]} -eq 0 ]; then
@@ -1010,10 +1067,7 @@ nft_port_contract_valid() {
             any(.nftables[]; .set? | .name == $set_v6 and .type == "ipv6_addr") and
             allow_rule("guard_input"; ("ptd_ip_guard_" + ($port | tostring) + "_v4_allow"); "ip"; $set_v4) and
             allow_rule("guard_input"; ("ptd_ip_guard_" + ($port | tostring) + "_v6_allow"); "ip6"; $set_v6) and
-            drop_rule("guard_input"; ("ptd_ip_guard_" + ($port | tostring) + "_drop")) and
-            allow_rule("guard_forward"; ("ptd_ip_guard_" + ($port | tostring) + "_v4_allow"); "ip"; $set_v4) and
-            allow_rule("guard_forward"; ("ptd_ip_guard_" + ($port | tostring) + "_v6_allow"); "ip6"; $set_v6) and
-            drop_rule("guard_forward"; ("ptd_ip_guard_" + ($port | tostring) + "_drop"))
+            drop_rule("guard_input"; ("ptd_ip_guard_" + ($port | tostring) + "_drop"))
         ' >/dev/null
 }
 
@@ -1039,15 +1093,12 @@ self_check() {
         return 1
     }
     printf '%s' "$table_json" |
-        jq -e --argjson expected_rules "$(( ${#POLICY_LIMIT[@]} * 6 ))" \
+        jq -e --argjson expected_rules "$(( ${#POLICY_LIMIT[@]} * 3 ))" \
             --argjson expected_sets "$(( ${#POLICY_LIMIT[@]} * 2 ))" '
-            ([.nftables[] | .chain? // empty] | length) == 2 and
+            ([.nftables[] | .chain? // empty] | length) == 1 and
             any(.nftables[]; .chain? |
                 .name == "guard_input" and .type == "filter" and
                 .hook == "input" and .prio == -20 and .policy == "accept") and
-            any(.nftables[]; .chain? |
-                .name == "guard_forward" and .type == "filter" and
-                .hook == "forward" and .prio == -20 and .policy == "accept") and
             ([.nftables[] | .set? // empty] | length) == $expected_sets and
             ([.nftables[] | .rule? // empty] | length) == $expected_rules
         ' >/dev/null || {
