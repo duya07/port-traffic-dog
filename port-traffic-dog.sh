@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.15"
+readonly SCRIPT_VERSION="1.5.16"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -22,6 +22,7 @@ readonly CRON_LOCK_DIR="${PORT_TRAFFIC_DOG_CRON_LOCK_DIR:-/run/lock/port-traffic
 readonly EXPIRY_LOCK_FILE="${PORT_TRAFFIC_DOG_EXPIRY_LOCK_FILE:-/run/lock/port-traffic-dog-expiry.lock}"
 readonly TC_SHARED_LOCK_FILE="${TRAFFIC_TOOLS_TC_LOCK_FILE:-/run/lock/traffic-tools-tc.lock}"
 readonly TRAFFICCOP_TC_STATE_FILE="${TRAFFICCOP_TC_STATE_FILE:-/etc/trafficcop-lite/tc_limit_state}"
+readonly TRAFFICCOP_CONFIG_FILE="${TRAFFICCOP_CONFIG_FILE:-/etc/trafficcop-lite/traffic_monitor_config.txt}"
 readonly TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
 readonly TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
 readonly TC_RECOVERY_SERVICE="traffic-tools-tc-recovery.service"
@@ -49,6 +50,7 @@ readonly SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traffic-dog/m
 readonly IP_GUARD_SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-ip-guard.sh"
 readonly MODULES_ARCHIVE_URL="https://github.com/duya07/port-traffic-dog/archive/refs/heads/main.zip"
 readonly SHORTCUT_COMMAND="dog"
+readonly SHORTCUT_PATH="${PORT_TRAFFIC_DOG_SHORTCUT_PATH:-/usr/local/bin/$SHORTCUT_COMMAND}"
 
 get_script_exec_path() {
     if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
@@ -150,13 +152,15 @@ check_dependencies() {
 }
 
 setup_script_permissions() {
+    local result=0
     if [ -f "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+        chmod +x "$SCRIPT_PATH" 2>/dev/null || result=1
     fi
 
     if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || result=1
     fi
+    return "$result"
 }
 
 read_current_crontab() {
@@ -912,28 +916,39 @@ get_expected_quota_rule_count() {
 }
 
 get_nftables_counter_data() {
-    local port=$1
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local input_bytes=0
-    local output_bytes=0
+    local port="$1"
+    local table_name family prefix input_output output_output input_bytes output_bytes
 
-    if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
-        input_bytes=$(nft list counter $family $table_name "port_${port_safe}_in" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
-        output_bytes=$(nft list counter $family $table_name "port_${port_safe}_out" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
-    else
-        input_bytes=$(nft list counter $family $table_name "port_${port}_in" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
-        output_bytes=$(nft list counter $family $table_name "port_${port}_out" 2>/dev/null | \
-            grep -o 'bytes [0-9]*' | awk '{print $2}' || true)
-    fi
+    table_name=$(jq -er '.nftables.table_name | select(type == "string" and length > 0)' "$CONFIG_FILE" 2>/dev/null) || return 1
+    family=$(jq -er '.nftables.family | select(type == "string" and length > 0)' "$CONFIG_FILE" 2>/dev/null) || return 1
+    prefix=$(get_port_counter_prefix "$port") || return 1
+    input_output=$(nft list counter "$family" "$table_name" "${prefix}_in" 2>/dev/null) || return 1
+    output_output=$(nft list counter "$family" "$table_name" "${prefix}_out" 2>/dev/null) || return 1
+    input_bytes=$(printf '%s\n' "$input_output" |
+        sed -n 's/.*[[:space:]]bytes \([0-9][0-9]*\).*/\1/p' | head -n1)
+    output_bytes=$(printf '%s\n' "$output_output" |
+        sed -n 's/.*[[:space:]]bytes \([0-9][0-9]*\).*/\1/p' | head -n1)
+    [[ "$input_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$output_bytes" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "$input_bytes" "$output_bytes"
+}
 
-    input_bytes=${input_bytes:-0}
-    output_bytes=${output_bytes:-0}
-    echo "$input_bytes $output_bytes"
+NFT_COUNTER_INPUT=""
+NFT_COUNTER_OUTPUT=""
+
+read_nftables_counter_data() {
+    local port="$1"
+    local counter_data input_bytes output_bytes extra
+
+    NFT_COUNTER_INPUT=""
+    NFT_COUNTER_OUTPUT=""
+    counter_data=$(get_nftables_counter_data "$port") || return 1
+    read -r input_bytes output_bytes extra <<< "$counter_data"
+    [[ "$input_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$output_bytes" =~ ^[0-9]+$ ]] || return 1
+    [ -z "${extra:-}" ] || return 1
+    NFT_COUNTER_INPUT="$input_bytes"
+    NFT_COUNTER_OUTPUT="$output_bytes"
 }
 
 get_nftables_quota_used() {
@@ -1030,14 +1045,17 @@ port_counter_quota_usage_consistent() {
     quota_limit=$(get_quota_limit "$port")
     [ "$quota_limit" != "unlimited" ] || return 0
 
-    local first=()
-    local second=()
+    local first_input first_output second_input second_output
     local quota_used
-    read -r -a first < <(get_nftables_counter_data "$port")
+    read_nftables_counter_data "$port" || return 1
+    first_input="$NFT_COUNTER_INPUT"
+    first_output="$NFT_COUNTER_OUTPUT"
     quota_used=$(get_nftables_quota_used "$port") || return 1
-    read -r -a second < <(get_nftables_counter_data "$port")
-    local first_total=$(( ${first[0]:-0} + ${first[1]:-0} ))
-    local second_total=$(( ${second[0]:-0} + ${second[1]:-0} ))
+    read_nftables_counter_data "$port" || return 1
+    second_input="$NFT_COUNTER_INPUT"
+    second_output="$NFT_COUNTER_OUTPUT"
+    local first_total=$((first_input + first_output))
+    local second_total=$((second_input + second_output))
     local lower_total="$first_total"
     local upper_total="$second_total"
     if [ "$lower_total" -gt "$upper_total" ]; then
@@ -1196,12 +1214,12 @@ save_traffic_data_locked() {
     backup_time=$(get_beijing_time -Iseconds)
 
     for port in "${active_ports[@]}"; do
-        local traffic_data=()
-        read -r -a traffic_data < <(get_nftables_counter_data "$port")
-        local current_input=${traffic_data[0]}
-        local current_output=${traffic_data[1]}
-        [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-        [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+        if ! read_nftables_counter_data "$port"; then
+            rm -f "$entries_file" "$temp_file"
+            return 1
+        fi
+        local current_input="$NFT_COUNTER_INPUT"
+        local current_output="$NFT_COUNTER_OUTPUT"
         jq -cn \
             --arg port "$port" \
             --arg time "$backup_time" \
@@ -1316,9 +1334,8 @@ restore_counter_value() {
     nft add counter "$family" "$table_name" "${prefix}_in" { packets 0 bytes "$target_input" } 2>/dev/null || true
     nft add counter "$family" "$table_name" "${prefix}_out" { packets 0 bytes "$target_output" } 2>/dev/null || true
 
-    local restored_data=()
-    read -r -a restored_data < <(get_nftables_counter_data "$port")
-    [ "${restored_data[0]:--1}" = "$target_input" ] && [ "${restored_data[1]:--1}" = "$target_output" ]
+    read_nftables_counter_data "$port" || return 1
+    [ "$NFT_COUNTER_INPUT" = "$target_input" ] && [ "$NFT_COUNTER_OUTPUT" = "$target_output" ]
 }
 
 restore_all_monitoring_rules() {
@@ -1329,12 +1346,12 @@ restore_port_counters_from_backup() {
     local port="$1"
     acquire_traffic_stats_lock || return 1
 
-    local current_data=()
-    read -r -a current_data < <(get_nftables_counter_data "$port")
-    local target_input=${current_data[0]:-0}
-    local target_output=${current_data[1]:-0}
-    [[ "$target_input" =~ ^[0-9]+$ ]] || target_input=0
-    [[ "$target_output" =~ ^[0-9]+$ ]] || target_output=0
+    if ! read_nftables_counter_data "$port"; then
+        release_traffic_stats_lock
+        return 1
+    fi
+    local target_input="$NFT_COUNTER_INPUT"
+    local target_output="$NFT_COUNTER_OUTPUT"
 
     if [ -f "$TRAFFIC_DATA_FILE" ] && jq -e --arg port "$port" '.[$port] | type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
         local backup_input
@@ -1383,6 +1400,11 @@ port_runtime_rules_complete() {
 }
 
 restore_runtime_state() {
+    local include_tc="${1:-true}"
+    case "$include_tc" in
+        true|false) ;;
+        *) return 2 ;;
+    esac
     validate_config_file "$CONFIG_FILE" >/dev/null || return 1
     init_nftables || return 1
     local convert_legacy_multiplier=false
@@ -1420,7 +1442,8 @@ restore_runtime_state() {
         local rate_limit
         limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
         rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
+        if [ "$include_tc" = "true" ] &&
+           [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
             local tc_limit
             tc_limit=$(convert_bandwidth_to_tc "$rate_limit")
             if [ -n "$tc_limit" ]; then
@@ -1636,12 +1659,14 @@ record_traffic_snapshot() {
 
     exec 3< "$states_file"
     for port in "${active_ports[@]}"; do
-        local traffic_data=()
-        read -r -a traffic_data < <(get_nftables_counter_data "$port")
-        local current_input=${traffic_data[0]:-0}
-        local current_output=${traffic_data[1]:-0}
-        [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-        [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+        if ! read_nftables_counter_data "$port"; then
+            exec 3<&-
+            rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
+            release_traffic_stats_lock
+            return 1
+        fi
+        local current_input="$NFT_COUNTER_INPUT"
+        local current_output="$NFT_COUNTER_OUTPUT"
 
         local snapshot_state
         if ! IFS= read -r snapshot_state <&3; then
@@ -1811,11 +1836,9 @@ update_traffic_snapshot_baseline_locked() {
     [[ "$input_adjustment" =~ ^[0-9]+$ ]] || return 1
     [[ "$output_adjustment" =~ ^[0-9]+$ ]] || return 1
 
-    local traffic_data=($(get_nftables_counter_data "$port"))
-    local current_input=${traffic_data[0]:-0}
-    local current_output=${traffic_data[1]:-0}
-    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+    read_nftables_counter_data "$port" || return 1
+    local current_input="$NFT_COUNTER_INPUT"
+    local current_output="$NFT_COUNTER_OUTPUT"
     local snapshot_date
     snapshot_date=$(get_current_date)
     local snapshot_time
@@ -2965,7 +2988,11 @@ repair_port_traffic_rules() {
         traffic_data=("${usage_snapshot[0]:-0}" "${usage_snapshot[1]:-0}")
         quota_used="${usage_snapshot[2]:--1}"
     else
-        read -r -a traffic_data < <(get_nftables_counter_data "$port")
+        if ! read_nftables_counter_data "$port"; then
+            log_notification "port $port runtime counter snapshot failed"
+            return 1
+        fi
+        traffic_data=("$NFT_COUNTER_INPUT" "$NFT_COUNTER_OUTPUT")
     fi
     local current_input=${traffic_data[0]:-0}
     local current_output=${traffic_data[1]:-0}
@@ -3208,14 +3235,12 @@ get_port_status_label() {
 
     if [ "$quota_enabled" = "true" ]; then
         if [ "$monthly_limit" != "unlimited" ]; then
-            local current_usage=$(get_port_monthly_usage "$port")
+            local current_usage=""
             local limit_bytes
             limit_bytes=$(parse_size_to_bytes "$monthly_limit" 2>/dev/null || echo 0)
             if ! [[ "$limit_bytes" =~ ^[0-9]+$ ]] || [ "$limit_bytes" -le 0 ]; then
                 status_tags+=("[配额配置异常:${monthly_limit}]")
             else
-                local usage_percent=$((current_usage * 100 / limit_bytes))
-
                 local quota_display="$monthly_limit"
                 if [ "$billing_mode" = "double" ]; then
                     status_tags+=("[双向${quota_display}]")
@@ -3229,8 +3254,14 @@ get_port_status_label() {
                     status_tags+=("[$next_reset_label]")
                 fi
 
-                if [ $usage_percent -ge 100 ]; then
-                    status_tags+=("[已超限]")
+                if ! current_usage=$(get_port_monthly_usage "$port") ||
+                   ! [[ "$current_usage" =~ ^[0-9]+$ ]]; then
+                    status_tags+=("[流量读取失败]")
+                else
+                    local usage_percent=$((current_usage * 100 / limit_bytes))
+                    if [ "$usage_percent" -ge 100 ]; then
+                        status_tags+=("[已超限]")
+                    fi
                 fi
             fi
         else
@@ -3273,9 +3304,9 @@ get_port_status_label() {
 
 get_port_monthly_usage() {
     local port=$1
-    local traffic_data=($(get_nftables_counter_data "$port"))
-    local input_bytes=${traffic_data[0]}
-    local output_bytes=${traffic_data[1]}
+    read_nftables_counter_data "$port" || return 1
+    local input_bytes="$NFT_COUNTER_INPUT"
+    local output_bytes="$NFT_COUNTER_OUTPUT"
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
 
     calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode"
@@ -3600,11 +3631,19 @@ validate_config_file() {
 
     if ! jq -e '
         type == "object" and
+        ((.global // {}) | type == "object") and
         (.ports | type == "object") and
         ((.nftables // {}) | type == "object") and
+        ((.notifications // {}) | type == "object") and
+        ((.compat // {}) | type == "object") and
+        ((.notifications.telegram // {}) | type == "object") and
+        ((.notifications.wecom // {}) | type == "object") and
+        ((.notifications.email // {}) | type == "object") and
+        ((.notifications.telegram.status_notifications // {}) | type == "object") and
+        ((.notifications.wecom.status_notifications // {}) | type == "object") and
         ([.ports[] | type == "object"] | all)
     ' "$file" >/dev/null 2>&1; then
-        echo "配置根结构、ports 或端口配置项类型无效" >&2
+        echo "配置根结构或对象字段类型无效" >&2
         return 1
     fi
 
@@ -4039,9 +4078,9 @@ get_daily_total_traffic() {
     local total_bytes=0
     local ports=($(get_active_ports))
     for port in "${ports[@]}"; do
-        local traffic_data=($(get_nftables_counter_data "$port"))
-        local input_bytes=${traffic_data[0]}
-        local output_bytes=${traffic_data[1]}
+        read_nftables_counter_data "$port" || return 1
+        local input_bytes="$NFT_COUNTER_INPUT"
+        local output_bytes="$NFT_COUNTER_OUTPUT"
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
         local port_total=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
         total_bytes=$(( total_bytes + port_total ))
@@ -4697,9 +4736,9 @@ format_port_list() {
     local index=1
 
     for port in "${active_ports[@]}"; do
-        local traffic_data=($(get_nftables_counter_data "$port"))
-        local input_bytes=${traffic_data[0]}
-        local output_bytes=${traffic_data[1]}
+        read_nftables_counter_data "$port" || return 1
+        local input_bytes="$NFT_COUNTER_INPUT"
+        local output_bytes="$NFT_COUNTER_OUTPUT"
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
         local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
         local total_formatted=$(format_bytes $total_bytes)
@@ -4863,6 +4902,10 @@ tc_auto_recovery_state() {
         echo "不可用（当前系统未运行 systemd）"
     elif [ -e "$TC_RECOVERY_UNIT_FILE" ] && ! tc_recovery_unit_is_owned; then
         echo "冲突（同名 unit 不属于 Dog/NTC）"
+    elif [ -e "$TC_RECOVERY_RUNNER" ] && ! tc_recovery_runner_is_owned; then
+        echo "冲突（恢复入口不属于 Dog/NTC）"
+    elif [ -e "$TC_RECOVERY_UNIT_FILE" ] && [ ! -e "$TC_RECOVERY_RUNNER" ]; then
+        echo "损坏（恢复入口缺失）"
     elif [ ! -e "$TC_RECOVERY_UNIT_FILE" ]; then
         echo "未启用"
     elif "$TC_RECOVERY_SYSTEMCTL" is-enabled --quiet "$TC_RECOVERY_SERVICE" 2>/dev/null; then
@@ -5138,7 +5181,8 @@ ensure_ip_guard_script() {
 manage_ip_guard() {
     clear 2>/dev/null || true
     echo -e "${BLUE}=== 来源 IP 并发限制（测试中） ===${NC}"
-    echo -e "${YELLOW}这是独立实验组件，仅统计 TCP conntrack 活跃来源 IP。${NC}"
+    echo -e "${YELLOW}这是独立实验组件，仅限制本机 TCP 服务的 conntrack 活跃来源 IP。${NC}"
+    echo "内核 FORWARD/DNAT 流量不在该测试功能范围内，也不会被它下发 drop 规则。"
     echo "NAT/代理后的多名用户可能只显示为一个来源 IP；半开连接和 conntrack 超时也会影响口径。"
     echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
     echo
@@ -5154,7 +5198,8 @@ manage_ip_guard() {
 
 # 显示主界面
 show_main_menu() {
-    clear 2>/dev/null || true
+    while true; do
+        clear 2>/dev/null || true
 
     local active_ports=($(get_active_ports))
     local port_count=${#active_ports[@]}
@@ -5185,20 +5230,21 @@ show_main_menu() {
     echo
     read -p "请选择操作 [0-10]: " choice
 
-    case $choice in
-        1) manage_port_monitoring ;;
-        2) manage_traffic_limits ;;
-        3) manage_traffic_reset ;;
-        4) manage_configuration ;;
-        5) install_update_script ;;
-        6) uninstall_script ;;
-        7) manage_notifications ;;
-        8) system_check_and_repair ;;
-        9) manage_tc_recovery ;;
-        10) manage_ip_guard ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选择，请输入0-10${NC}"; sleep 1; show_main_menu ;;
-    esac
+        case $choice in
+            1) manage_port_monitoring; return ;;
+            2) manage_traffic_limits; return ;;
+            3) manage_traffic_reset; return ;;
+            4) manage_configuration; return ;;
+            5) install_update_script; return ;;
+            6) uninstall_script; return ;;
+            7) manage_notifications; return ;;
+            8) system_check_and_repair || true ;;
+            9) manage_tc_recovery; return ;;
+            10) manage_ip_guard; return ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择，请输入0-10${NC}"; sleep 1 ;;
+        esac
+    done
 }
 
 manage_port_monitoring() {
@@ -5789,12 +5835,13 @@ remove_port_monitoring() {
 
 add_nftables_rules() {
     local port="$1"
-    local current_traffic=()
-    read -r -a current_traffic < <(get_nftables_counter_data "$port")
-    local current_input="${current_traffic[0]:-0}"
-    local current_output="${current_traffic[1]:-0}"
-    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+    local current_input=0
+    local current_output=0
+    if port_counter_objects_exist "$port"; then
+        read_nftables_counter_data "$port" || return 1
+        current_input="$NFT_COUNTER_INPUT"
+        current_output="$NFT_COUNTER_OUTPUT"
+    fi
     rebuild_port_counter_objects \
         "$port" "$current_input" "$current_output" rebuild
 }
@@ -6273,9 +6320,14 @@ change_port_billing_mode() {
     fi
     
     # 读取当前流量
-    local traffic_data=($(get_nftables_counter_data "$target_port"))
-    local saved_input=${traffic_data[0]:-0}
-    local saved_output=${traffic_data[1]:-0}
+    if ! read_nftables_counter_data "$target_port"; then
+        echo -e "${RED}读取当前流量失败，已取消模式切换并保留现有规则${NC}"
+        sleep 2
+        change_port_billing_mode
+        return
+    fi
+    local saved_input="$NFT_COUNTER_INPUT"
+    local saved_output="$NFT_COUNTER_OUTPUT"
     echo -e "  读取流量: 入站=$(format_bytes $saved_input), 出站=$(format_bytes $saved_output)"
     local converted_input
     converted_input=$(scale_counter_for_rule_multiplier "$saved_input" "$current_multiplier" "$new_multiplier")
@@ -6345,12 +6397,12 @@ apply_nftables_quota() {
         return 1
     fi
 
-    local current_traffic=()
-    read -r -a current_traffic < <(get_nftables_counter_data "$port")
-    local current_input="${current_traffic[0]:-0}"
-    local current_output="${current_traffic[1]:-0}"
-    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
+    if ! read_nftables_counter_data "$port"; then
+        log_notification "端口 $port counter 读取失败，已保留原有限额规则"
+        return 1
+    fi
+    local current_input="$NFT_COUNTER_INPUT"
+    local current_output="$NFT_COUNTER_OUTPUT"
     local current_total
     current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
 
@@ -6529,10 +6581,29 @@ tc_state_optional_unique_value() {
     local count
     count=$(grep -Ec "^${key}=" "$state_file" 2>/dev/null || true)
     [ "$count" -le 1 ] || return 1
-    [ "$count" -eq 1 ] && grep "^${key}=" "$state_file" | cut -d'=' -f2-
+    if [ "$count" -eq 1 ]; then
+        grep "^${key}=" "$state_file" | cut -d'=' -f2-
+    fi
+    return 0
 }
 
-# 返回值：0=当前接口存在有效统一限速；1=无状态；2=状态无效；3=旧版状态；4=其他接口。
+# 仅在 NTC 状态存在时读取其启用状态；配置缺失视为旧版/独立状态，异常配置则拒绝使用状态。
+# 返回值：0=已禁用；1=未禁用或配置不存在；2=配置无法安全解释。
+trafficcop_config_is_disabled() {
+    local disabled
+
+    [ -e "$TRAFFICCOP_CONFIG_FILE" ] || return 1
+    tc_state_file_is_secure "$TRAFFICCOP_CONFIG_FILE" || return 2
+    disabled=$(tc_state_optional_unique_value "$TRAFFICCOP_CONFIG_FILE" "DISABLED") || return 2
+    case "$disabled" in
+        true) return 0 ;;
+        ""|false) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# 返回值：0=当前接口存在有效统一限速；1=无状态；2=状态无效；3=旧版状态；
+# 4=其他接口；5=NTC 已明确禁用，残留状态不再授权恢复整机上限。
 trafficcop_unified_state_rate() {
     local interface="$1"
     local schema
@@ -6541,6 +6612,13 @@ trafficcop_unified_state_rate() {
     local speed
 
     [ -e "$TRAFFICCOP_TC_STATE_FILE" ] || return 1
+    local disabled_status=0
+    trafficcop_config_is_disabled || disabled_status=$?
+    case "$disabled_status" in
+        0) return 5 ;;
+        1) ;;
+        *) return 2 ;;
+    esac
     tc_state_file_is_secure "$TRAFFICCOP_TC_STATE_FILE" || return 2
     if ! schema=$(tc_state_unique_value "$TRAFFICCOP_TC_STATE_FILE" "SCHEMA" 2>/dev/null); then
         if ! grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE" 2>/dev/null; then
@@ -6734,7 +6812,7 @@ desired_tc_parent_rate() {
     rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || result=$?
     case "$result" in
         0) printf '%s\n' "$rate" ;;
-        1|4) printf '%s\n' "$TC_PARENT_RATE" ;;
+        1|4|5) printf '%s\n' "$TC_PARENT_RATE" ;;
         3)
             if tc_root_owner_marker_matches "$interface" &&
                tc_root_matches_unified_contract "$interface"; then
@@ -6902,7 +6980,8 @@ cleanup_owned_tc_root_if_unused_locked() {
         rm -f "$(get_tc_root_owner_file)"
         return 0
     fi
-    if [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_status" -ne 1 ] && [ "$ntc_status" -ne 4 ]; then
+    if [ -e "$TRAFFICCOP_TC_STATE_FILE" ] &&
+       [ "$ntc_status" -ne 1 ] && [ "$ntc_status" -ne 4 ] && [ "$ntc_status" -ne 5 ]; then
         # NTC 状态存在但无法安全解释时宁可保留基础层级，也不删除其全局限速。
         return 1
     fi
@@ -7339,7 +7418,7 @@ dog_tc_runtime_complete_all() {
             tc_class_rate_matches "$interface" "1:1" "$ntc_rate" "$ntc_rate" || return 1
             tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate" || return 1
             ;;
-        1|4) ;;
+        1|4|5) ;;
         *)
             [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && return 1
             ;;
@@ -7446,7 +7525,8 @@ recover_tc_runtime() {
     local ntc_status=0
     trafficcop_unified_state_rate "$interface" >/dev/null 2>&1 || ntc_status=$?
     if [ -e "$TRAFFICCOP_TC_STATE_FILE" ] &&
-       [ "$ntc_status" -ne 0 ] && [ "$ntc_status" -ne 1 ] && [ "$ntc_status" -ne 4 ]; then
+       [ "$ntc_status" -ne 0 ] && [ "$ntc_status" -ne 1 ] &&
+       [ "$ntc_status" -ne 4 ] && [ "$ntc_status" -ne 5 ]; then
         finish_tc_update
         echo "TrafficCop TC 状态文件无法安全解释，拒绝自动删除 qdisc。" >&2
         return 1
@@ -7860,9 +7940,14 @@ immediate_reset() {
     echo "将重置以下端口的流量统计:"
     local total_all_traffic=0
     for port in "${ports_to_reset[@]}"; do
-        local traffic_data=($(get_nftables_counter_data "$port"))
-        local input_bytes=${traffic_data[0]}
-        local output_bytes=${traffic_data[1]}
+        if ! read_nftables_counter_data "$port"; then
+            echo -e "${RED}端口 $port 流量读取失败，已取消本次重置${NC}"
+            sleep 2
+            manage_traffic_reset
+            return
+        fi
+        local input_bytes="$NFT_COUNTER_INPUT"
+        local output_bytes="$NFT_COUNTER_OUTPUT"
         local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
         local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
         local total_formatted=$(format_bytes $total_bytes)
@@ -7888,10 +7973,14 @@ immediate_reset() {
         local failed_count=0
         for port in "${ports_to_reset[@]}"; do
             # 获取当前流量用于记录
-            record_traffic_snapshot >/dev/null 2>&1 || true
-            local traffic_data=($(get_nftables_counter_data "$port"))
-            local input_bytes=${traffic_data[0]}
-            local output_bytes=${traffic_data[1]}
+            if ! record_traffic_snapshot >/dev/null 2>&1 ||
+               ! read_nftables_counter_data "$port"; then
+                echo -e "${RED}端口 $port 流量读取失败，未执行清零${NC}"
+                failed_count=$((failed_count + 1))
+                continue
+            fi
+            local input_bytes="$NFT_COUNTER_INPUT"
+            local output_bytes="$NFT_COUNTER_OUTPUT"
             local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
             local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
@@ -7929,10 +8018,13 @@ perform_auto_reset_port() {
     local due_date="${2:-}"
     local policy_instance_id="${3:-}"
 
-    record_traffic_snapshot >/dev/null 2>&1 || true
-    local traffic_data=($(get_nftables_counter_data "$port"))
-    local input_bytes=${traffic_data[0]}
-    local output_bytes=${traffic_data[1]}
+    if ! record_traffic_snapshot >/dev/null 2>&1 ||
+       ! read_nftables_counter_data "$port"; then
+        log_notification "端口 $port 自动重置失败：无法可靠读取当前流量，未执行清零"
+        return 1
+    fi
+    local input_bytes="$NFT_COUNTER_INPUT"
+    local output_bytes="$NFT_COUNTER_OUTPUT"
     local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
     local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
 
@@ -8567,7 +8659,13 @@ import_config() {
     echo "正在验证配置包..."
 
     # 创建临时目录用于解压验证
-    local temp_dir=$(mktemp -d)
+    local temp_dir
+    if ! temp_dir=$(mktemp -d); then
+        echo -e "${RED}错误：无法创建配置包验证临时目录${NC}"
+        sleep 2
+        manage_configuration
+        return
+    fi
 
     # 解压到临时目录进行验证
     if ! tar -tzf "$package_path" >/dev/null 2>&1; then
@@ -8597,8 +8695,14 @@ import_config() {
         return
     fi
 
-    # 解压配置包
-    tar -xzf "$package_path" -C "$temp_dir" 2>/dev/null
+    # 即使 tar 已写出部分文件，只要解压返回失败就不得进入锁和运行态修改阶段。
+    if ! tar -xzf "$package_path" -C "$temp_dir" 2>/dev/null; then
+        echo -e "${RED}错误：配置包解压失败，当前配置未作修改${NC}"
+        rm -rf "$temp_dir"
+        sleep 2
+        manage_configuration
+        return
+    fi
 
     # 验证配置包结构
     local config_dir_name="port-traffic-dog-config"
@@ -9121,7 +9225,7 @@ install_update_script() {
 
     local backup_dir="$temp_dir/backup"
     local notifications_dir="$CONFIG_DIR/notifications"
-    local shortcut_path="/usr/local/bin/$SHORTCUT_COMMAND"
+    local shortcut_path="$SHORTCUT_PATH"
     mkdir -p "$backup_dir"
     [ -f "$INSTALLED_SCRIPT_PATH" ] && cp -a "$INSTALLED_SCRIPT_PATH" "$backup_dir/port-traffic-dog.sh"
     [ -f "$shortcut_path" ] && cp -a "$shortcut_path" "$backup_dir/dog"
@@ -9263,24 +9367,47 @@ install_update_script() {
     return 0
 }
 
+shortcut_command_is_valid() {
+    [ -f "$SHORTCUT_PATH" ] && [ ! -L "$SHORTCUT_PATH" ] && [ -x "$SHORTCUT_PATH" ] || return 1
+    cmp -s "$SHORTCUT_PATH" <(
+        printf '#!/bin/bash\nexec bash "%s" "$@"\n' "$INSTALLED_SCRIPT_PATH"
+    )
+}
+
 create_shortcut_command() {
     if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ] && [ ! -f "$INSTALLED_SCRIPT_PATH" ]; then
-        cp "$SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH"
-        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+        mkdir -p "$(dirname "$INSTALLED_SCRIPT_PATH")" || return 1
+        cp "$SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH" || return 1
+        chmod 755 "$INSTALLED_SCRIPT_PATH" || return 1
     elif [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+        chmod 755 "$INSTALLED_SCRIPT_PATH" || return 1
+    else
+        return 1
     fi
 
-    cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
+    local shortcut_dir
+    local shortcut_temp
+    shortcut_dir=$(dirname "$SHORTCUT_PATH")
+    mkdir -p "$shortcut_dir" || return 1
+    shortcut_temp=$(mktemp "$shortcut_dir/.${SHORTCUT_COMMAND}.XXXXXX") || return 1
+    if ! cat > "$shortcut_temp" << EOF
 #!/bin/bash
 exec bash "$INSTALLED_SCRIPT_PATH" "\$@"
 EOF
-    chmod 755 "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || true
+    then
+        rm -f "$shortcut_temp"
+        return 1
+    fi
+    if ! chmod 755 "$shortcut_temp" || ! mv -f "$shortcut_temp" "$SHORTCUT_PATH"; then
+        rm -f "$shortcut_temp"
+        return 1
+    fi
+    shortcut_command_is_valid || return 1
     echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
 }
 
 ensure_installation_files() {
-    local shortcut_path="/usr/local/bin/$SHORTCUT_COMMAND"
+    local shortcut_path="$SHORTCUT_PATH"
     if [ -f "$INSTALLED_SCRIPT_PATH" ] && [ -f "$shortcut_path" ]; then
         install_tc_recovery_service_files >/dev/null 2>&1 || true
         return 0
@@ -9296,6 +9423,7 @@ cleanup_owned_tc_root_without_config() {
     local owner_file
     local owner_interface=""
     local ntc_uninstall_status=0
+    local cleanup_result=0
 
     owner_file=$(get_tc_root_owner_file)
     [ -r "$owner_file" ] || return 0
@@ -9311,15 +9439,23 @@ cleanup_owned_tc_root_without_config() {
     if tc_root_is_owned "$owner_interface"; then
         trafficcop_unified_state_rate "$owner_interface" >/dev/null 2>&1 || ntc_uninstall_status=$?
         if [ "$ntc_uninstall_status" -eq 0 ] ||
-           { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ]; }; then
+           { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] &&
+             [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ] &&
+             [ "$ntc_uninstall_status" -ne 5 ]; }; then
             rm -f "$owner_file"
             log_notification "卸载Dog时保留TrafficCop正在使用的统一HTB: $owner_interface"
         else
-            tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null || true
+            if tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null; then
+                rm -f "$owner_file"
+            else
+                log_notification "卸载Dog时删除统一HTB失败，已保留归属标记: $owner_interface"
+                cleanup_result=1
+            fi
         fi
     fi
 
     finish_tc_update
+    return "$cleanup_result"
 }
 
 rollback_interrupted_uninstall() {
@@ -9353,7 +9489,7 @@ uninstall_script() {
 
     echo -e "${YELLOW}将要删除以下内容:${NC}"
     echo "  - 脚本文件: $INSTALLED_SCRIPT_PATH"
-    echo "  - 快捷命令: /usr/local/bin/$SHORTCUT_COMMAND"
+    echo "  - 快捷命令: $SHORTCUT_PATH"
     echo "  - 配置目录: $CONFIG_DIR"
     echo "  - 所有nftables规则"
     echo "  - 所有TC限制规则"
@@ -9556,7 +9692,7 @@ uninstall_script() {
         trap - EXIT INT TERM
         local uninstall_files_ok=true
         rm -rf "$CONFIG_DIR" 2>/dev/null || uninstall_files_ok=false
-        rm -f "/usr/local/bin/$SHORTCUT_COMMAND" 2>/dev/null || uninstall_files_ok=false
+        rm -f "$SHORTCUT_PATH" 2>/dev/null || uninstall_files_ok=false
         rm -f "$INSTALLED_SCRIPT_PATH" 2>/dev/null || uninstall_files_ok=false
         cleanup_tc_recovery_files_if_unused || uninstall_files_ok=false
         finish_full_maintenance_update
@@ -10041,6 +10177,7 @@ filter_runtime_restore_cron_entries() {
         /# port-traffic-dog runtime restore/ { next }
         /# port-traffic-dog expiry reboot check/ { next }
         /port-traffic-dog.*--restore-runtime/ { next }
+        /port-traffic-dog.*--restore-nft-runtime/ { next }
         /^@reboot[[:space:]].*port-traffic-dog.*--check-port-expirations/ { next }
         { print }
     '
@@ -10060,9 +10197,9 @@ setup_runtime_restore_cron() {
         return 1
     fi
     printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
-    # 到期封锁不依赖网卡或 TC，开机后立即恢复，避免固定延迟造成窗口期。
+    # 到期封锁和 nftables 计数不依赖 TC；TC 开机恢复只由共享 systemd oneshot 负责。
     echo "@reboot $script_path --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry reboot check" >> "$temp_cron"
-    echo "@reboot sleep 15 && $script_path --restore-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
+    echo "@reboot $script_path --restore-nft-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
     finish_cron_update "$temp_cron"
 }
 
@@ -10163,7 +10300,7 @@ refresh_port_auto_reset_cron_from_config() {
 
 refresh_all_cron_from_config() {
     local result=0
-    setup_cron_environment
+    setup_cron_environment || result=1
     refresh_port_auto_reset_cron_from_config || result=1
     refresh_notification_cron_from_config || result=1
     setup_traffic_snapshot_cron || result=1
@@ -10179,7 +10316,7 @@ legacy_cron_needs_migration() {
         return 0
     fi
     if has_active_ports &&
-       ! printf '%s\n' "$cron_content" | grep -q 'port-traffic-dog.*--restore-runtime'; then
+       ! printf '%s\n' "$cron_content" | grep -q 'port-traffic-dog.*--restore-nft-runtime'; then
         return 0
     fi
     if has_active_ports &&
@@ -10579,7 +10716,7 @@ self_check() {
         local actual_wecom_count
         actual_wecom_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--send-wecom-status' || true)
         local actual_restore_count
-        actual_restore_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--restore-runtime' || true)
+        actual_restore_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--restore-nft-runtime' || true)
         local actual_expiry_reboot_count
         actual_expiry_reboot_count=$(printf '%s\n' "$cron_content" | grep -Ec '^@reboot[[:space:]].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)' || true)
 
@@ -10588,7 +10725,7 @@ self_check() {
         local expected_wecom_count=0
         local expected_restore_count=1
         local expected_expiry_reboot_count=1
-        if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--restore-runtime([[:space:]]|$)'; then
+        if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--restore-nft-runtime([[:space:]]|$)'; then
             cron_matches_config=false
         fi
         if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)'; then
@@ -10659,6 +10796,11 @@ self_check() {
 
     if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
         check_ok "主脚本安装路径存在: $INSTALLED_SCRIPT_PATH"
+        if shortcut_command_is_valid; then
+            check_ok "快捷命令有效: $SHORTCUT_PATH"
+        else
+            check_fail "快捷命令缺失、不可执行或内容异常: $SHORTCUT_PATH"
+        fi
     else
         check_warn "主脚本安装路径不存在，当前使用: $SCRIPT_PATH"
     fi
@@ -10697,21 +10839,31 @@ self_check() {
 
     local telegram_route
     local telegram_custom_base
+    local telegram_api_base_valid=true
     telegram_route=$(jq -r '.notifications.telegram.api_route // "official"' "$CONFIG_FILE" 2>/dev/null || echo official)
     telegram_custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
     telegram_custom_base="${telegram_custom_base%/}"
-    if [ "$telegram_route" = "custom" ] && declare -F telegram_api_base_is_secure >/dev/null 2>&1 &&
-       ! telegram_api_base_is_secure "$telegram_custom_base"; then
-        check_warn "Telegram自定义线路不安全，当前已自动回退官方 HTTPS 线路"
+    if [ "$telegram_route" = "custom" ] &&
+       { ! declare -F telegram_api_base_is_secure >/dev/null 2>&1 ||
+         ! telegram_api_base_is_secure "$telegram_custom_base"; }; then
+        check_fail "Telegram自定义线路无效，发送已拒绝；请改用远程 HTTPS 或本机回环 HTTP"
+        telegram_api_base_valid=false
     fi
 
     local telegram_enabled
     telegram_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo "false")
     local bot_token
     bot_token=$(jq -r '.notifications.telegram.bot_token // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
-    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ]; then
+    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ] &&
+       [ "$telegram_api_base_valid" = "true" ]; then
         local api_base
-        api_base=$(get_telegram_api_base 2>/dev/null || echo "https://api.telegram.org")
+        if ! api_base=$(get_telegram_api_base 2>/dev/null); then
+            check_fail "Telegram线路配置无法解析，已跳过连通性检测"
+            telegram_api_base_valid=false
+        fi
+    fi
+    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ] &&
+       [ "$telegram_api_base_valid" = "true" ]; then
         local getme_url
         if [[ "$api_base" =~ /bot$ ]]; then
             getme_url="${api_base}${bot_token}/getMe"
@@ -10730,7 +10882,7 @@ self_check() {
             fi
             check_warn "Telegram连通性异常: ${err_desc:-无响应}"
         fi
-    else
+    elif [ "$telegram_enabled" != "true" ] || [ -z "$bot_token" ] || [ "$bot_token" = "null" ]; then
         check_warn "Telegram未启用或Token为空，跳过连通性检测"
     fi
 
@@ -10750,16 +10902,33 @@ system_check_and_repair() {
     echo
 
     echo -e "${YELLOW}[1/6] 检查依赖、权限和本地配置...${NC}"
+    local repair_status=0
+    local base_environment_ok=true
+
     check_dependencies true
     if ! init_config; then
         echo -e "${RED}本地配置无效，无法继续自动修复${NC}"
         return 1
     fi
-    setup_script_permissions
-    setup_cron_environment
-    create_shortcut_command >/dev/null
+    if ! setup_script_permissions; then
+        echo -e "${RED}脚本权限修复失败${NC}"
+        base_environment_ok=false
+        repair_status=1
+    fi
+    if ! setup_cron_environment; then
+        echo -e "${RED}cron 基础环境配置失败${NC}"
+        base_environment_ok=false
+        repair_status=1
+    fi
+    if ! create_shortcut_command >/dev/null; then
+        echo -e "${RED}快捷命令创建或校验失败${NC}"
+        base_environment_ok=false
+        repair_status=1
+    fi
     install_tc_recovery_service_files >/dev/null 2>&1 || true
-    echo -e "${GREEN}基础运行环境已就绪${NC}"
+    if [ "$base_environment_ok" = "true" ]; then
+        echo -e "${GREEN}基础运行环境已就绪${NC}"
+    fi
 
     echo -e "${YELLOW}[2/6] 检查通知模块...${NC}"
     if download_notification_modules >/dev/null 2>&1; then
@@ -10769,8 +10938,12 @@ system_check_and_repair() {
     fi
 
     echo -e "${YELLOW}[3/6] 重建端口重置和通知定时任务...${NC}"
-    refresh_all_cron_from_config
-    echo -e "${GREEN}定时任务已按当前配置刷新${NC}"
+    if refresh_all_cron_from_config; then
+        echo -e "${GREEN}定时任务已按当前配置刷新${NC}"
+    else
+        echo -e "${RED}定时任务刷新失败，已保留可读取的现有任务${NC}"
+        repair_status=1
+    fi
 
     echo -e "${YELLOW}[4/6] 检查并修复流量与配额规则...${NC}"
     local repaired_count
@@ -10778,11 +10951,13 @@ system_check_and_repair() {
         echo -e "${GREEN}流量规则检查完成，修复端口数: ${repaired_count}${NC}"
     else
         echo -e "${RED}流量规则修复失败，将在最终自检中显示异常端口${NC}"
+        repair_status=1
     fi
     if restore_runtime_state >/dev/null 2>&1; then
         echo -e "${GREEN}nftables 与 TC 运行状态已按当前配置恢复${NC}"
     else
         echo -e "${RED}运行状态恢复失败，将在最终自检中显示异常端口${NC}"
+        repair_status=1
     fi
 
     echo -e "${YELLOW}[5/6] 更新自然日流量快照...${NC}"
@@ -10795,14 +10970,19 @@ system_check_and_repair() {
     echo
     echo -e "${YELLOW}[6/6] 执行最终自检...${NC}"
     if self_check; then
-        echo -e "${GREEN}系统自检/修复完成${NC}"
+        if [ "$repair_status" -eq 0 ]; then
+            echo -e "${GREEN}系统自检/修复完成${NC}"
+        else
+            echo -e "${YELLOW}最终自检已通过，但本次修复过程存在失败步骤，请按上方提示处理${NC}"
+        fi
     else
+        repair_status=1
         echo -e "${YELLOW}修复后仍有异常，请根据上方 FAIL/WARN 处理${NC}"
     fi
 
     echo
     read -r -p "按回车键返回主菜单..."
-    show_main_menu
+    return "$repair_status"
 }
 
 main() {
@@ -10847,6 +11027,12 @@ main() {
                 [ -f "$CONFIG_FILE" ] || exit 0
                 validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
                 restore_runtime_state
+                exit $?
+                ;;
+            --restore-nft-runtime)
+                [ -f "$CONFIG_FILE" ] || exit 0
+                validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
+                restore_runtime_state false
                 exit $?
                 ;;
             --tc-status)
@@ -10929,8 +11115,9 @@ main() {
                 exit "$install_status"
                 ;;
             --uninstall)
-                uninstall_script
-                exit 0
+                local uninstall_status=0
+                uninstall_script || uninstall_status=$?
+                exit "$uninstall_status"
                 ;;
             --self-check)
                 self_check
@@ -11005,7 +11192,8 @@ main() {
                 echo "  --refresh-all-cron           刷新全部定时任务并清理旧任务"
                 echo "  --repair-traffic-rules  按计费模式修复流量计数/配额规则"
                 echo "  --snapshot-traffic       写入自然日流量快照"
-                echo "  --restore-runtime        恢复 nftables/TC 运行状态"
+                echo "  --restore-runtime        手动恢复 nftables/TC 运行状态"
+                echo "  --restore-nft-runtime    开机恢复 nftables（不修改 TC）"
                 echo "  --reset-port PORT         重置指定端口流量"
                 echo "  --check-reset-port PORT   检查指定端口是否到重置日"
                 echo "  --check-scheduled-resets  检查所有端口是否到重置日"

@@ -34,7 +34,7 @@
 22. 带宽限制仅在 TC 分类和过滤器完整创建后写入配置；网卡已有不兼容的根队列时明确报错，不再显示伪成功。
 23. 直接覆盖旧脚本后，首次打开 `dog` 会轻量检测并迁移旧版单端口重置/快照 cron；菜单更新和迁移脚本统一由新版本刷新全部定时任务。
 24. 设置流量配额时会验证旧规则已清理、新 quota 对象及规则数量完整后再写配置；失败时不显示伪成功并尝试恢复旧配额。自检同时核对重置与快照任务的执行频率。
-25. 存在监控端口时会维护唯一的开机恢复任务；VPS 重启后自动恢复 nftables counter、quota 和 TC，分钟快照发现运行规则缺失时也会先恢复再采样，避免把灾备数据覆盖成 0。
+25. 存在监控端口时会维护唯一的 Dog `@reboot` 任务，只恢复 nftables counter/quota，不写 TC；统一 HTB 的开机重建由用户显式启用的共享 systemd oneshot 负责。分钟快照发现 nftables 规则缺失时也会先恢复再采样，避免把灾备数据覆盖成 0。
 26. 自然日快照改为每轮一次原子写入，并同步刷新 `traffic_data.json`；历史按 `.global.data_retention_days` 裁剪，未配置时默认保留 400 天。
 27. 端口段统计规则不再无条件写 packet mark；只有启用 TC 限速时才写入独立且唯一的高 20 位标记，并保留 skb mark 低 12 位，减少对策略路由或透明代理的影响。
 28. TC 单端口限速同时安装 IPv4 与 IPv6 分类器；脚本自建父分类预留 100Gbps，避免旧版固定 1Gbps 父分类压低高速端口配置。
@@ -58,7 +58,7 @@
 46. 每个端口可单独设置服务到期日 `YYYY-MM-DD`。到期前流量周期照常重置；北京时间到期日当天起独立封锁该端口的 TCP/UDP 入站、出站和转发流量，延期或取消后立即解锁。
 47. 服务到期检查每分钟运行，并通过独立 `@reboot` 任务在开机时立即恢复；设置、导入、删除和卸载均与检查任务共用到期锁，避免留下孤儿封锁规则。
 48. 主菜单增加“来源 IP 并发限制（测试中）”。该功能位于独立的 `port-ip-guard.sh`，主脚本只负责校验、安装和调用，未启用时不会创建额外防火墙规则或服务。
-49. 来源 IP 守护会在全量 conntrack 快照前先建立事件监听，避免启动空窗；只有准入集合实际变化时才按受影响端口原子刷新 nftables，减少高连接频率下的无效规则重写。
+49. 来源 IP 守护会在全量 conntrack 快照前先建立事件监听，避免启动空窗；它通过 conntrack 回复方向的本机地址和服务端口识别真正进入本机 TCP 服务的连接，不会把本机主动访问远端同号端口算作来源；只有准入集合实际变化时才按受影响端口原子刷新 nftables。该测试功能不处理内核 FORWARD/DNAT 流量，也不会对其下发 drop。
 
 ## 下载方式说明
 
@@ -119,7 +119,7 @@ Alpine 预装脚本会补齐 `bash/nftables/conntrack-tools/iproute2/jq/gawk/bc/
 
 ## 3) 旧 VPS 迁移到定制版
 
-迁移脚本会先以仅 root 可读的权限备份配置、主脚本、快捷命令、root crontab 和现有 nftables 表，再完整下载并校验主脚本、两个通知模块及当前配置；全部校验通过后才覆盖安装。覆盖后的刷新、修复或自检失败时会自动恢复迁移前状态。
+迁移脚本会先以仅 root 可读的权限备份配置、主脚本、快捷命令、root crontab 和现有 nftables 表，再完整下载并校验主脚本、两个通知模块、独立 IP Guard 组件及当前配置；全部校验通过后才覆盖安装。若 IP Guard 服务原本正在运行，迁移后会重启并核验新组件；覆盖后的刷新、修复或自检失败时会自动恢复迁移前状态。
 
 直连:
 
@@ -161,6 +161,7 @@ sudo dog --refresh-all-cron
 sudo dog --repair-traffic-rules
 sudo dog --snapshot-traffic
 sudo dog --restore-runtime
+sudo dog --restore-nft-runtime
 sudo dog --check-port-expirations
 sudo dog --recover-tc --manual
 sudo dog --uninstall
@@ -176,7 +177,8 @@ sudo dog --uninstall
 - `--refresh-all-cron`: 按当前端口、重置和通知配置刷新全部定时任务，同时清理旧版单端口重置及旧快照任务。
 - `--repair-traffic-rules`: 按当前计费模式检查并重建 counter/quota 规则；双向目标为每个方向 8 条 counter 引用、16 条 quota 引用，单向目标为每个方向 4 条 counter 引用、8 条 quota 引用。升级时会按旧规则倍率换算已有 counter，避免已有流量丢失或再次翻倍。
 - `--snapshot-traffic`: 立即写入一次自然日流量快照；正常情况下脚本会自动配置每分钟执行一次。
-- `--restore-runtime`: 按当前配置和 `traffic_data.json` 恢复 nftables/TC 运行状态；脚本会通过 `@reboot` 自动调用，一般无需手动执行。
+- `--restore-runtime`: 手动按当前配置和 `traffic_data.json` 恢复 nftables/TC 运行状态；不会作为 Dog 的普通开机 cron 自动调用。
+- `--restore-nft-runtime`: 只恢复 nftables counter/quota，不修改 TC；Dog 的 `@reboot` 任务使用此入口。
 - `--check-port-expirations`: 按北京时间检查全部端口的服务到期日，并只同步 Dog 自己带固定 comment 的封锁规则；正常情况下由每分钟 cron 和独立 `@reboot` 任务调用。
 - `--uninstall`: 卸载脚本、配置目录、nftables/tc 规则，并清理通知 cron、自然日快照 cron、开机恢复 cron 和端口自动重置 cron。
 
@@ -220,9 +222,10 @@ sudo dog --uninstall
 
 ### 5.2 来源 IP 并发限制（测试中）
 
-主菜单 `10` 会按需安装并调用独立脚本 `/etc/port-traffic-dog/port-ip-guard.sh`。它限制的是单个 TCP 端口当前 conntrack 中允许准入的来源 IP 数，不是账号数，也不支持 UDP。
+主菜单 `10` 会按需安装并调用独立脚本 `/etc/port-traffic-dog/port-ip-guard.sh`。它限制的是进入本机 TCP 服务端口、当前 conntrack 中允许准入的来源 IP 数，不是账号数，也不支持 UDP。该实验组件只挂载 nftables `input` hook；内核转发或 DNAT 流量不受它限制。
 
-- NAT、CDN、反向代理或四层转发后的多名用户可能共享同一个来源 IP。
+- NAT、CDN、反向代理或用户态四层代理后的多名用户可能共享同一个来源 IP。
+- 守护进程会读取本机 IPv4/IPv6 地址，并结合 conntrack 原始/回复两个方向确认本机服务端口；本机主动连接远端同号端口不会占用准入名额。接口地址读取失败时不会按不完整快照刷新名单。
 - 半开连接、conntrack 超时和地址伪造会影响统计；新来源的首个 SYN 会被丢弃，准入后依靠 TCP 重传建立连接。
 - 组件使用独立 nftables 表和 systemd 服务；进程停止时会尝试 fail-open 解封。无法确认同名表归属时会拒绝覆盖或删除。
 - 对当前 SSH 服务端口设置限制需要双重确认。建议先在有控制台或备用管理入口的机器测试。

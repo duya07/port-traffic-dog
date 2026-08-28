@@ -15,6 +15,8 @@ trap 'echo "regression failed at line $LINENO" >&2' ERR
 # Load function definitions without running main, and redirect all state to a temp directory.
 source <(sed \
     -e "s#^readonly SCRIPT_PATH=.*#readonly SCRIPT_PATH=\"$SCRIPT_FILE\"#" \
+    -e "s#^readonly INSTALLED_SCRIPT_PATH=.*#readonly INSTALLED_SCRIPT_PATH=\"$TEST_DIR/bin/port-traffic-dog.sh\"#" \
+    -e "s#^readonly SHORTCUT_PATH=.*#readonly SHORTCUT_PATH=\"$TEST_DIR/bin/dog\"#" \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
     -e "s#^readonly CONFIG_LOCK_DIR=.*#readonly CONFIG_LOCK_DIR=\"$TEST_DIR/config.lock\"#" \
     -e "s#^readonly TRAFFIC_STATS_LOCK_DIR=.*#readonly TRAFFIC_STATS_LOCK_DIR=\"$TEST_DIR/traffic-stats.lock\"#" \
@@ -23,6 +25,7 @@ source <(sed \
     -e "s#^readonly EXPIRY_LOCK_FILE=.*#readonly EXPIRY_LOCK_FILE=\"$TEST_DIR/expiry.lock\"#" \
     -e "s#^readonly TC_SHARED_LOCK_FILE=.*#readonly TC_SHARED_LOCK_FILE=\"$TEST_DIR/traffic-tools-tc.lock\"#" \
     -e "s#^readonly TRAFFICCOP_TC_STATE_FILE=.*#readonly TRAFFICCOP_TC_STATE_FILE=\"$TEST_DIR/trafficcop-tc.state\"#" \
+    -e "s#^readonly TRAFFICCOP_CONFIG_FILE=.*#readonly TRAFFICCOP_CONFIG_FILE=\"$TEST_DIR/trafficcop.conf\"#" \
     -e "s#^readonly TC_RECOVERY_RUNNER=.*#readonly TC_RECOVERY_RUNNER=\"$TEST_DIR/traffic-tools-tc-recovery.sh\"#" \
     -e "s#^readonly TC_RECOVERY_UNIT_FILE=.*#readonly TC_RECOVERY_UNIT_FILE=\"$TEST_DIR/traffic-tools-tc-recovery.service\"#" \
     -e 's#^readonly TC_RECOVERY_SYSTEMCTL=.*#readonly TC_RECOVERY_SYSTEMCTL="mock_tc_recovery_systemctl"#' \
@@ -31,6 +34,7 @@ source <(sed \
 
 ORIGINAL_INSTALL_UPDATE_SCRIPT_DEFINITION=$(declare -f install_update_script)
 ORIGINAL_INSTALL_TC_RECOVERY_FILES_DEFINITION=$(declare -f install_tc_recovery_service_files)
+ORIGINAL_REFRESH_ALL_CRON_DEFINITION=$(declare -f refresh_all_cron_from_config)
 
 mkdir -p "$CONFIG_DIR/logs"
 flock() { :; }
@@ -91,6 +95,15 @@ jq '.ports = {"3265": {}, "3000-4000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.o
 ! validate_config_file "$TEST_DIR/config.overlap.json" >/dev/null 2>&1
 jq '.ports = {"70000": {}}' "$CONFIG_FILE" > "$TEST_DIR/config.bad-port.json"
 ! validate_config_file "$TEST_DIR/config.bad-port.json" >/dev/null 2>&1
+for invalid_filter in \
+    '.global = "broken"' \
+    '.notifications = "broken"' \
+    '.compat = []' \
+    '.notifications.telegram = false' \
+    '.notifications.wecom.status_notifications = "broken"'; do
+    jq "$invalid_filter" "$CONFIG_FILE" > "$TEST_DIR/config.bad-object.json"
+    ! validate_config_file "$TEST_DIR/config.bad-object.json" >/dev/null 2>&1
+done
 
 mkdir "$TRAFFIC_STATS_LOCK_DIR"
 printf '99999999 0\n' > "$TRAFFIC_STATS_LOCK_DIR/owner"
@@ -428,7 +441,46 @@ jq -e '
     .daily["3265"]["2026-07-11"].input == 30 and
     .daily["3265"]["2026-07-11"].output == 50
 ' "$TRAFFIC_STATS_FILE" >/dev/null
+
+# nft 查询失败不能伪装成 counter 清零；失败快照必须原样保留，恢复后只计真实增量。
+jq -n '{
+    last_snapshot: {"3265": {input:150,output:250,date:"2026-07-11",time:"2026-07-11T12:00:00+08:00"}},
+    state: {"3265": {date:"2026-07-11",time:"2026-07-11T12:00:00+08:00",input_base:100,output_base:200,input_offset:0,output_offset:0,last_input:150,last_output:250}},
+    daily: {"3265": {"2026-07-11": {input:50,output:50}}}
+}' > "$TRAFFIC_STATS_FILE"
+cp "$TRAFFIC_STATS_FILE" "$TEST_DIR/traffic-stats.before-query-failure"
+(
+    query_fails=true
+    port_counter_objects_exist() { return 0; }
+    get_nftables_counter_data() {
+        [ "$query_fails" = "false" ] || return 42
+        echo "160 260"
+    }
+    get_current_date() { echo "2026-07-11"; }
+    get_beijing_time() { echo "2026-07-11T12:01:00+08:00"; }
+    ! record_traffic_snapshot
+    cmp -s "$TRAFFIC_STATS_FILE" "$TEST_DIR/traffic-stats.before-query-failure"
+    query_fails=false
+    record_traffic_snapshot
+)
+jq -e '
+    .daily["3265"]["2026-07-11"].input == 60 and
+    .daily["3265"]["2026-07-11"].output == 60 and
+    .state["3265"].last_input == 160 and
+    .state["3265"].last_output == 260
+' "$TRAFFIC_STATS_FILE" >/dev/null
+(
+    nft() { return 42; }
+    ! get_nftables_counter_data 3265
+)
 cp "$TEST_DIR/config.before-snapshot.json" "$CONFIG_FILE"
+# 状态页不能把 counter 查询失败折叠为 0，从而漏报配额读取异常。
+(
+    get_port_monthly_usage() { return 42; }
+    status_output=$(get_port_status_label 3265)
+    grep -Fq '[流量读取失败]' <<< "$status_output"
+    ! grep -Fq '[已超限]' <<< "$status_output"
+)
 rm -f "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE"
 
 update_config_file '.concurrency.first = 1' &
@@ -1129,7 +1181,7 @@ migrate_legacy_cron_if_needed
 ! grep -Eq -- '--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
 [ "$(grep -c -- '--check-scheduled-resets' "$CRON_FILE")" -eq 1 ]
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
-[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-nft-runtime' "$CRON_FILE")" -eq 1 ]
 [ "$(grep -c '^@reboot .*--check-port-expirations' "$CRON_FILE")" -eq 1 ]
 grep -q -- '--send-telegram-status' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
@@ -1139,6 +1191,7 @@ remove_all_port_auto_reset_cron
 remove_runtime_restore_cron
 ! grep -q -- '--check-port-expirations' "$CRON_FILE"
 ! grep -q -- '--restore-runtime' "$CRON_FILE"
+! grep -q -- '--restore-nft-runtime' "$CRON_FILE"
 cp "$TEST_DIR/crontab.before-expiry-uninstall.json" "$CRON_FILE"
 printf '%s\n' '5 0 * * * /usr/local/bin/port-traffic-dog.sh --check-reset-port 3011 >/dev/null 2>&1  # 端口流量狗自动重置端口3011' >> "$CRON_FILE"
 migrate_legacy_cron_if_needed
@@ -1176,7 +1229,7 @@ grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 update_config_file '.ports = {}'
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
-[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-nft-runtime' "$CRON_FILE")" -eq 1 ]
 ! grep -Eq -- '--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots' "$CRON_FILE"
 grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '--send-telegram-status' "$CRON_FILE"
@@ -1204,7 +1257,7 @@ update_config_file '
 setup_traffic_snapshot_cron
 setup_traffic_snapshot_cron
 [ "$(grep -c -- '--snapshot-traffic' "$CRON_FILE")" -eq 1 ]
-[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-nft-runtime' "$CRON_FILE")" -eq 1 ]
 grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 grep -q -- '/usr/local/bin/unrelated-job' "$CRON_FILE"
 
@@ -1213,7 +1266,7 @@ setup_telegram_notification_cron
 ! grep -q -- '--send-telegram-status' "$CRON_FILE"
 setup_traffic_snapshot_cron
 ! grep -q -- '--snapshot-traffic' "$CRON_FILE"
-[ "$(grep -c -- '--restore-runtime' "$CRON_FILE")" -eq 1 ]
+[ "$(grep -c -- '--restore-nft-runtime' "$CRON_FILE")" -eq 1 ]
 refresh_port_auto_reset_cron_from_config
 ! grep -q -- '--check-scheduled-resets' "$CRON_FILE"
 
@@ -1375,16 +1428,42 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     [ "$(get_telegram_api_route)" = "official" ]
     [ "$(get_telegram_api_base)" = "https://api.telegram.org" ]
 
-    # 旧版明确保存的自定义线路和地址必须继续按原配置读取。
+    # 旧配置中的远程 HTTP 不得静默回退官方线路，也不得发起网络请求。
     telegram_update_config_file '
         .notifications.telegram.api_route = "custom" |
-        .notifications.telegram.custom_api_base = "http://example.com"
+        .notifications.telegram.custom_api_base = "http://example.com" |
+        .notifications.telegram.bot_token = "123456:test-token" |
+        .notifications.telegram.chat_id = "123456"
     '
-    [ "$(get_telegram_api_base)" = "https://api.telegram.org" ]
+    ! get_telegram_api_base >/dev/null
+    telegram_curl_capture="$TEST_DIR/telegram-insecure-curl.capture"
+    curl() { touch "$telegram_curl_capture"; return 0; }
+    log_notification() { :; }
+    ! send_telegram_message "test"
+    [ ! -e "$telegram_curl_capture" ]
+
+    # 菜单也必须在写配置前拒绝远程 HTTP，并保留原安全地址。
+    telegram_update_config_file '.notifications.telegram.custom_api_base = "https://old.example.com"'
+    cp "$CONFIG_FILE" "$TEST_DIR/telegram.before-insecure-menu.json"
+    (
+        menu_inputs=(2 "http://example.com")
+        menu_index=0
+        read() {
+            local target_var="${!#}"
+            printf -v "$target_var" '%s' "${menu_inputs[$menu_index]}"
+            menu_index=$((menu_index + 1))
+        }
+        sleep() { :; }
+        ! telegram_switch_api_route >/dev/null
+    )
+    cmp -s "$CONFIG_FILE" "$TEST_DIR/telegram.before-insecure-menu.json"
+
     telegram_update_config_file '.notifications.telegram.custom_api_base = "http://127.0.0.1:8080"'
     [ "$(get_telegram_api_base)" = "http://127.0.0.1:8080" ]
     telegram_update_config_file '.notifications.telegram.custom_api_base = "https://tg.example.com/"'
     [ "$(get_telegram_api_base)" = "https://tg.example.com" ]
+    ! grep -Fq '自动回退官方 HTTPS 线路' "$SCRIPT_FILE"
+    grep -Fq 'Telegram自定义线路无效，发送已拒绝' "$SCRIPT_FILE"
     (
         init_nftables() { :; }
         setup_exit_hooks() { :; }
@@ -1468,7 +1547,7 @@ mkdir -p "$CONFIG_DIR/notifications"
 cp "$PROJECT_DIR/telegram.sh" "$CONFIG_DIR/notifications/telegram.sh"
 cp "$PROJECT_DIR/wecom.sh" "$CONFIG_DIR/notifications/wecom.sh"
 printf '%s\n' \
-    '@reboot sleep 15 && /usr/local/bin/port-traffic-dog.sh --restore-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore' \
+    '@reboot /usr/local/bin/port-traffic-dog.sh --restore-nft-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore' \
     '@reboot /usr/local/bin/port-traffic-dog.sh --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry reboot check' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot' \
     '* * * * * /usr/local/bin/port-traffic-dog.sh --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知' \
@@ -1501,6 +1580,98 @@ sed -i 's/^0 \* \* \* \* \(.*--snapshot-traffic.*\)$/* * * * * \1/' "$CRON_FILE"
 self_check >/dev/null
 sed -i '/--snapshot-traffic/d' "$CRON_FILE"
 ! self_check >/dev/null
+
+# 快捷命令必须原子创建并严格匹配目标脚本；缺失、不可执行、篡改或符号链接均无效。
+setup_traffic_snapshot_cron
+create_shortcut_command >/dev/null
+shortcut_command_is_valid
+(
+    chmod() { return 43; }
+    ! setup_script_permissions
+)
+self_check >/dev/null
+chmod 644 "$SHORTCUT_PATH"
+! shortcut_command_is_valid
+! self_check >/dev/null
+chmod 755 "$SHORTCUT_PATH"
+printf '%s\n' '#!/bin/bash' 'exec bash /tmp/foreign "$@"' > "$SHORTCUT_PATH"
+! shortcut_command_is_valid
+rm -f "$SHORTCUT_PATH"
+ln -s "$INSTALLED_SCRIPT_PATH" "$SHORTCUT_PATH"
+! shortcut_command_is_valid
+rm -f "$SHORTCUT_PATH" "$INSTALLED_SCRIPT_PATH"
+(
+    cp() { return 42; }
+    ! create_shortcut_command >/dev/null
+)
+[ ! -e "$SHORTCUT_PATH" ]
+create_shortcut_command >/dev/null
+shortcut_command_is_valid
+
+# tar 部分写出有效配置后返回失败，也必须在任何维护锁和运行态修改前停止。
+readonly IMPORT_PARTIAL_ARCHIVE="$TEST_DIR/import-partial.tar.gz"
+readonly IMPORT_PARTIAL_BEFORE="$TEST_DIR/import-partial-before.json"
+readonly IMPORT_PARTIAL_LOCK_TRACE="$TEST_DIR/import-partial-lock.trace"
+readonly IMPORT_PARTIAL_RUNTIME_TRACE="$TEST_DIR/import-partial-runtime.trace"
+readonly IMPORT_PARTIAL_TEMP_TRACE="$TEST_DIR/import-partial-temp.trace"
+: > "$IMPORT_PARTIAL_ARCHIVE"
+cp "$CONFIG_FILE" "$IMPORT_PARTIAL_BEFORE"
+import_partial_output=$(
+    (
+        tar() {
+            case "${1:-}" in
+                -tzf)
+                    printf '%s\n' \
+                        'port-traffic-dog-config/' \
+                        'port-traffic-dog-config/config.json'
+                    ;;
+                -tvzf)
+                    printf '%s\n' \
+                        'drwx------ root/root 0 2026-08-28 00:00 port-traffic-dog-config/' \
+                        '-rw------- root/root 1 2026-08-28 00:00 port-traffic-dog-config/config.json'
+                    ;;
+                -xzf)
+                    local destination=""
+                    while [ "$#" -gt 0 ]; do
+                        if [ "$1" = "-C" ]; then
+                            destination="$2"
+                            break
+                        fi
+                        shift
+                    done
+                    [ -n "$destination" ] || return 99
+                    printf '%s\n' "$destination" >> "$IMPORT_PARTIAL_TEMP_TRACE"
+                    mkdir -p "$destination/port-traffic-dog-config"
+                    cp "$CONFIG_FILE" "$destination/port-traffic-dog-config/config.json"
+                    printf '%s\n' partial > "$destination/port-traffic-dog-config/partial-file"
+                    return 42
+                    ;;
+                *) return 99 ;;
+            esac
+        }
+        sleep() { :; }
+        manage_configuration() { :; }
+        begin_expiry_update() { printf 'expiry\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        begin_reset_update() { printf 'reset\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        begin_tc_update() { printf 'tc\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        begin_cron_update() { printf 'cron\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        acquire_traffic_stats_lock() { printf 'traffic\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        acquire_config_lock() { printf 'config\n' >> "$IMPORT_PARTIAL_LOCK_TRACE"; return 1; }
+        record_traffic_snapshot() { printf 'snapshot\n' >> "$IMPORT_PARTIAL_RUNTIME_TRACE"; }
+        restore_runtime_state() { printf 'restore\n' >> "$IMPORT_PARTIAL_RUNTIME_TRACE"; }
+        import_config <<EOF
+$IMPORT_PARTIAL_ARCHIVE
+y
+EOF
+    )
+)
+grep -Fq '配置包解压失败，当前配置未作修改' <<< "$import_partial_output"
+cmp -s "$IMPORT_PARTIAL_BEFORE" "$CONFIG_FILE"
+[ ! -e "$IMPORT_PARTIAL_LOCK_TRACE" ]
+[ ! -e "$IMPORT_PARTIAL_RUNTIME_TRACE" ]
+while IFS= read -r import_temp_dir; do
+    [ ! -e "$import_temp_dir" ]
+done < "$IMPORT_PARTIAL_TEMP_TRACE"
 
 # 普通启动只允许执行轻量初始化，以及检测到旧 cron 时进行一次性迁移。
 readonly STARTUP_TRACE_FILE="$TEST_DIR/startup.trace"
@@ -1618,12 +1789,18 @@ readonly EXPORT_SAVE_CAPTURE="$TEST_DIR/export-save.capture"
 grep -q -- '--refresh-all-cron' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/reset.lock' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- 'port-traffic-dog-config/cron.lock' "$PROJECT_DIR/migrate-to-custom.sh"
-grep -Fq 'CRON_LOCK_DIR="${CONFIG_DIR}/cron.lock"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'CRON_LOCK_DIR="${PORT_TRAFFIC_DOG_CRON_LOCK_DIR:-/run/lock/port-traffic-dog-root-crontab.lock}"' "$PROJECT_DIR/migrate-to-custom.sh"
+! grep -Fq 'CRON_LOCK_DIR="${CONFIG_DIR}/cron.lock"' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq '"${current_pid}" "$(date +%s)" "${current_boot_id}" "${current_start_time}"' "$PROJECT_DIR/migrate-to-custom.sh"
 ! grep -Fq '"${CONFIG_DIR}/reset.lock" "${CONFIG_DIR}/cron.lock"' "$PROJECT_DIR/migrate-to-custom.sh"
 [ "$(grep -c 'crontab -l' "$SCRIPT_FILE")" -eq 1 ]
 grep -q '^umask 077$' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -q -- '--validate-config' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'IP_GUARD_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/port-ip-guard.sh"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'bash "${tmp_ip_guard}" --validate-config "${CONFIG_DIR}/ip-guard.json"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'bash "${tmp_ip_guard}" --validate-config "${tmp_ip_guard_invalid_config}"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'cmp -s "${tmp_ip_guard}" "${IP_GUARD_PATH}"' "$PROJECT_DIR/migrate-to-custom.sh"
+grep -Fq 'restart_ip_guard_after_migration' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'bash "${INSTALLED_SCRIPT_PATH}" --restore-runtime' "$PROJECT_DIR/migrate-to-custom.sh"
 grep -Fq -- 'archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"' "$SCRIPT_FILE"
 grep -Fq -- 'bash "$INSTALLED_SCRIPT_PATH" --finalize-update' "$SCRIPT_FILE"
@@ -1638,8 +1815,57 @@ for expected_call in \
     check_dependencies init_config setup_script_permissions setup_cron_environment \
     create_shortcut_command install_tc_recovery_service_files download_notification_modules \
     refresh_all_cron_from_config repair_duplicate_traffic_rules \
-    restore_runtime_state record_traffic_snapshot self_check show_main_menu; do
+    restore_runtime_state record_traffic_snapshot self_check; do
     [ "$(grep -c -x "$expected_call" "$STARTUP_TRACE_FILE")" -eq 1 ]
+done
+[ "$(grep -c -x show_main_menu "$STARTUP_TRACE_FILE")" -eq 0 ]
+
+# cron 环境失败必须由全量刷新继续传播，同时仍尝试其余独立 cron 子步骤。
+(
+    eval "$ORIGINAL_REFRESH_ALL_CRON_DEFINITION"
+    setup_cron_environment() { return 31; }
+    refresh_port_auto_reset_cron_from_config() { touch "$TEST_DIR/refresh-reset.called"; }
+    refresh_notification_cron_from_config() { touch "$TEST_DIR/refresh-notification.called"; }
+    setup_traffic_snapshot_cron() { touch "$TEST_DIR/refresh-snapshot.called"; }
+    ! refresh_all_cron_from_config
+)
+[ -e "$TEST_DIR/refresh-reset.called" ]
+[ -e "$TEST_DIR/refresh-notification.called" ]
+[ -e "$TEST_DIR/refresh-snapshot.called" ]
+
+# 每个关键步骤单独失败时都必须返回非零；核心修复函数不得递归进入主菜单。
+for failed_step in permissions cron-environment shortcut refresh-cron self-check; do
+    repair_failure_status=0
+    rm -f "$TEST_DIR/system-repair-should-not-call-menu"
+    (
+        check_dependencies() { :; }
+        init_config() { :; }
+        setup_script_permissions() { [ "$failed_step" != permissions ]; }
+        setup_cron_environment() { [ "$failed_step" != cron-environment ]; }
+        create_shortcut_command() { [ "$failed_step" != shortcut ]; }
+        install_tc_recovery_service_files() { :; }
+        download_notification_modules() { :; }
+        refresh_all_cron_from_config() { [ "$failed_step" != refresh-cron ]; }
+        repair_duplicate_traffic_rules() { echo 0; }
+        restore_runtime_state() { :; }
+        record_traffic_snapshot() { :; }
+        self_check() { [ "$failed_step" != self-check ]; }
+        show_main_menu() { touch "$TEST_DIR/system-repair-should-not-call-menu"; }
+        clear() { :; }
+        read() { :; }
+        system_check_and_repair
+    ) > "$TEST_DIR/system-repair-${failed_step}.out" 2>&1 || repair_failure_status=$?
+    [ "$repair_failure_status" -eq 1 ]
+    [ ! -e "$TEST_DIR/system-repair-should-not-call-menu" ]
+    ! grep -Fq '系统自检/修复完成' "$TEST_DIR/system-repair-${failed_step}.out"
+    case "$failed_step" in
+        permissions|cron-environment|shortcut)
+            ! grep -Fq '基础运行环境已就绪' "$TEST_DIR/system-repair-${failed_step}.out"
+            ;;
+        refresh-cron)
+            ! grep -Fq '定时任务已按当前配置刷新' "$TEST_DIR/system-repair-${failed_step}.out"
+            ;;
+    esac
 done
 
 [ "$(dog_tc_status_kind 'TC_STATUS=OK INTERFACE=eth0')" = "ok" ]
@@ -1738,6 +1964,11 @@ grep -Fq '规则正常或当前没有需要恢复的规则时，不会修改 TC�
     tc_recovery_systemd_available() { return 0; }
     mock_tc_recovery_systemctl() { printf '%s\n' "$*" >> "$TEST_DIR/tc-recovery-systemctl.trace"; return 0; }
     rm -f "$TC_RECOVERY_RUNNER"
+    printf '%s\n' '# traffic-tools-tc-recovery-v1' > "$TC_RECOVERY_UNIT_FILE"
+    [ "$(tc_auto_recovery_state)" = '损坏（恢复入口缺失）' ]
+    printf '%s\n' '# foreign runner' > "$TC_RECOVERY_RUNNER"
+    [ "$(tc_auto_recovery_state)" = '冲突（恢复入口不属于 Dog/NTC）' ]
+    rm -f "$TC_RECOVERY_RUNNER"
     printf '%s\n' '# foreign unit' > "$TC_RECOVERY_UNIT_FILE"
     if install_tc_recovery_service_files >/dev/null 2>&1; then
         exit 1
@@ -1768,6 +1999,87 @@ grep -Fq '规则正常或当前没有需要恢复的规则时，不会修改 TC�
     grep -Fq 'exit "$result"' "$TC_RECOVERY_RUNNER"
 )
 
+# NTC 已禁用时，Dog 不得使用残留状态恢复整机上限；配置恢复启用后仍读取原速率。
+printf '%s\n' 'DISABLED=true' > "$TRAFFICCOP_CONFIG_FILE"
+chmod 600 "$TRAFFICCOP_CONFIG_FILE"
+printf '%s\n' \
+    'SCHEMA=traffic-tools-unified-htb-v1' \
+    'PROVIDER=trafficcop-lite' \
+    'INTERFACE=eth0' \
+    'LIMIT_SPEED=90000' > "$TRAFFICCOP_TC_STATE_FILE"
+chmod 600 "$TRAFFICCOP_TC_STATE_FILE"
+ntc_state_status=0
+trafficcop_unified_state_rate eth0 >/dev/null || ntc_state_status=$?
+[ "$ntc_state_status" -eq 5 ]
+[ "$(desired_tc_parent_rate eth0)" = "$TC_PARENT_RATE" ]
+
+# NTC 明确禁用后，残留 state 不得阻止 Dog 删除最后一个端口类或卸载遗留 root。
+(
+    owner_file="$TEST_DIR/disabled-ntc-cleanup.owner"
+    cleanup_capture="$TEST_DIR/disabled-ntc-cleanup.capture"
+    printf '%s\n' 'eth0|unified-htb-v3' > "$owner_file"
+    get_default_interface() { printf '%s\n' eth0; }
+    get_tc_root_owner_file() { printf '%s\n' "$owner_file"; }
+    tc_root_is_owned() { return 0; }
+    tc() {
+        case "$*" in
+            'class show dev eth0')
+                printf '%s\n' \
+                    'class htb 1:1 root rate 100Gbit ceil 100Gbit' \
+                    'class htb 1:30 parent 1:1 rate 1Kbit ceil 100Gbit'
+                ;;
+            'filter show dev eth0 parent 1:0') return 0 ;;
+            'qdisc del dev eth0 root handle 1:') touch "$cleanup_capture" ;;
+            *) return 1 ;;
+        esac
+    }
+    cleanup_owned_tc_root_if_unused_locked eth0
+    [ -e "$cleanup_capture" ]
+)
+(
+    unset -f read
+    owner_fixture=$(get_tc_root_owner_file)
+    cleanup_capture="$TEST_DIR/disabled-ntc-uninstall.capture"
+    printf '%s\n' 'eth0|unified-htb-v3' > "$owner_fixture"
+    begin_tc_update() { :; }
+    finish_tc_update() { :; }
+    tc_root_is_owned() { return 0; }
+    log_notification() { :; }
+    tc() {
+        [ "$*" = 'qdisc del dev eth0 root handle 1:' ] || return 1
+        touch "$cleanup_capture"
+    }
+    cleanup_owned_tc_root_without_config
+    [ -e "$cleanup_capture" ]
+    [ ! -e "$owner_fixture" ]
+)
+
+printf '%s\n' 'DISABLED=false' > "$TRAFFICCOP_CONFIG_FILE"
+[ "$(trafficcop_unified_state_rate eth0)" = '90000kbit' ]
+printf '%s\n' 'DISABLED=false' 'DISABLED=false' > "$TRAFFICCOP_CONFIG_FILE"
+ntc_state_status=0
+trafficcop_unified_state_rate eth0 >/dev/null || ntc_state_status=$?
+[ "$ntc_state_status" -eq 2 ]
+
+# Dog 的 cron 开机入口只恢复 nftables，不再成为第二个 TC writer。
+update_config_file '.ports["3265"] = {
+    enabled: true,
+    bandwidth_limit: {enabled: true, rate: "10Mbps"}
+}'
+(
+    validate_config_file() { :; }
+    init_nftables() { :; }
+    reconcile_orphaned_runtime_objects() { :; }
+    get_active_ports() { printf '%s\n' 3265; }
+    port_counter_objects_exist() { :; }
+    repair_port_traffic_rules() { :; }
+    repair_port_quota_rules() { :; }
+    sync_port_expiry_state() { :; }
+    begin_tc_update() { touch "$TEST_DIR/nft-only-tc-called"; }
+    restore_runtime_state false
+)
+[ ! -e "$TEST_DIR/nft-only-tc-called" ]
+
 tc_menu_output=$(
     (
         unset -f read
@@ -1780,5 +2092,14 @@ tc_menu_output=$(
 )
 grep -Fq '开机自动恢复关闭失败' <<< "$tc_menu_output"
 ! grep -Fq '开机自动恢复已关闭' <<< "$tc_menu_output"
+
+# CLI 必须把卸载失败码传给调用方，不能以 0 伪报成功。
+uninstall_status=0
+(
+    check_root() { :; }
+    uninstall_script() { return 23; }
+    main --uninstall
+) >/dev/null 2>&1 || uninstall_status=$?
+[ "$uninstall_status" -eq 23 ]
 
 echo "regression tests passed"
