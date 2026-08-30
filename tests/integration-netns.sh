@@ -32,6 +32,13 @@ trap '
     fi
 ' ERR
 
+assert_fails() {
+    if "$@"; then
+        echo "expected command to fail but it succeeded: $*" >&2
+        return 1
+    fi
+}
+
 source <(sed \
     -e "s#^readonly CONFIG_DIR=.*#readonly CONFIG_DIR=\"$TEST_DIR/config\"#" \
     -e "s#^readonly EXPIRY_LOCK_FILE=.*#readonly EXPIRY_LOCK_FILE=\"$TEST_DIR/expiry.lock\"#" \
@@ -181,9 +188,9 @@ nft insert rule inet port_traffic_monitor output tcp sport 33366 counter name po
 nft insert rule inet port_traffic_monitor input tcp dport 33366 quota name port_33366_quota drop
 [ "$(list_orphaned_runtime_objects | wc -l)" -eq 3 ]
 reconcile_orphaned_runtime_objects
-! nft list counter inet port_traffic_monitor port_33366_in >/dev/null 2>&1
-! nft list counter inet port_traffic_monitor port_33366_out >/dev/null 2>&1
-! nft list quota inet port_traffic_monitor port_33366_quota >/dev/null 2>&1
+assert_fails nft list counter inet port_traffic_monitor port_33366_in >/dev/null 2>&1
+assert_fails nft list counter inet port_traffic_monitor port_33366_out >/dev/null 2>&1
+assert_fails nft list quota inet port_traffic_monitor port_33366_quota >/dev/null 2>&1
 nft list counter inet port_traffic_monitor port_3265_in >/dev/null
 nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
 
@@ -223,8 +230,8 @@ read -r input_bytes output_bytes < <(get_nftables_counter_data 3265)
 quota_used=$(nft -j list quota inet port_traffic_monitor port_3265_quota |
     jq -r '.nftables[] | select(.quota != null) | .quota.used // 0')
 [ "$quota_used" -eq 0 ]
-! counter_direction_has_preceding_terminal_rule 3265 in
-! counter_direction_has_preceding_terminal_rule 3265 out
+assert_fails counter_direction_has_preceding_terminal_rule 3265 in
+assert_fails counter_direction_has_preceding_terminal_rule 3265 out
 
 python3 -c '
 import socket
@@ -245,7 +252,7 @@ nft list quota inet port_traffic_monitor port_3265_quota >/dev/null
 nft insert rule inet port_traffic_monitor input tcp dport 3000-4000 accept
 apply_nftables_quota 3265 1GB
 counter_direction_has_preceding_terminal_rule 3265 in
-! counter_direction_has_preceding_terminal_rule 3265 out
+assert_fails counter_direction_has_preceding_terminal_rule 3265 out
 
 python3 -c '
 import socket
@@ -279,8 +286,8 @@ read -r order_input_after order_output_after < <(get_nftables_counter_data 3265)
 order_quota_after=$(get_nftables_quota_used 3265)
 [ "$order_input_after" -gt "$order_input_before" ]
 [ $((order_input_after + order_output_after)) -eq "$order_quota_after" ]
-! counter_direction_has_preceding_terminal_rule 3265 in
-! counter_direction_has_preceding_terminal_rule 3265 out
+assert_fails counter_direction_has_preceding_terminal_rule 3265 in
+assert_fails counter_direction_has_preceding_terminal_rule 3265 out
 port_counter_quota_usage_consistent 3265
 
 # If only one direction loses a counter rule, recover the quota/counter gap before rebuilding.
@@ -352,9 +359,9 @@ atomic_quota_rules_before=$(count_quota_rules 3265)
         fi
         command nft "$@"
     }
-    ! repair_port_traffic_rules 3265 true
-    ! apply_nftables_quota 3265 2GB
-    ! add_nftables_rules 3265
+    assert_fails repair_port_traffic_rules 3265 true
+    assert_fails apply_nftables_quota 3265 2GB
+    assert_fails add_nftables_rules 3265
 )
 read -r atomic_input_after atomic_output_after < <(get_nftables_counter_data 3265)
 [ "$atomic_input_after" -eq "$atomic_input_before" ]
@@ -438,12 +445,12 @@ tc_class_rate_matches eth0 1:1 "$TC_PARENT_RATE"
 # Missing IPv4 UDP filters and rate drift must both fail runtime validation.
 filter_prio=$((3265 % 1000 + 1))
 tc filter del dev eth0 protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32
-! tc_limit_runtime_complete 3265
+assert_fails tc_limit_runtime_complete 3265
 remove_tc_limit 3265
 apply_tc_limit 3265 10mbit
 tc_limit_runtime_complete 3265
 tc class replace dev eth0 parent 1:1 classid "$class_id" htb rate 20mbit ceil 20mbit
-! tc_limit_runtime_complete 3265
+assert_fails tc_limit_runtime_complete 3265
 remove_tc_limit 3265
 wait_for_tc_state qdisc "qdisc htb 1:" absent
 [ ! -f "$(get_tc_root_owner_file)" ]
@@ -453,18 +460,21 @@ apply_tc_limit 3265 10mbit
 tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 87mbit ceil 87mbit
-! apply_tc_limit 3265 10mbit
+assert_fails apply_tc_limit 3265 10mbit
 [ ! -f "$(get_tc_root_owner_file)" ]
-! tc class show dev eth0 | grep -Eq '^class htb 1:1([[:space:]]|$)'
+if tc class show dev eth0 | grep -Eq '^class htb 1:1([[:space:]]|$)'; then
+    echo "unexpected Dog parent class on foreign HTB root" >&2
+    exit 1
+fi
 tc qdisc del dev eth0 root handle 1:
 
 # An unrelated HTB hierarchy must remain untouched.
 tc qdisc add dev eth0 root handle 1: htb default 30
 tc class add dev eth0 parent 1: classid 1:1 htb rate 1mbit
 foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
-! apply_tc_limit 3265 10mbit
+assert_fails apply_tc_limit 3265 10mbit
 write_ntc_unified_state 5000
-! apply_tc_limit 3265 10mbit
+assert_fails apply_tc_limit 3265 10mbit
 [ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
 rm -f "$TRAFFICCOP_TC_STATE_FILE"
 tc class show dev eth0 | grep -Eq '^class htb 1:1 .*rate 1Mbit([[:space:]]|$)'
@@ -484,7 +494,7 @@ apply_tc_limit 3265 10mbit
 tc_root_matches_unified_contract eth0
 tc_class_rate_matches eth0 1:1 5mbit
 tc_limit_runtime_complete 3265
-! grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE"
+assert_fails grep -q '^SCHEMA=' "$TRAFFICCOP_TC_STATE_FILE"
 rm -f "$TRAFFICCOP_TC_STATE_FILE"
 remove_tc_limit 3265
 wait_for_tc_state qdisc "qdisc htb 1:" absent

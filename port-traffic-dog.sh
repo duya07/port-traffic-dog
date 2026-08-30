@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.16"
+readonly SCRIPT_VERSION="1.5.17"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -3590,14 +3590,20 @@ parse_size_to_bytes() {
 
 
 get_active_ports() {
-    jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | tr -d '\r' | sort -n
+    local ports_output
+
+    [ -f "$CONFIG_FILE" ] || return 1
+    jq -e '.ports | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
+    ports_output=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    printf '%s\n' "${ports_output//$'\r'/}" | sort -n
 }
 
 has_active_ports() {
-    [ -f "$CONFIG_FILE" ] || return 1
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    [ ${#active_ports[@]} -gt 0 ]
+    local ports_output
+
+    [ -f "$CONFIG_FILE" ] || return 2
+    ports_output=$(get_active_ports) || return 2
+    [ -n "$ports_output" ]
 }
 
 is_port_range() {
@@ -3655,6 +3661,25 @@ validate_config_file() {
         echo "nftables family 或 table_name 无效" >&2
         return 1
     fi
+
+    if ! jq -e '
+        ((.notifications.telegram.enabled // false) | type == "boolean") and
+        ((.notifications.telegram.status_notifications.enabled // false) | type == "boolean") and
+        ((.notifications.wecom.enabled // false) | type == "boolean") and
+        ((.notifications.wecom.status_notifications.enabled // false) | type == "boolean")
+    ' "$file" >/dev/null 2>&1; then
+        echo "通知开关必须为 true 或 false" >&2
+        return 1
+    fi
+    local notification_channel notification_interval
+    for notification_channel in telegram wecom; do
+        notification_interval=$(jq -r --arg channel "$notification_channel" \
+            '.notifications[$channel].status_notifications.interval // "1h"' "$file") || return 1
+        if ! notification_interval_cron_expression "$notification_interval" >/dev/null; then
+            echo "${notification_channel} 状态通知周期无效: $notification_interval" >&2
+            return 1
+        fi
+    done
 
     local ports=()
     mapfile -t ports < <(jq -r '.ports | keys[]' "$file" 2>/dev/null | tr -d '\r')
@@ -3953,12 +3978,20 @@ generate_tc_class_id() {
     local attempts=0
     while [ "$attempts" -lt 65534 ]; do
         local class_id="1:$(printf '%x' "$minor")"
-        if ! tc_minor_in_use "$port" "$minor" && ! tc_class_id_exists "$class_id"; then
-            if save_tc_class_id "$port" "$class_id"; then
-                echo "$class_id"
-                return
-            fi
-            return 1
+        if ! tc_minor_in_use "$port" "$minor"; then
+            local class_exists_status=0
+            tc_class_id_exists "$class_id" || class_exists_status=$?
+            case "$class_exists_status" in
+                0) ;;
+                1)
+                    if save_tc_class_id "$port" "$class_id"; then
+                        echo "$class_id"
+                        return
+                    fi
+                    return 1
+                    ;;
+                *) return 1 ;;
+            esac
         fi
 
         minor=$((minor + 1))
@@ -4017,8 +4050,10 @@ tc_class_id_exists() {
     local class_id="$1"
     local interface
     interface=$(get_default_interface 2>/dev/null || true)
-    [ -n "$interface" ] || return 1
-    tc class show dev "$interface" 2>/dev/null |
+    [ -n "$interface" ] || return 2
+    local class_state
+    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 2
+    printf '%s\n' "$class_state" |
         awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { found=1 } END { exit found ? 0 : 1 }'
 }
 
@@ -5847,12 +5882,15 @@ add_nftables_rules() {
 }
 
 remove_nftables_rules() {
-    local port=$1
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local port="$1"
+    local table_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE") || return 1
+    local family
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE") || return 1
 
     if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
+        local port_safe
+        port_safe=$(echo "$port" | tr '-' '_')
         local search_pattern="port_${port_safe}_"
     else
         local search_pattern="port_${port}_"
@@ -5860,37 +5898,64 @@ remove_nftables_rules() {
 
     # 使用handle删除法：逐个删除匹配的规则
     local deleted_count=0
+    local table_state
     while true; do
-        local handle=$(nft -a list table $family $table_name 2>/dev/null | \
+        if ! table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null); then
+            log_notification "端口 $port 无法读取nftables表，已停止删除规则"
+            return 1
+        fi
+        local handle
+        handle=$(printf '%s\n' "$table_state" | \
             grep -E "(tcp|udp).*(dport|sport).*$search_pattern" | \
             head -n1 | \
-            sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
+            sed -n 's/.*# handle \([0-9]\+\)$/\1/p' || true)
 
         if [ -z "$handle" ]; then
             break
         fi
 
+        local delete_succeeded=false
         for chain in input output forward; do
-            if nft delete rule $family $table_name $chain handle $handle 2>/dev/null; then
+            if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
                 deleted_count=$((deleted_count + 1))
+                delete_succeeded=true
                 break
             fi
         done
+        if [ "$delete_succeeded" != "true" ]; then
+            log_notification "端口 $port 无法删除nftables规则handle=$handle，已停止清理"
+            return 1
+        fi
 
         if [ $deleted_count -ge 150 ]; then
-            break
+            log_notification "端口 $port nftables规则超过安全清理上限，已停止清理"
+            return 1
         fi
     done
 
-    # 删除计数器
+    # 删除计数器；对象不存在是幂等成功，删除失败或删除后仍存在则报错。
+    local counter_names=()
     if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
-        nft delete counter $family $table_name "port_${port_safe}_in" 2>/dev/null || true
-        nft delete counter $family $table_name "port_${port_safe}_out" 2>/dev/null || true
+        counter_names=("port_${port_safe}_in" "port_${port_safe}_out")
     else
-        nft delete counter $family $table_name "port_${port}_in" 2>/dev/null || true
-        nft delete counter $family $table_name "port_${port}_out" 2>/dev/null || true
+        counter_names=("port_${port}_in" "port_${port}_out")
     fi
+    local counter_name
+    for counter_name in "${counter_names[@]}"; do
+        if printf '%s\n' "$table_state" |
+           grep -Eq "^[[:space:]]*counter[[:space:]]+$counter_name([[:space:]]|\\{)"; then
+            nft delete counter "$family" "$table_name" "$counter_name" 2>/dev/null || {
+                log_notification "端口 $port 无法删除nftables计数器: $counter_name"
+                return 1
+            }
+            table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null) || return 1
+            if printf '%s\n' "$table_state" |
+               grep -Eq "^[[:space:]]*counter[[:space:]]+$counter_name([[:space:]]|\\{)"; then
+                log_notification "端口 $port nftables计数器删除后仍然存在: $counter_name"
+                return 1
+            fi
+        fi
+    done
 }
 
 restore_previous_tc_limit() {
@@ -6488,13 +6553,16 @@ nftables_quota_is_absent() {
 
 # 删除nftables配额限制 - 使用handle删除法
 remove_nftables_quota() {
-    local port=$1
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
+    local port="$1"
+    local table_name
+    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE") || return 1
+    local family
+    family=$(jq -r '.nftables.family' "$CONFIG_FILE") || return 1
 
     # 检查是否为端口段
     if is_port_range "$port"; then
-        local port_safe=$(echo "$port" | tr '-' '_')
+        local port_safe
+        port_safe=$(echo "$port" | tr '-' '_')
         local quota_name="port_${port_safe}_quota"
     else
         local quota_name="port_${port}_quota"
@@ -6502,31 +6570,54 @@ remove_nftables_quota() {
 
     # 循环删除所有包含配额名称的规则 - 每次只获取一个handle
     local deleted_count=0
+    local table_state
     while true; do
+        if ! table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null); then
+            log_notification "端口 $port 无法读取nftables表，已停止删除配额"
+            return 1
+        fi
         # 每次只获取第一个匹配的配额规则handle
-        local handle=$(nft -a list table $family $table_name 2>/dev/null | \
+        local handle
+        handle=$(printf '%s\n' "$table_state" | \
             grep "quota name \"$quota_name\"" | \
             head -n1 | \
-            sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
+            sed -n 's/.*# handle \([0-9]\+\)$/\1/p' || true)
 
         if [ -z "$handle" ]; then
             break
         fi
 
+        local delete_succeeded=false
         for chain in input output forward; do
-            if nft delete rule $family $table_name $chain handle $handle 2>/dev/null; then
+            if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
                 deleted_count=$((deleted_count + 1))
+                delete_succeeded=true
                 break
             fi
         done
+        if [ "$delete_succeeded" != "true" ]; then
+            log_notification "端口 $port 无法删除nftables配额规则handle=$handle，已停止清理"
+            return 1
+        fi
 
         if [ $deleted_count -ge 150 ]; then
-            break
+            log_notification "端口 $port nftables配额规则超过安全清理上限，已停止清理"
+            return 1
         fi
     done
 
-    if nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1; then
-        nft delete quota "$family" "$table_name" "$quota_name" 2>/dev/null || true
+    if printf '%s\n' "$table_state" |
+       grep -Eq "^[[:space:]]*quota[[:space:]]+$quota_name([[:space:]]|\\{)"; then
+        nft delete quota "$family" "$table_name" "$quota_name" 2>/dev/null || {
+            log_notification "端口 $port 无法删除nftables配额对象: $quota_name"
+            return 1
+        }
+        table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null) || return 1
+        if printf '%s\n' "$table_state" |
+           grep -Eq "^[[:space:]]*quota[[:space:]]+$quota_name([[:space:]]|\\{)"; then
+            log_notification "端口 $port nftables配额对象删除后仍然存在: $quota_name"
+            return 1
+        fi
     fi
 }
 
@@ -6869,7 +6960,10 @@ ensure_owned_tc_hierarchy_locked() {
     ENSURE_TC_ROOT_CREATED=false
     ENSURE_TC_ROOT_MIGRATED=false
     [ -n "$interface" ] || return 1
-    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+    if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null); then
+        log_notification "无法读取网卡TC根队列，已拒绝修改统一HTB: $interface"
+        return 1
+    fi
     qdisc_line=$(printf '%s\n' "$qdisc_state" | head -n 1)
 
     if grep -Eq '^qdisc tbf .* root([[:space:]]|$)' <<< "$qdisc_line"; then
@@ -6898,9 +6992,12 @@ ensure_owned_tc_hierarchy_locked() {
             log_notification "检测到不属于Dog/TrafficCop统一协议的HTB根队列，已拒绝接管: $interface"
             return 1
         fi
-        read -r previous_parent_rate previous_parent_ceil < <(
+        if ! read -r previous_parent_rate previous_parent_ceil < <(
             tc_class_rate_and_ceil "$interface" "1:1"
-        ) || true
+        ); then
+            log_notification "无法读取统一HTB父类，已拒绝修改: $interface"
+            return 1
+        fi
     elif [ "$ENSURE_TC_ROOT_MIGRATED" != "true" ]; then
         if ! tc_root_qdisc_is_replaceable "$qdisc_state"; then
             log_notification "检测到不可安全替换的根qdisc，已拒绝创建统一HTB: $interface"
@@ -6964,12 +7061,12 @@ cleanup_owned_tc_root_if_unused_locked() {
     # 1:1 与 1:30 是统一层级的基础分类；其他分类或过滤器表示端口限速仍在使用。
     local class_output
     local filter_output
-    class_output=$(tc class show dev "$interface" 2>/dev/null) || return 0
+    class_output=$(tc class show dev "$interface" 2>/dev/null) || return 1
     if printf '%s\n' "$class_output" |
        awk '$1 == "class" && $2 == "htb" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }'; then
         return 0
     fi
-    filter_output=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 0
+    filter_output=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 1
     if [ -n "$filter_output" ]; then
         return 0
     fi
@@ -6986,9 +7083,10 @@ cleanup_owned_tc_root_if_unused_locked() {
         return 1
     fi
 
-    if tc qdisc del dev "$interface" root handle 1: 2>/dev/null; then
-        rm -f "$(get_tc_root_owner_file)"
+    if ! tc qdisc del dev "$interface" root handle 1: 2>/dev/null; then
+        return 1
     fi
+    rm -f "$(get_tc_root_owner_file)"
 }
 
 cleanup_owned_tc_root_if_unused() {
@@ -7099,8 +7197,16 @@ apply_tc_limit_locked() {
         fi
     fi
 
-    class_state=$(tc class show dev "$interface" 2>/dev/null || true)
-    grep -Fq "class htb $class_id " <<< "$class_state" || return 1
+    if ! class_state=$(tc class show dev "$interface" 2>/dev/null); then
+        remove_tc_limit_locked "$port" "$class_id" >/dev/null 2>&1 || true
+        log_notification "端口 $port 无法核验TC限速分类: $class_id"
+        return 1
+    fi
+    if ! grep -Fq "class htb $class_id " <<< "$class_state"; then
+        remove_tc_limit_locked "$port" "$class_id" >/dev/null 2>&1 || true
+        log_notification "端口 $port TC限速分类创建后未找到: $class_id"
+        return 1
+    fi
     if [ "$legacy_class_id" != "$class_id" ]; then
         tc class del dev "$interface" classid "$legacy_class_id" 2>/dev/null || true
     fi
@@ -7152,7 +7258,14 @@ remove_tc_limit_locked() {
 
     [ -n "$interface" ] || return 1
     local qdisc_state
-    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
+    local initial_class_state
+    local initial_filter_state
+    if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
+       ! initial_class_state=$(tc class show dev "$interface" 2>/dev/null) ||
+       ! initial_filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+        log_notification "端口 $port 无法读取完整TC状态，已拒绝删除TC对象: $interface"
+        return 1
+    fi
     if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state" &&
        ! tc_root_is_managed "$interface" &&
        ! adopt_legacy_tc_root_if_safe "$interface"; then
@@ -7228,19 +7341,27 @@ remove_tc_limit_locked() {
     cleanup_owned_tc_root_if_unused_locked "$interface"
 
     local cleanup_ok=true
-    if [ -n "$class_id" ] && tc_class_id_exists "$class_id"; then
-        cleanup_ok=false
+    if [ -n "$class_id" ]; then
+        local class_exists_status=0
+        tc_class_id_exists "$class_id" || class_exists_status=$?
+        [ "$class_exists_status" -eq 1 ] || cleanup_ok=false
     fi
-    if [ -n "$class_id" ] && tc filter show dev "$interface" parent 1:0 2>/dev/null |
-        grep -Eq "(flowid|classid)[[:space:]]+$class_id([[:space:]]|$)"; then
-        cleanup_ok=false
+    if [ -n "$class_id" ]; then
+        local filter_state
+        if ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+            cleanup_ok=false
+        elif grep -Eq "(flowid|classid)[[:space:]]+$class_id([[:space:]]|$)" <<< "$filter_state"; then
+            cleanup_ok=false
+        fi
     fi
     if is_port_range "$port"; then
         local remaining_comment
+        local nft_state
         remaining_comment=$(get_port_range_mark_comment "$port")
-        if nft -a list table "$(jq -r '.nftables.family' "$CONFIG_FILE")" \
-            "$(jq -r '.nftables.table_name' "$CONFIG_FILE")" 2>/dev/null |
-            grep -Fq "comment \"$remaining_comment\""; then
+        if ! nft_state=$(nft -a list table "$(jq -r '.nftables.family' "$CONFIG_FILE")" \
+            "$(jq -r '.nftables.table_name' "$CONFIG_FILE")" 2>/dev/null); then
+            cleanup_ok=false
+        elif grep -Fq "comment \"$remaining_comment\"" <<< "$nft_state"; then
             cleanup_ok=false
         fi
     fi
@@ -7455,8 +7576,16 @@ dog_tc_status() {
 
     local runtime_status=0
     local qdisc_state
+    local class_state
+    local filter_state
+    if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
+       ! class_state=$(tc class show dev "$interface" 2>/dev/null) ||
+       ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+        finish_tc_update
+        echo "TC_STATUS=ERROR INTERFACE=$interface REASON=status-read-failed"
+        return 1
+    fi
     dog_tc_runtime_complete_all "$interface" || runtime_status=$?
-    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
 
     local result=0
     case "$runtime_status" in
@@ -7514,6 +7643,17 @@ recover_tc_runtime() {
         return 1
     fi
 
+    local qdisc_state
+    local class_state
+    local filter_state
+    if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
+       ! class_state=$(tc class show dev "$interface" 2>/dev/null) ||
+       ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+        finish_tc_update
+        echo "无法读取完整 TC 状态，未修改 qdisc。" >&2
+        return 1
+    fi
+
     local runtime_status=0
     dog_tc_runtime_complete_all "$interface" || runtime_status=$?
     if [ "$runtime_status" -eq 0 ]; then
@@ -7537,8 +7677,6 @@ recover_tc_runtime() {
         return 0
     fi
 
-    local qdisc_state
-    qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null || true)
     if [ "$mode" = "--auto" ] && ! tc_root_qdisc_is_replaceable "$qdisc_state"; then
         finish_tc_update
         echo "自动恢复检测到外部或未知 root qdisc，拒绝接管；请由用户确认后执行手动重建。" >&2
@@ -9226,10 +9364,23 @@ install_update_script() {
     local backup_dir="$temp_dir/backup"
     local notifications_dir="$CONFIG_DIR/notifications"
     local shortcut_path="$SHORTCUT_PATH"
-    mkdir -p "$backup_dir"
-    [ -f "$INSTALLED_SCRIPT_PATH" ] && cp -a "$INSTALLED_SCRIPT_PATH" "$backup_dir/port-traffic-dog.sh"
-    [ -f "$shortcut_path" ] && cp -a "$shortcut_path" "$backup_dir/dog"
-    [ -d "$CONFIG_DIR" ] && cp -a "$CONFIG_DIR" "$backup_dir/config"
+    local had_installed_script=false
+    local had_shortcut=false
+    local had_config_dir=false
+    [ -f "$INSTALLED_SCRIPT_PATH" ] && had_installed_script=true
+    [ -f "$shortcut_path" ] && had_shortcut=true
+    [ -d "$CONFIG_DIR" ] && had_config_dir=true
+    if ! mkdir -p "$backup_dir" ||
+       { [ "$had_installed_script" = "true" ] &&
+         ! cp -a "$INSTALLED_SCRIPT_PATH" "$backup_dir/port-traffic-dog.sh"; } ||
+       { [ "$had_shortcut" = "true" ] &&
+         ! cp -a "$shortcut_path" "$backup_dir/dog"; } ||
+       { [ "$had_config_dir" = "true" ] &&
+         ! cp -a "$CONFIG_DIR" "$backup_dir/config"; }; then
+        echo -e "${RED}无法完整备份当前脚本或配置，已停止更新${NC}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
     if ! read_root_crontab_locked > "$backup_dir/root.crontab"; then
         echo -e "${RED}无法备份 root crontab，已停止更新${NC}"
         rm -rf "$temp_dir"
@@ -9321,17 +9472,19 @@ install_update_script() {
 
         rm -f "${INSTALLED_SCRIPT_PATH}.new.$$" "$INSTALLED_SCRIPT_PATH" "$shortcut_path"
         rm -rf "$CONFIG_DIR"
-        if [ -f "$backup_dir/port-traffic-dog.sh" ]; then
+        if [ "$had_installed_script" = "true" ] && [ -f "$backup_dir/port-traffic-dog.sh" ]; then
             cp -a "$backup_dir/port-traffic-dog.sh" "$INSTALLED_SCRIPT_PATH" || rollback_ok=false
-        else
+        elif [ "$had_installed_script" = "true" ]; then
             rollback_ok=false
         fi
-        if [ -f "$backup_dir/dog" ]; then
+        if [ "$had_shortcut" = "true" ] && [ -f "$backup_dir/dog" ]; then
             cp -a "$backup_dir/dog" "$shortcut_path" || rollback_ok=false
+        elif [ "$had_shortcut" = "true" ]; then
+            rollback_ok=false
         fi
-        if [ -d "$backup_dir/config" ]; then
+        if [ "$had_config_dir" = "true" ] && [ -d "$backup_dir/config" ]; then
             cp -a "$backup_dir/config" "$CONFIG_DIR" || rollback_ok=false
-        else
+        elif [ "$had_config_dir" = "true" ]; then
             rollback_ok=false
         fi
         if begin_cron_update; then
@@ -9341,7 +9494,7 @@ install_update_script() {
             rollback_ok=false
         fi
         finish_full_maintenance_update
-        if [ "$rollback_ok" = "true" ] && [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        if [ "$rollback_ok" = "true" ] && [ "$had_installed_script" = "true" ]; then
             bash "$INSTALLED_SCRIPT_PATH" --restore-runtime >/dev/null 2>&1 || rollback_ok=false
         fi
         if [ "$ip_guard_was_active" = "true" ] &&
@@ -9920,6 +10073,7 @@ setup_telegram_notification_cron() {
     local temp_cron=$(mktemp)
     local current_cron
 
+    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
@@ -9931,12 +10085,23 @@ setup_telegram_notification_cron() {
     # 通道总开关和状态通知开关必须同时启用。
     local telegram_channel_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE")
     local telegram_status_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$telegram_channel_enabled" = "true" ] && [ "$telegram_status_enabled" = "true" ] && has_active_ports; then
+    local active_ports_status=0
+    has_active_ports || active_ports_status=$?
+    if [ "$active_ports_status" -gt 1 ]; then
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    fi
+    if [ "$telegram_channel_enabled" = "true" ] && [ "$telegram_status_enabled" = "true" ] &&
+       [ "$active_ports_status" -eq 0 ]; then
         local status_interval=$(jq -r '.notifications.telegram.status_notifications.interval' "$CONFIG_FILE")
         local schedule
-        if schedule=$(notification_interval_cron_expression "$status_interval"); then
-            echo "$schedule $script_path --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知" >> "$temp_cron"
-        fi
+        schedule=$(notification_interval_cron_expression "$status_interval") || {
+            rm -f "$temp_cron"
+            release_cron_update
+            return 1
+        }
+        echo "$schedule $script_path --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知" >> "$temp_cron"
     fi
 
     finish_cron_update "$temp_cron"
@@ -9947,6 +10112,7 @@ setup_wecom_notification_cron() {
     script_path=$(get_script_exec_path)
     local temp_cron=$(mktemp)
     local current_cron
+    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
@@ -9958,12 +10124,23 @@ setup_wecom_notification_cron() {
     # 通道总开关和状态通知开关必须同时启用。
     local wecom_channel_enabled=$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE")
     local wecom_status_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
-    if [ "$wecom_channel_enabled" = "true" ] && [ "$wecom_status_enabled" = "true" ] && has_active_ports; then
+    local active_ports_status=0
+    has_active_ports || active_ports_status=$?
+    if [ "$active_ports_status" -gt 1 ]; then
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    fi
+    if [ "$wecom_channel_enabled" = "true" ] && [ "$wecom_status_enabled" = "true" ] &&
+       [ "$active_ports_status" -eq 0 ]; then
         local wecom_interval=$(jq -r '.notifications.wecom.status_notifications.interval' "$CONFIG_FILE")
         local schedule
-        if schedule=$(notification_interval_cron_expression "$wecom_interval"); then
-            echo "$schedule $script_path --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知" >> "$temp_cron"
-        fi
+        schedule=$(notification_interval_cron_expression "$wecom_interval") || {
+            rm -f "$temp_cron"
+            release_cron_update
+            return 1
+        }
+        echo "$schedule $script_path --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知" >> "$temp_cron"
     fi
 
     finish_cron_update "$temp_cron"
@@ -10138,6 +10315,7 @@ setup_traffic_snapshot_cron() {
     temp_cron=$(mktemp)
     local current_cron
 
+    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
         rm -f "$temp_cron"
@@ -10146,7 +10324,14 @@ setup_traffic_snapshot_cron() {
     fi
     printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
 
-    if has_active_ports; then
+    local active_ports_status=0
+    has_active_ports || active_ports_status=$?
+    if [ "$active_ports_status" -gt 1 ]; then
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    fi
+    if [ "$active_ports_status" -eq 0 ]; then
         echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
     fi
     local result=0
@@ -10406,7 +10591,12 @@ log_notification() {
 
 # 通用状态通知发送函数
 send_status_notification() {
-    has_active_ports || return 0
+    local active_ports_status=0
+    has_active_ports || active_ports_status=$?
+    [ "$active_ports_status" -eq 0 ] || {
+        [ "$active_ports_status" -eq 1 ] && return 0
+        return 1
+    }
 
     local success_count=0
     local total_count=0
@@ -11052,7 +11242,13 @@ main() {
                 exit "$recovery_status"
                 ;;
             --snapshot-traffic)
-                if ! has_active_ports; then
+                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
+                local active_ports_status=0
+                has_active_ports || active_ports_status=$?
+                if [ "$active_ports_status" -gt 1 ]; then
+                    exit 1
+                fi
+                if [ "$active_ports_status" -eq 1 ]; then
                     remove_traffic_snapshot_cron >/dev/null 2>&1 || true
                     exit 0
                 fi
@@ -11063,7 +11259,13 @@ main() {
                 exit $?
                 ;;
             --send-telegram-status)
-                if ! has_active_ports; then
+                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
+                local active_ports_status=0
+                has_active_ports || active_ports_status=$?
+                if [ "$active_ports_status" -gt 1 ]; then
+                    exit 1
+                fi
+                if [ "$active_ports_status" -eq 1 ]; then
                     remove_telegram_notification_cron >/dev/null 2>&1 || true
                     exit 0
                 fi
@@ -11073,7 +11275,13 @@ main() {
                 exit "$telegram_status"
                 ;;
             --send-wecom-status)
-                if ! has_active_ports; then
+                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
+                local active_ports_status=0
+                has_active_ports || active_ports_status=$?
+                if [ "$active_ports_status" -gt 1 ]; then
+                    exit 1
+                fi
+                if [ "$active_ports_status" -eq 1 ]; then
                     remove_wecom_notification_cron >/dev/null 2>&1 || true
                     exit 0
                 fi
@@ -11086,7 +11294,13 @@ main() {
                 exit "$wecom_status"
                 ;;
             --send-status)
-                has_active_ports || exit 0
+                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
+                local active_ports_status=0
+                has_active_ports || active_ports_status=$?
+                [ "$active_ports_status" -eq 0 ] || {
+                    [ "$active_ports_status" -eq 1 ] && exit 0
+                    exit 1
+                }
                 local notification_status=0
                 send_status_notification || notification_status=$?
                 exit "$notification_status"

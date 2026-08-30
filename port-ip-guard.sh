@@ -13,6 +13,7 @@ TABLE_NAME="${PTD_IP_GUARD_TABLE_NAME:-port_traffic_dog_ip_guard}"
 readonly TABLE_OWNER_MARKER="port-traffic-dog-ip-guard:v1"
 SERVICE_NAME="${PTD_IP_GUARD_SERVICE_NAME:-port-traffic-dog-ip-guard.service}"
 SERVICE_FILE="${PTD_IP_GUARD_SERVICE_FILE:-/etc/systemd/system/$SERVICE_NAME}"
+readonly SERVICE_OWNER_MARKER="# PORT_TRAFFIC_DOG_IP_GUARD_SERVICE:v1"
 INSTALLED_SCRIPT="${PTD_IP_GUARD_SCRIPT_PATH:-$CONFIG_DIR/port-ip-guard.sh}"
 SYSTEMCTL="${PTD_IP_GUARD_SYSTEMCTL:-systemctl}"
 RECONCILE_SECONDS="${PTD_IP_GUARD_RECONCILE_SECONDS:-60}"
@@ -866,21 +867,48 @@ install_script_safely() {
     fi
 }
 
+service_file_is_owned() {
+    [ -f "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] || return 1
+    grep -Fxq "ExecStart=$INSTALLED_SCRIPT --run" "$SERVICE_FILE" || return 1
+    grep -Fxq "ExecStopPost=-$INSTALLED_SCRIPT --fail-open" "$SERVICE_FILE" || return 1
+    if grep -Fxq "$SERVICE_OWNER_MARKER" "$SERVICE_FILE"; then
+        return 0
+    fi
+
+    # 兼容升级前由本组件创建、尚未带所有权标记的旧单元。
+    grep -Fxq 'Description=Port Traffic Dog active source IP guard (experimental)' "$SERVICE_FILE" &&
+        grep -Fxq 'Type=simple' "$SERVICE_FILE" &&
+        grep -Fxq 'Restart=always' "$SERVICE_FILE"
+}
+
 install_service() {
-    local service_dir temp_service
+    local service_dir temp_service load_state
     command_exists "$SYSTEMCTL" || {
         echo "系统没有 systemd，无法持久运行该测试功能。" >&2
         return 1
     }
-    install_script_safely || return 1
     service_dir=$(dirname "$SERVICE_FILE")
     mkdir -p "$service_dir" || return 1
     if [ -d "$SERVICE_FILE" ]; then
         echo "systemd 单元目标是目录，拒绝覆盖: $SERVICE_FILE" >&2
         return 1
     fi
+    if [ -e "$SERVICE_FILE" ] && ! service_file_is_owned; then
+        echo "同名 systemd 单元不属于本组件，拒绝覆盖: $SERVICE_FILE" >&2
+        return 1
+    fi
+    load_state=$("$SYSTEMCTL" show "$SERVICE_NAME" --property=LoadState --value 2>/dev/null) || {
+        echo "无法确认 $SERVICE_NAME 是否已被其他单元占用。" >&2
+        return 1
+    }
+    if [ "$load_state" != "not-found" ] && [ ! -e "$SERVICE_FILE" ]; then
+        echo "同名 systemd 单元已从其他位置加载，拒绝覆盖: $SERVICE_NAME" >&2
+        return 1
+    fi
+    install_script_safely || return 1
     temp_service=$(mktemp "$service_dir/.${SERVICE_NAME}.XXXXXX") || return 1
     if cat > "$temp_service" <<EOF
+$SERVICE_OWNER_MARKER
 [Unit]
 Description=Port Traffic Dog active source IP guard (experimental)
 After=network-online.target nftables.service
@@ -914,10 +942,25 @@ EOF
     "$SYSTEMCTL" daemon-reload || return 1
     "$SYSTEMCTL" enable "$SERVICE_NAME" >/dev/null || return 1
     "$SYSTEMCTL" restart "$SERVICE_NAME" || return 1
+
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if "$SYSTEMCTL" is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 &&
+           bash "$INSTALLED_SCRIPT" --self-check >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$SERVICE_NAME 重启后未通过 active/self-check 核验。" >&2
+    return 1
 }
 
 stop_service_strict() {
     local load_state active_state enabled_state
+    if [ -e "$SERVICE_FILE" ] && ! service_file_is_owned; then
+        echo "同名 systemd 单元不属于本组件，拒绝停止或删除: $SERVICE_FILE" >&2
+        return 1
+    fi
     command_exists "$SYSTEMCTL" || {
         [ ! -e "$SERVICE_FILE" ] && return 0
         echo "缺少 systemctl，无法确认守护服务已停止。" >&2
@@ -930,6 +973,10 @@ stop_service_strict() {
     if [ "$load_state" = "not-found" ]; then
         [ ! -e "$SERVICE_FILE" ] || return 1
         return 0
+    fi
+    if ! service_file_is_owned; then
+        echo "$SERVICE_NAME 已加载，但无法确认由本组件所有，拒绝停止。" >&2
+        return 1
     fi
 
     # disable --now 先撤销开机入口并请求停止；显式 stop 兼容不支持 --now
@@ -1079,6 +1126,10 @@ self_check() {
         echo "IP_GUARD_STATUS=IDLE"
         return 0
     fi
+    service_file_is_owned || {
+        echo "IP_GUARD_STATUS=ERROR REASON=service-unit-unowned"
+        return 1
+    }
     "$SYSTEMCTL" is-active --quiet "$SERVICE_NAME" 2>/dev/null || {
         echo "IP_GUARD_STATUS=ERROR REASON=service-inactive"
         return 1

@@ -18,6 +18,7 @@ NOTIFICATIONS_DIR="${CONFIG_DIR}/notifications"
 IP_GUARD_PATH="${CONFIG_DIR}/port-ip-guard.sh"
 IP_GUARD_SERVICE="port-traffic-dog-ip-guard.service"
 IP_GUARD_SERVICE_FILE="/etc/systemd/system/${IP_GUARD_SERVICE}"
+IP_GUARD_SERVICE_OWNER_MARKER="# PORT_TRAFFIC_DOG_IP_GUARD_SERVICE:v1"
 IP_GUARD_SYSTEMCTL="${PORT_TRAFFIC_DOG_IP_GUARD_SYSTEMCTL:-systemctl}"
 CRON_LOCK_DIR="${PORT_TRAFFIC_DOG_CRON_LOCK_DIR:-/run/lock/port-traffic-dog-root-crontab.lock}"
 CRON_LOCK_MAX_AGE=86400
@@ -28,6 +29,7 @@ had_config=false
 had_script=false
 had_dog=false
 had_crontab=false
+had_nft_table=false
 install_started=false
 migration_complete=false
 nft_family="inet"
@@ -49,8 +51,22 @@ download_to() {
     fi
 }
 
+ip_guard_service_file_is_owned() {
+    [ -f "${IP_GUARD_SERVICE_FILE}" ] && [ ! -L "${IP_GUARD_SERVICE_FILE}" ] || return 1
+    grep -Fxq "ExecStart=${IP_GUARD_PATH} --run" "${IP_GUARD_SERVICE_FILE}" || return 1
+    grep -Fxq "ExecStopPost=-${IP_GUARD_PATH} --fail-open" "${IP_GUARD_SERVICE_FILE}" || return 1
+    if grep -Fxq "${IP_GUARD_SERVICE_OWNER_MARKER}" "${IP_GUARD_SERVICE_FILE}"; then
+        return 0
+    fi
+    grep -Fxq 'Description=Port Traffic Dog active source IP guard (experimental)' \
+        "${IP_GUARD_SERVICE_FILE}" &&
+        grep -Fxq 'Type=simple' "${IP_GUARD_SERVICE_FILE}" &&
+        grep -Fxq 'Restart=always' "${IP_GUARD_SERVICE_FILE}"
+}
+
 detect_ip_guard_runtime_state() {
     [ -e "${IP_GUARD_SERVICE_FILE}" ] || return 0
+    ip_guard_service_file_is_owned || return 1
     command -v "${IP_GUARD_SYSTEMCTL}" >/dev/null 2>&1 || return 1
 
     local active_state attempt
@@ -61,8 +77,6 @@ detect_ip_guard_runtime_state() {
             active|reloading)
                 ip_guard_was_active=true
                 [ -x "${IP_GUARD_PATH}" ] || return 1
-                grep -Fxq "ExecStart=${IP_GUARD_PATH} --run" "${IP_GUARD_SERVICE_FILE}" || return 1
-                grep -Fxq "ExecStopPost=-${IP_GUARD_PATH} --fail-open" "${IP_GUARD_SERVICE_FILE}" || return 1
                 return 0
                 ;;
             inactive|failed)
@@ -218,6 +232,43 @@ release_cron_lock() {
     cron_lock_held=false
 }
 
+# 返回 0 表示存在 crontab，3 表示明确不存在，其他状态表示读取失败。
+read_root_crontab_to_file() {
+    local output_file="$1"
+    local error_file
+    error_file=$(mktemp "${TMP_DIR}/crontab-error.XXXXXX") || return 1
+    if crontab -l > "${output_file}" 2> "${error_file}"; then
+        rm -f "${error_file}"
+        return 0
+    fi
+    if grep -Eqi 'no crontab for' "${error_file}"; then
+        : > "${output_file}"
+        rm -f "${error_file}"
+        return 3
+    fi
+    echo "错误: 无法读取 root crontab" >&2
+    sed 's/^/  /' "${error_file}" >&2 || true
+    rm -f "${error_file}" "${output_file}"
+    return 1
+}
+
+# 返回 0 表示表存在，1 表示明确不存在，2 表示无法可靠读取。
+nft_table_exists() {
+    local family="$1"
+    local table_name="$2"
+    local tables_json
+    local table_count
+    tables_json=$(nft -j list tables 2>/dev/null) || return 2
+    table_count=$(jq -er --arg family "$family" --arg table "$table_name" '
+        [.nftables[]? | .table? | select(.family == $family and .name == $table)] | length
+    ' <<< "${tables_json}") || return 2
+    case "${table_count}" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) return 2 ;;
+    esac
+}
+
 if [ "${EUID}" -ne 0 ]; then
     echo "错误: 请使用 root 运行"
     exit 1
@@ -259,16 +310,28 @@ cleanup() {
         fi
 
         if command -v nft >/dev/null 2>&1; then
-            nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
-            [ -f "${BACKUP_DIR}/nftables-table.bak" ] &&
+            if [ "${had_nft_table}" = "true" ] &&
+               [ -s "${BACKUP_DIR}/nftables-table.bak" ]; then
+                nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
                 nft -f "${BACKUP_DIR}/nftables-table.bak" >/dev/null 2>&1
+            elif [ "${had_nft_table}" = "false" ]; then
+                nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
+            else
+                echo "警告: nftables 备份缺失，未继续删除当前表。" >&2
+            fi
         fi
         if ! start_original_ip_guard_after_rollback; then
             stop_ip_guard_before_rollback >/dev/null 2>&1 || true
             if command -v nft >/dev/null 2>&1; then
-                nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
-                [ -f "${BACKUP_DIR}/nftables-table.bak" ] &&
+                if [ "${had_nft_table}" = "true" ] &&
+                   [ -s "${BACKUP_DIR}/nftables-table.bak" ]; then
+                    nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
                     nft -f "${BACKUP_DIR}/nftables-table.bak" >/dev/null 2>&1
+                elif [ "${had_nft_table}" = "false" ]; then
+                    nft delete table "${nft_family}" "${nft_table}" >/dev/null 2>&1 || true
+                else
+                    echo "警告: nftables 备份缺失，未继续删除当前表。" >&2
+                fi
             fi
             echo "警告: 旧 IP Guard 服务未能恢复为 active；已再次停止服务并恢复旧 nftables 备份。" >&2
         fi
@@ -319,13 +382,17 @@ if ! detect_ip_guard_runtime_state; then
 fi
 
 acquire_cron_lock || { echo "错误: 无法取得Dog crontab锁"; exit 1; }
-if crontab -l > "${BACKUP_DIR}/root.crontab.bak" 2>/dev/null; then
-    had_crontab=true
-    echo "已备份: root crontab -> ${BACKUP_DIR}/root.crontab.bak"
-else
-    rm -f "${BACKUP_DIR}/root.crontab.bak"
-fi
+crontab_read_status=0
+read_root_crontab_to_file "${BACKUP_DIR}/root.crontab.bak" || crontab_read_status=$?
 release_cron_lock
+case "${crontab_read_status}" in
+    0)
+        had_crontab=true
+        echo "已备份: root crontab -> ${BACKUP_DIR}/root.crontab.bak"
+        ;;
+    3) rm -f "${BACKUP_DIR}/root.crontab.bak" ;;
+    *) exit 1 ;;
+esac
 
 ports_before="[]"
 if [ -f "${CONFIG_DIR}/config.json" ]; then
@@ -338,9 +405,23 @@ if [ -f "${CONFIG_DIR}/config.json" ]; then
     nft_family="$(jq -r '.nftables.family // "inet"' "${CONFIG_DIR}/config.json")"
     nft_table="$(jq -r '.nftables.table_name // "port_traffic_monitor"' "${CONFIG_DIR}/config.json")"
     if command -v nft >/dev/null 2>&1; then
-        nft list table "${nft_family}" "${nft_table}" \
-            > "${BACKUP_DIR}/nftables-table.bak" 2>/dev/null || \
-            rm -f "${BACKUP_DIR}/nftables-table.bak"
+        nft_table_status=0
+        nft_table_exists "${nft_family}" "${nft_table}" || nft_table_status=$?
+        case "${nft_table_status}" in
+            0)
+                if ! nft list table "${nft_family}" "${nft_table}" \
+                    > "${BACKUP_DIR}/nftables-table.bak" 2>/dev/null; then
+                    echo "错误: 无法备份现有 nftables 表，已停止迁移"
+                    exit 1
+                fi
+                had_nft_table=true
+                ;;
+            1) rm -f "${BACKUP_DIR}/nftables-table.bak" ;;
+            *)
+                echo "错误: 无法确认现有 nftables 表状态，已停止迁移"
+                exit 1
+                ;;
+        esac
     fi
 fi
 
@@ -443,8 +524,14 @@ echo "已执行: --repair-traffic-rules"
 echo "已执行: --restore-runtime"
 
 acquire_cron_lock || { echo "错误: 无法取得Dog crontab锁"; exit 1; }
-current_root_cron=$(crontab -l 2>/dev/null || true)
+current_cron_file="${TMP_DIR}/current-root.crontab"
+crontab_read_status=0
+read_root_crontab_to_file "${current_cron_file}" || crontab_read_status=$?
 release_cron_lock
+case "${crontab_read_status}" in
+    0|3) current_root_cron=$(< "${current_cron_file}") ;;
+    *) exit 1 ;;
+esac
 if printf '%s\n' "${current_root_cron}" | grep -Eq \
     'port-traffic-dog.*--(send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'; then
     echo "错误: 仍检测到旧快照定时任务，已停止并保留备份供排查"

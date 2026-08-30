@@ -13,6 +13,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'echo "ip guard regression failed at line $LINENO" >&2' ERR
 
+assert_fails() {
+    if "$@"; then
+        echo "expected command to fail but it succeeded: $*" >&2
+        return 1
+    fi
+}
+
 export PTD_IP_GUARD_CONFIG_DIR="$TEST_DIR/config"
 export PTD_IP_GUARD_CONFIG_FILE="$TEST_DIR/config/ip-guard.json"
 export PTD_IP_GUARD_LOCK_FILE="$TEST_DIR/ip-guard.lock"
@@ -29,8 +36,8 @@ source "$SCRIPT_FILE"
     render_ruleset false > "$TEST_DIR/rendered-rules.nft"
 )
 grep -Fq 'hook input' "$TEST_DIR/rendered-rules.nft"
-! grep -Fq 'guard_forward' "$TEST_DIR/rendered-rules.nft"
-! grep -Fq 'hook forward' "$TEST_DIR/rendered-rules.nft"
+assert_fails grep -Fq 'guard_forward' "$TEST_DIR/rendered-rules.nft"
+assert_fails grep -Fq 'hook forward' "$TEST_DIR/rendered-rules.nft"
 
 # nftables 1.0.x 的 JSON 可能省略表 comment；只接受表顶层精确所有权标记。
 OWNER_TABLES_JSON="$TEST_DIR/owner-tables.json"
@@ -120,7 +127,7 @@ cp "$OWNER_TABLES_JSON" "$OWNER_TABLE_JSON"
     [ -n "${LOCAL_ADDRESSES[192.0.2.10]:-}" ]
     [ -z "${LOCAL_ADDRESSES[203.0.113.99]:-}" ]
     ip() { return 1; }
-    ! load_local_addresses
+    assert_fails load_local_addresses
     [ "${#LOCAL_ADDRESSES[@]}" -eq 0 ]
 )
 
@@ -138,8 +145,8 @@ SYNC_BATCH_CAPTURE="$TEST_DIR/sync-batch.capture"
 )
 grep -Fq "flush set inet $TABLE_NAME p3265_v4" "$SYNC_BATCH_CAPTURE"
 grep -Fq "198.51.100.1" "$SYNC_BATCH_CAPTURE"
-! grep -Fq "p8080_" "$SYNC_BATCH_CAPTURE"
-! grep -Fq "198.51.100.8" "$SYNC_BATCH_CAPTURE"
+assert_fails grep -Fq "p8080_" "$SYNC_BATCH_CAPTURE"
+assert_fails grep -Fq "198.51.100.8" "$SYNC_BATCH_CAPTURE"
 
 # 空快照或名单完全未变化也必须被视为成功，且不得触发 nftables 写入。
 (
@@ -179,7 +186,7 @@ LISTENER_EVENT_PROCESSED="$TEST_DIR/listener.processed"
     rebuild_firewall() { :; }
     process_conntrack_event() { touch "$LISTENER_EVENT_PROCESSED"; }
     fail_open_firewall() { :; }
-    ! run_daemon >/dev/null 2>&1
+    assert_fails run_daemon >/dev/null 2>&1
     [ -f "$LISTENER_EVENT_PROCESSED" ]
 )
 MOCK_LOAD_STATE="loaded"
@@ -191,6 +198,7 @@ MOCK_ENABLED_AFTER_DISABLE="disabled"
 MOCK_DISABLE_RC=0
 MOCK_STOP_RC=0
 MOCK_DAEMON_RELOAD_RC=0
+MOCK_RESTART_RC=0
 
 mock_systemctl() {
     printf '%s\n' "$*" >> "$SYSTEMCTL_TRACE"
@@ -213,6 +221,13 @@ mock_systemctl() {
             MOCK_ACTIVE_STATE="$MOCK_ACTIVE_AFTER_STOP"
             return "$MOCK_STOP_RC"
             ;;
+        enable) return 0 ;;
+        restart)
+            MOCK_LOAD_STATE="loaded"
+            MOCK_ACTIVE_STATE="active"
+            return "$MOCK_RESTART_RC"
+            ;;
+        is-active) [ "$MOCK_ACTIVE_STATE" = "active" ] ;;
         is-enabled)
             echo "$MOCK_ENABLED_STATE"
             [ "$MOCK_ENABLED_STATE" = "enabled" ]
@@ -232,9 +247,16 @@ reset_systemctl_mock() {
     MOCK_DISABLE_RC=0
     MOCK_STOP_RC=0
     MOCK_DAEMON_RELOAD_RC=0
+    MOCK_RESTART_RC=0
     : > "$SYSTEMCTL_TRACE"
     mkdir -p "$(dirname "$SERVICE_FILE")"
-    : > "$SERVICE_FILE"
+    printf '%s\n' \
+        "$SERVICE_OWNER_MARKER" \
+        'Description=Port Traffic Dog active source IP guard (experimental)' \
+        'Type=simple' \
+        "ExecStart=$INSTALLED_SCRIPT --run" \
+        "ExecStopPost=-$INSTALLED_SCRIPT --fail-open" \
+        'Restart=always' > "$SERVICE_FILE"
 }
 
 # 成功路径必须先请求 disable --now/stop，再以最终 systemd 状态为准。
@@ -247,22 +269,60 @@ grep -Fq "stop $SERVICE_NAME" "$SYSTEMCTL_TRACE"
 reset_systemctl_mock
 MOCK_ACTIVE_AFTER_DISABLE="active"
 MOCK_ACTIVE_AFTER_STOP="active"
-! stop_service_strict >/dev/null 2>&1
+assert_fails stop_service_strict >/dev/null 2>&1
 
 # 已停止但仍 enabled，或变成无法明确禁用的 static，也不能继续清理。
 reset_systemctl_mock
 MOCK_ENABLED_AFTER_DISABLE="enabled"
-! stop_service_strict >/dev/null 2>&1
+assert_fails stop_service_strict >/dev/null 2>&1
 reset_systemctl_mock
 MOCK_ENABLED_AFTER_DISABLE="static"
-! stop_service_strict >/dev/null 2>&1
+assert_fails stop_service_strict >/dev/null 2>&1
 
 # systemd 报 not-found 时，只有服务文件也确实不存在才可视为已清理。
 reset_systemctl_mock
 MOCK_LOAD_STATE="not-found"
-! stop_service_strict >/dev/null 2>&1
+assert_fails stop_service_strict >/dev/null 2>&1
 rm -f "$SERVICE_FILE"
 stop_service_strict
+
+# 陌生同名单元不得被停止或被安装流程覆盖。
+printf '%s\n' '[Service]' 'ExecStart=/usr/local/bin/foreign-service' > "$SERVICE_FILE"
+: > "$SYSTEMCTL_TRACE"
+assert_fails stop_service_strict >/dev/null 2>&1
+[ ! -s "$SYSTEMCTL_TRACE" ]
+(
+    install_script_safely() { touch "$TEST_DIR/foreign-install-touched"; }
+    assert_fails install_service >/dev/null 2>&1
+)
+[ ! -e "$TEST_DIR/foreign-install-touched" ]
+
+# 安装只有在服务 active 且已安装脚本自检通过后才算成功。
+(
+    reset_systemctl_mock
+    rm -f "$SERVICE_FILE"
+    MOCK_LOAD_STATE="not-found"
+    install_script_safely() {
+        mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
+        printf '%s\n' '#!/bin/bash' '[ "${1:-}" = "--self-check" ]' > "$INSTALLED_SCRIPT"
+        chmod 755 "$INSTALLED_SCRIPT"
+    }
+    install_service
+    grep -Fxq "$SERVICE_OWNER_MARKER" "$SERVICE_FILE"
+)
+(
+    reset_systemctl_mock
+    rm -f "$SERVICE_FILE"
+    MOCK_LOAD_STATE="not-found"
+    sleep() { :; }
+    install_script_safely() {
+        mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
+        printf '%s\n' '#!/bin/bash' 'exit 1' > "$INSTALLED_SCRIPT"
+        chmod 755 "$INSTALLED_SCRIPT"
+    }
+    assert_fails install_service >/dev/null 2>&1
+)
+reset_systemctl_mock
 
 # self-check 必须核对链、集合和每个端口规则的完整语义，不能只按对象数量通过。
 SELF_CHECK_FIXTURE="$TEST_DIR/self-check.json"
@@ -294,6 +354,7 @@ jq -n '
     check_dependencies() { :; }
     init_config() { :; }
     load_policies() { POLICY_LIMIT=([3265]=2); }
+    service_file_is_owned() { :; }
     mock_systemctl() { [ "${1:-}" = "is-active" ]; }
     require_owned_table() { :; }
     nft() { cat "$SELF_CHECK_FIXTURE"; }
@@ -308,10 +369,11 @@ jq '(.nftables[] | select(.rule?.chain == "guard_input" and
     check_dependencies() { :; }
     init_config() { :; }
     load_policies() { POLICY_LIMIT=([3265]=2); }
+    service_file_is_owned() { :; }
     mock_systemctl() { [ "${1:-}" = "is-active" ]; }
     require_owned_table() { :; }
     nft() { cat "$BROKEN_SELF_CHECK_FIXTURE"; }
-    ! self_check >/dev/null 2>&1
+    assert_fails self_check >/dev/null 2>&1
 )
 
 # 入口级验证：空策略和卸载都不得在残留 active 时继续删除防火墙或文件。
@@ -330,7 +392,7 @@ jq() { :; }
 reset_systemctl_mock
 MOCK_ACTIVE_AFTER_DISABLE="active"
 MOCK_ACTIVE_AFTER_STOP="active"
-! apply_if_configured >/dev/null 2>&1
+assert_fails apply_if_configured >/dev/null 2>&1
 [ ! -e "$FAIL_OPEN_CAPTURE" ]
 
 mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -338,7 +400,7 @@ mkdir -p "$(dirname "$CONFIG_FILE")"
 reset_systemctl_mock
 MOCK_ACTIVE_AFTER_DISABLE="active"
 MOCK_ACTIVE_AFTER_STOP="active"
-! uninstall_feature true >/dev/null 2>&1
+assert_fails uninstall_feature true >/dev/null 2>&1
 [ ! -e "$REMOVE_CAPTURE" ]
 [ -e "$SERVICE_FILE" ]
 [ -e "$CONFIG_FILE" ]
@@ -375,7 +437,7 @@ apply_if_configured() {
     APPLY_TRANSACTION_COUNT=$((APPLY_TRANSACTION_COUNT + 1))
     [ "$APPLY_TRANSACTION_COUNT" -ge 2 ]
 }
-! update_config_and_apply 'del(.ports[$port])' token --arg port 3265 >/dev/null 2>&1
+assert_fails update_config_and_apply 'del(.ports[$port])' token --arg port 3265 >/dev/null 2>&1
 cmp -s "$CONFIG_FILE" "$TEST_DIR/config.before-transaction"
 [ "$APPLY_TRANSACTION_COUNT" -eq 2 ]
 
