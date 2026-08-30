@@ -12,6 +12,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'echo "migration regression failed at line $LINENO" >&2' ERR
 
+assert_fails() {
+    if "$@"; then
+        echo "expected command to fail but it succeeded: $*" >&2
+        return 1
+    fi
+}
+
 create_mocks() {
     local case_dir="$1"
     mkdir -p "$case_dir/mockbin"
@@ -37,7 +44,10 @@ EOF
 set -euo pipefail
 case "${1:-}" in
     -l)
-        [ -f "$PTD_MIGRATION_CRONTAB_FILE" ] || exit 1
+        if [ ! -f "$PTD_MIGRATION_CRONTAB_FILE" ]; then
+            echo "no crontab for root" >&2
+            exit 1
+        fi
         cat "$PTD_MIGRATION_CRONTAB_FILE"
         ;;
     -r)
@@ -67,7 +77,9 @@ EOF
 #!/bin/bash
 set -euo pipefail
 printf 'nft %s\n' "$*" >> "$PTD_MIGRATION_OPERATIONS_LOG"
-if [ "${1:-}" = "list" ]; then
+if [ "$*" = "-j list tables" ]; then
+    printf '%s\n' '{"nftables":[{"table":{"family":"inet","name":"port_traffic_monitor"}}]}'
+elif [ "${1:-}" = "list" ]; then
     printf '%s\n' 'table inet port_traffic_monitor {}'
 fi
 exit 0
@@ -172,8 +184,11 @@ prepare_case() {
         printf '%s\n' '#!/bin/bash' '# old shortcut' 'exit 0' > "$case_dir/bin/dog"
         chmod 700 "$case_dir/bin/port-traffic-dog.sh" "$case_dir/bin/dog"
         printf '%s\n' \
+            'Description=Port Traffic Dog active source IP guard (experimental)' \
+            'Type=simple' \
             "ExecStart=$case_dir/config/port-ip-guard.sh --run" \
             "ExecStopPost=-$case_dir/config/port-ip-guard.sh --fail-open" \
+            'Restart=always' \
             > "$case_dir/systemd/port-traffic-dog-ip-guard.service"
     fi
 
@@ -222,7 +237,7 @@ cmp -s "$success_case/payload/port-ip-guard.sh" "$success_case/config/port-ip-gu
 grep -Fxq 'restart port-traffic-dog-ip-guard.service' "$success_case/systemctl.log"
 grep -Fxq 'is-active --quiet port-traffic-dog-ip-guard.service' "$success_case/systemctl.log"
 grep -Fq -- '--restore-nft-runtime' "$success_case/crontab"
-! grep -Fq -- '--restore-runtime' "$success_case/crontab"
+assert_fails grep -Fq -- '--restore-runtime' "$success_case/crontab"
 grep -Fq '迁移完成。' "$success_case/output"
 
 # 覆盖后的维护命令失败时，旧 helper、权限、主脚本和快捷命令都要恢复。
