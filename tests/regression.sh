@@ -147,6 +147,27 @@ bandwidth_input_means_unlimited ""
 assert_fails bandwidth_input_means_unlimited 1mbit
 assert_fails bandwidth_input_means_unlimited abc
 
+# 表确实不存在 => 清理/校验按“无对象”成功；nft 查询失败 => 仍失败关闭。
+(
+    log_notification() { :; }
+    get_expected_expiry_comments_json() { printf '[]\n'; }
+    get_active_runtime_prefixes_json() { printf '[]\n'; }
+    nft() { case "$1 $2" in "list tables") return 0 ;; *) return 1 ;; esac; }
+    port_counter_objects_are_absent 3265
+    nftables_quota_is_absent 3265
+    list_orphaned_expiry_rules >/dev/null
+    list_orphaned_runtime_objects >/dev/null
+    remove_nftables_rules 3265
+    missing_status=0
+    port_counter_objects_exist 3265 || missing_status=$?
+    [ "$missing_status" -eq 1 ]
+)
+(
+    nft() { return 1; }
+    assert_fails port_counter_objects_are_absent 3265
+    assert_fails nftables_quota_is_absent 3265
+    assert_fails port_counter_objects_exist 3265
+)
 # 第二次 jq 读取失败不得被末端 sort 掩盖成“配置有效但没有端口”。
 (
     jq() {
