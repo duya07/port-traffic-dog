@@ -168,6 +168,193 @@ assert_fails bandwidth_input_means_unlimited abc
     assert_fails nftables_quota_is_absent 3265
     assert_fails port_counter_objects_exist 3265
 )
+# `> file` 形态助手的三态契约：0=读取成功，1=确证表不存在（注入空表 JSON），2=失败关闭。
+(
+    table_file="$TEST_DIR/nft-table-file.json"
+    nft() { printf '%s\n' '{"nftables":[{"counter":{"name":"port_3265_in"}}]}'; }
+    nft_table_json_to_file_or_absent inet port_traffic_monitor "$table_file" handles
+    jq -e 'any(.nftables[]; .counter?.name? == "port_3265_in")' "$table_file" >/dev/null
+    nft() { case "$*" in "list tables") return 0 ;; *) return 1 ;; esac; }
+    table_state=0
+    nft_table_json_to_file_or_absent inet port_traffic_monitor "$table_file" handles ||
+        table_state=$?
+    [ "$table_state" -eq 1 ]
+    jq -e '.nftables == []' "$table_file" >/dev/null
+    nft() {
+        case "$*" in
+            "list tables") printf 'table inet port_traffic_monitor\n'; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    table_state=0
+    nft_table_json_to_file_or_absent inet port_traffic_monitor "$table_file" handles ||
+        table_state=$?
+    [ "$table_state" -eq 2 ]
+    nft() { return 1; }
+    table_state=0
+    nft_table_json_to_file_or_absent inet port_traffic_monitor "$table_file" handles ||
+        table_state=$?
+    [ "$table_state" -eq 2 ]
+)
+# C 类：确证表不存在时必须注入空表后继续原事务，不得当作读取失败中止。
+(
+    nft_call_log="$TEST_DIR/nft-base-chain.calls"
+    : > "$nft_call_log"
+    nft() {
+        printf '%s\n' "$*" >> "$nft_call_log"
+        case "$*" in
+            "list tables") return 0 ;;
+            "-j list table inet port_traffic_monitor") return 1 ;;
+            "add chain "*) return 0 ;;
+            "-j list chain inet port_traffic_monitor input")
+                printf '%s\n' \
+                    '{"nftables":[{"chain":{"name":"input","type":"filter","hook":"input","prio":0}}]}'
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    ensure_nft_base_chain inet port_traffic_monitor input input 0
+    grep -q '^add chain ' "$nft_call_log"
+)
+(
+    batch_log="$TEST_DIR/nft-init.batch"
+    nft() {
+        case "$*" in
+            "list tables") return 0 ;;
+            "-j list table inet port_traffic_monitor") return 1 ;;
+            "-c -f "*) cp "$3" "$batch_log"; return 0 ;;
+            "-f "*) cp "$2" "$batch_log"; return 0 ;;
+            "-j list chain "*)
+                chain_name="$6"
+                chain_hook="input"
+                chain_prio=0
+                case "$chain_name" in
+                    output | expiry_output) chain_hook="output" ;;
+                    forward | expiry_forward) chain_hook="forward" ;;
+                esac
+                case "$chain_name" in expiry_*) chain_prio=-30 ;; esac
+                printf '{"nftables":[{"chain":{"name":"%s","type":"filter","hook":"%s","prio":%d}}]}\n' \
+                    "$chain_name" "$chain_hook" "$chain_prio"
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    init_nftables
+    grep -q '^add table inet port_traffic_monitor$' "$batch_log"
+    [ "$(grep -c '^add chain ' "$batch_log")" -eq 6 ]
+)
+(
+    batch_log="$TEST_DIR/nft-expiry-rebuild.batch"
+    init_nftables() { :; }
+    port_expiry_rule_layout_complete() { :; }
+    nft() {
+        case "$*" in
+            "list tables") return 0 ;;
+            "-j -a list table inet port_traffic_monitor") return 1 ;;
+            "-c -f "*) cp "$3" "$batch_log"; return 0 ;;
+            "-f "*) cp "$2" "$batch_log"; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    apply_port_expiry_rules_locked 3265
+    [ "$(grep -c '^add rule ' "$batch_log")" -eq 8 ]
+    ! grep -q '^delete rule ' "$batch_log"
+)
+(
+    batch_log="$TEST_DIR/nft-counter-rebuild.batch"
+    count_counter_rules() { echo 0; }
+    port_counter_objects_exist() { return 0; }
+    get_expected_counter_rule_count() { echo 0; }
+    write_port_counter_rule_commands() { :; }
+    nft() {
+        case "$*" in
+            "list tables") return 0 ;;
+            "-j -a list table inet port_traffic_monitor") return 1 ;;
+            "-f "*) cp "$2" "$batch_log"; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    rebuild_port_counter_objects 3265 11 22 false
+    grep -q '^add counter inet port_traffic_monitor port_3265_in ' "$batch_log"
+    grep -q '^add counter inet port_traffic_monitor port_3265_out ' "$batch_log"
+    ! grep -q '^delete counter ' "$batch_log"
+)
+(
+    batch_log="$TEST_DIR/nft-quota-rebuild.batch"
+    log_notification() { :; }
+    port_counter_objects_exist() { return 0; }
+    read_nftables_counter_data() { NFT_COUNTER_INPUT=11; NFT_COUNTER_OUTPUT=22; return 0; }
+    count_quota_rules() { echo 0; }
+    get_expected_quota_rule_count() { echo 0; }
+    nftables_quota_limit_matches() { return 0; }
+    nft() {
+        case "$*" in
+            "list tables") return 0 ;;
+            "-j -a list table inet port_traffic_monitor") return 1 ;;
+            "-f "*) cp "$2" "$batch_log"; return 0 ;;
+            "list quota "*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    apply_nftables_quota 3265 100MB
+    grep -q '^add quota inet port_traffic_monitor port_3265_quota ' "$batch_log"
+    ! grep -q '^delete ' "$batch_log"
+)
+# A 类 `> file` 形态：表不存在 => 清理/回收已完成。
+(
+    nft() { case "$*" in "list tables") return 0 ;; *) return 1 ;; esac; }
+    remove_port_expiry_rules_locked 3265
+)
+(
+    log_notification() { :; }
+    nft() { case "$*" in "list tables") return 0 ;; *) return 1 ;; esac; }
+    remove_nftables_quota 3265
+)
+(
+    reconcile_orphaned_expiry_rules() { :; }
+    list_orphaned_runtime_objects() { printf 'counter port_9999_out\n'; }
+    nft() { case "$*" in "list tables") return 0 ;; *) return 1 ;; esac; }
+    reconcile_orphaned_runtime_objects
+)
+# 表存在却读不到：所有清理/重建/应用路径一律失败关闭，不做任何修改。
+(
+    log_notification() { :; }
+    reconcile_orphaned_expiry_rules() { :; }
+    list_orphaned_runtime_objects() { printf 'counter port_9999_out\n'; }
+    nft() {
+        case "$*" in
+            "list tables") printf 'table inet port_traffic_monitor\n'; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    assert_fails ensure_nft_base_chain inet port_traffic_monitor input input 0
+    assert_fails init_nftables
+    assert_fails remove_port_expiry_rules_locked 3265
+    assert_fails reconcile_orphaned_runtime_objects
+    assert_fails remove_nftables_quota 3265
+)
+(
+    log_notification() { :; }
+    init_nftables() { :; }
+    port_expiry_rule_layout_complete() { :; }
+    count_counter_rules() { echo 0; }
+    port_counter_objects_exist() { return 0; }
+    get_expected_counter_rule_count() { echo 0; }
+    write_port_counter_rule_commands() { :; }
+    read_nftables_counter_data() { NFT_COUNTER_INPUT=11; NFT_COUNTER_OUTPUT=22; return 0; }
+    count_quota_rules() { echo 0; }
+    get_expected_quota_rule_count() { echo 0; }
+    nftables_quota_limit_matches() { return 0; }
+    nft() {
+        case "$*" in
+            "list tables") printf 'table inet port_traffic_monitor\n'; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    assert_fails apply_port_expiry_rules_locked 3265
+    assert_fails apply_nftables_quota 3265 100MB
+    assert_fails rebuild_port_counter_objects 3265 11 22 false
+)
 # 第二次 jq 读取失败不得被末端 sort 掩盖成“配置有效但没有端口”。
 (
     jq() {
