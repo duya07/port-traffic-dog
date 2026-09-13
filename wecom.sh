@@ -53,10 +53,11 @@ send_wecom_message() {
     while [ $retry_count -le $WECOM_MAX_RETRIES ]; do
         local response
         local curl_exit=0
-        response=$(curl -sS --connect-timeout $WECOM_CONNECT_TIMEOUT --max-time $WECOM_MAX_TIMEOUT \
+        # webhook key 在 URL 中：用 --config - 从 stdin 传入，避免出现在进程 argv。
+        response=$(printf 'url = "%s"\n' "${webhook_url//\"/\\\"}" | curl -sS --config - \
+            --connect-timeout $WECOM_CONNECT_TIMEOUT --max-time $WECOM_MAX_TIMEOUT \
             -H "Content-Type: application/json" \
-            -d "$json_data" \
-            "$webhook_url" 2>&1) || curl_exit=$?
+            -d "$json_data" 2>&1) || curl_exit=$?
 
         # 企业wx API成功响应的标准判断
         if [ "$curl_exit" -eq 0 ] && echo "$response" | grep -q '"errcode":0'; then

@@ -66,6 +66,13 @@ write_base_config
 validate_config_file "$CONFIG_FILE"
 cp "$CONFIG_FILE" "$TEST_DIR/config.valid.json"
 
+# 只有内核默认的 handle 0: root 可被普通路径直接替换；显式安装的同类型 qdisc 仍是冲突。
+tc_root_qdisc_is_replaceable ''
+tc_root_qdisc_is_replaceable 'qdisc fq 0: root refcnt 2 limit 10000p'
+tc_root_qdisc_is_replaceable 'qdisc mq 0: root'
+assert_fails tc_root_qdisc_is_replaceable 'qdisc fq 8001: root refcnt 2 limit 10000p'
+assert_fails tc_root_qdisc_is_replaceable 'malformed root state'
+
 # 主脚本只按需校验和安装独立 IP guard；无 marker 或语法错误的文件不得执行。
 validate_ip_guard_script_file "$PROJECT_DIR/port-ip-guard.sh"
 printf '%s\n' '#!/bin/bash' 'echo foreign' > "$TEST_DIR/foreign-ip-guard.sh"
@@ -114,6 +121,32 @@ for invalid_filter in \
     assert_fails validate_config_file "$TEST_DIR/config.bad-object.json" >/dev/null 2>&1
 done
 
+# 限速值为 0（含 0Mbps/0mbit 这类带单位写法）必须被拒绝：
+# 否则会写入 rate=0、生成 0 速率 HTB 类，把该端口流量黑洞化。
+for zero_rate in 0mbit 0kbit 0gbit 0Mbps 0Kbps 0Gbps; do
+    jq --arg r "$zero_rate" '
+        .ports = {"3265": {enabled:true, billing_mode:"single",
+            quota:{enabled:false, monthly_limit:"unlimited"},
+            bandwidth_limit:{enabled:true, rate:$r}}}
+    ' "$CONFIG_FILE" > "$TEST_DIR/config.zero-rate.json"
+    assert_fails validate_config_file "$TEST_DIR/config.zero-rate.json" >/dev/null 2>&1
+done
+for good_rate in 1mbit 1Mbps unlimited; do
+    jq --arg r "$good_rate" '
+        .ports = {"3265": {enabled:true, billing_mode:"single",
+            quota:{enabled:false, monthly_limit:"unlimited"},
+            bandwidth_limit:{enabled:true, rate:$r}}}
+    ' "$CONFIG_FILE" > "$TEST_DIR/config.good-rate.json"
+    validate_config_file "$TEST_DIR/config.good-rate.json" >/dev/null 2>&1
+done
+# 输入侧：0 / 0Mbps / 0kbit / 空串都表示“无限制”，非零与非法值不是。
+bandwidth_input_means_unlimited 0
+bandwidth_input_means_unlimited 0Mbps
+bandwidth_input_means_unlimited 0kbit
+bandwidth_input_means_unlimited ""
+assert_fails bandwidth_input_means_unlimited 1mbit
+assert_fails bandwidth_input_means_unlimited abc
+
 # 第二次 jq 读取失败不得被末端 sort 掩盖成“配置有效但没有端口”。
 (
     jq() {
@@ -132,6 +165,17 @@ mkdir "$TRAFFIC_STATS_LOCK_DIR"
 printf '99999999 0\n' > "$TRAFFIC_STATS_LOCK_DIR/owner"
 acquire_traffic_stats_lock
 release_traffic_stats_lock
+
+# /run/lock 世界可写：共享 TC 锁路径被预置成符号链接时必须拒绝，
+# 且绝不能以截断方式打开目标文件（否则可被诱导截断任意 root 文件）。
+symlink_victim="$TEST_DIR/lock-symlink-victim"
+printf 'IMPORTANT-LOCK-DATA\n' > "$symlink_victim"
+ln -sfn "$symlink_victim" "$TC_SHARED_LOCK_FILE"
+assert_fails begin_tc_update
+[ "$(cat "$symlink_victim")" = "IMPORTANT-LOCK-DATA" ]
+rm -f "$TC_SHARED_LOCK_FILE"
+begin_tc_update
+finish_tc_update
 
 readonly REUSED_PID_LOCK_DIR="$CONFIG_DIR/reused-pid.lock"
 mkdir "$REUSED_PID_LOCK_DIR"
@@ -345,7 +389,7 @@ update_config_file '
 '
 readonly TC_ROLLBACK_CAPTURE="$TEST_DIR/tc-rollback.capture"
 (
-    show_port_list() { return 0; }
+    show_port_list() { local -n result_ref="$1"; result_ref=(3265); }
     replace_tc_limit() { printf 'replace:%s\n' "$2" >> "$TC_ROLLBACK_CAPTURE"; }
     update_config_file() { return 1; }
     manage_traffic_limits() { :; }
@@ -357,7 +401,7 @@ jq -e '.ports["3265"].bandwidth_limit == {enabled:true, rate:"10Mbps"}' "$CONFIG
 
 readonly QUOTA_ROLLBACK_CAPTURE="$TEST_DIR/quota-rollback.capture"
 (
-    show_port_list() { return 0; }
+    show_port_list() { local -n result_ref="$1"; result_ref=(3265); }
     apply_nftables_quota() { printf 'apply:%s\n' "$2" >> "$QUOTA_ROLLBACK_CAPTURE"; }
     update_config_file() { return 1; }
     manage_traffic_limits() { :; }
@@ -367,23 +411,107 @@ readonly QUOTA_ROLLBACK_CAPTURE="$TEST_DIR/quota-rollback.capture"
 [ "$(paste -sd, "$QUOTA_ROLLBACK_CAPTURE")" = "apply:2GB,apply:1GB" ]
 jq -e '.ports["3265"].quota == {enabled:true, monthly_limit:"1GB"}' "$CONFIG_FILE" >/dev/null
 
+# 统计模式切换必须在同一统计/配置锁内完成，并先记录切换时刻的快照。
+readonly BILLING_SUCCESS_CAPTURE="$TEST_DIR/billing-success.capture"
+(
+    repair_port_traffic_rules_locked() { :; }
+    repair_port_quota_rules() { :; }
+    record_traffic_snapshot() { printf 'snapshot\n' >> "$BILLING_SUCCESS_CAPTURE"; }
+    read_nftables_counter_data() { NFT_COUNTER_INPUT=200; NFT_COUNTER_OUTPUT=400; }
+    rebuild_port_counter_objects() {
+        printf 'rebuild:%s:%s:%s:%s\n' \
+            "$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")" "$2" "$3" "$4" \
+            >> "$BILLING_SUCCESS_CAPTURE"
+    }
+    scale_current_day_traffic_stats() {
+        printf 'scale:%s:%s:%s:%s\n' "$2" "$3" "$4" "$5" >> "$BILLING_SUCCESS_CAPTURE"
+    }
+    update_traffic_snapshot_baseline() { printf 'baseline\n' >> "$BILLING_SUCCESS_CAPTURE"; }
+    change_port_billing_mode_transaction 3265 double single
+    [ "$TRAFFIC_STATS_LOCK_DEPTH" -eq 0 ]
+    [ "$CONFIG_LOCK_DEPTH" -eq 0 ]
+)
+grep -Fxq snapshot "$BILLING_SUCCESS_CAPTURE"
+grep -Fxq 'rebuild:single:100:200:rebuild' "$BILLING_SUCCESS_CAPTURE"
+grep -Fxq 'scale:2:1:2:1' "$BILLING_SUCCESS_CAPTURE"
+grep -Fxq baseline "$BILLING_SUCCESS_CAPTURE"
+jq -e '.ports["3265"].billing_mode == "single"' "$CONFIG_FILE" >/dev/null
+
+# 新基线写入失败时，回滚要保留切换期间新增流量并恢复原倍率。
+readonly BILLING_ROLLBACK_CAPTURE="$TEST_DIR/billing-rollback.capture"
+(
+    repair_port_traffic_rules_locked() { :; }
+    repair_port_quota_rules() { :; }
+    record_traffic_snapshot() { :; }
+    read_calls=0
+    read_nftables_counter_data() {
+        read_calls=$((read_calls + 1))
+        if [ "$read_calls" -eq 1 ]; then
+            NFT_COUNTER_INPUT=100
+            NFT_COUNTER_OUTPUT=200
+        else
+            NFT_COUNTER_INPUT=240
+            NFT_COUNTER_OUTPUT=440
+        fi
+    }
+    rebuild_port_counter_objects() {
+        printf 'rebuild:%s:%s:%s\n' \
+            "$(jq -r '.ports["3265"].billing_mode' "$CONFIG_FILE")" "$2" "$3" \
+            >> "$BILLING_ROLLBACK_CAPTURE"
+    }
+    scale_current_day_traffic_stats() {
+        printf 'scale:%s:%s:%s:%s\n' "$2" "$3" "$4" "$5" >> "$BILLING_ROLLBACK_CAPTURE"
+    }
+    baseline_calls=0
+    update_traffic_snapshot_baseline() {
+        baseline_calls=$((baseline_calls + 1))
+        printf 'baseline:%s:%s\n' "${3:-0}" "${4:-0}" >> "$BILLING_ROLLBACK_CAPTURE"
+        [ "$baseline_calls" -gt 1 ]
+    }
+    assert_fails change_port_billing_mode_transaction 3265 single double
+    [ "$BILLING_MODE_CHANGE_ROLLBACK_OK" = "true" ]
+    [ "$TRAFFIC_STATS_LOCK_DEPTH" -eq 0 ]
+    [ "$CONFIG_LOCK_DEPTH" -eq 0 ]
+)
+grep -Fxq 'rebuild:double:200:400' "$BILLING_ROLLBACK_CAPTURE"
+grep -Fxq 'rebuild:single:120:220' "$BILLING_ROLLBACK_CAPTURE"
+grep -Fxq 'scale:1:2:1:2' "$BILLING_ROLLBACK_CAPTURE"
+grep -Fxq 'scale:2:1:2:1' "$BILLING_ROLLBACK_CAPTURE"
+grep -Fxq 'baseline:20:20' "$BILLING_ROLLBACK_CAPTURE"
+jq -e '.ports["3265"].billing_mode == "single"' "$CONFIG_FILE" >/dev/null
+
+# 菜单选择后的配置若已被另一任务改变，不能按旧快照继续施工。
+(
+    repair_port_traffic_rules_locked() { return 99; }
+    assert_fails change_port_billing_mode_transaction 3265 double single
+    [ "$BILLING_MODE_CHANGE_ERROR" = "端口统计模式已被其他任务修改，请重新选择" ]
+    [ "$TRAFFIC_STATS_LOCK_DEPTH" -eq 0 ]
+    [ "$CONFIG_LOCK_DEPTH" -eq 0 ]
+)
+update_config_file '.ports["3265"].billing_mode = "double"'
+
 readonly DELETE_FAILURE_CAPTURE="$TEST_DIR/delete-failure.capture"
 (
-    show_port_list() { return 0; }
+    show_port_list() { local -n result_ref="$1"; result_ref=(3265); }
     save_traffic_data() { return 0; }
-    update_config_file() { return 1; }
-    remove_nftables_rules() { touch "$DELETE_FAILURE_CAPTURE"; }
-    remove_nftables_quota() { touch "$DELETE_FAILURE_CAPTURE"; }
-    remove_tc_limit() { touch "$DELETE_FAILURE_CAPTURE"; }
-    clear_port_conntrack_state() { touch "$DELETE_FAILURE_CAPTURE"; }
-    reconcile_orphaned_runtime_objects() { touch "$DELETE_FAILURE_CAPTURE"; }
+    update_config_file() {
+        printf 'config-lock:%s\n' "$TC_SHARED_LOCK_DEPTH" >> "$DELETE_FAILURE_CAPTURE"
+        return 1
+    }
+    remove_port_expiry_rules() { echo expiry >> "$DELETE_FAILURE_CAPTURE"; }
+    remove_nftables_quota() { echo quota >> "$DELETE_FAILURE_CAPTURE"; }
+    remove_nftables_rules() { echo counters >> "$DELETE_FAILURE_CAPTURE"; }
+    remove_tc_limit() { echo tc >> "$DELETE_FAILURE_CAPTURE"; }
+    restore_runtime_state() { echo restore >> "$DELETE_FAILURE_CAPTURE"; }
+    clear_port_conntrack_state() { echo conntrack >> "$DELETE_FAILURE_CAPTURE"; }
+    reconcile_orphaned_runtime_objects() { echo reconcile >> "$DELETE_FAILURE_CAPTURE"; }
     refresh_notification_cron_from_config() { :; }
     setup_traffic_snapshot_cron() { :; }
     manage_port_monitoring() { :; }
     sleep() { :; }
     remove_port_monitoring <<< $'1\ny'
 )
-[ ! -e "$DELETE_FAILURE_CAPTURE" ]
+[ "$(cat "$DELETE_FAILURE_CAPTURE")" = $'expiry\nquota\ncounters\ntc\nconfig-lock:1\nrestore' ]
 jq -e '.ports["3265"] != null' "$CONFIG_FILE" >/dev/null
 cp "$TEST_DIR/config.before-transaction-tests.json" "$CONFIG_FILE"
 
@@ -496,12 +624,32 @@ jq -e '
     nft() { return 42; }
     assert_fails get_nftables_counter_data 3265
 )
+# nft 读取“成功但输出为空”同样属于查询失败：jq 对空输入会以 0 退出，
+# 不能把这种读取失败折叠成“counter 对象不存在”，否则恢复流程会误入重建分支，
+# 清理校验也会伪报对象已消失。
+(
+    nft() { :; }
+    empty_read_state=0
+    port_counter_objects_exist 3265 2>"$TEST_DIR/empty-read.stderr" || empty_read_state=$?
+    [ "$empty_read_state" -eq 2 ]
+    # jq 1.6 下不能让空值落到 [ -eq ] 上产生 "integer expression expected" 噪声。
+    [ ! -s "$TEST_DIR/empty-read.stderr" ]
+    assert_fails port_counter_objects_are_absent 3265
+    # 同一根因的其它 fail-open 点：nft 成功但输出为空时不得判成“已确认不存在/完整”。
+    assert_fails nftables_quota_is_absent 3265
+    assert_fails port_expiry_rule_layout_complete 3265
+    assert_fails nft_base_chain_contract_valid inet port_traffic_monitor input prerouting 0
+    assert_fails ensure_nft_base_chain inet port_traffic_monitor input prerouting 0
+    assert_fails list_orphaned_expiry_rules
+    assert_fails list_orphaned_runtime_objects
+)
 cp "$TEST_DIR/config.before-snapshot.json" "$CONFIG_FILE"
 # 状态页不能把 counter 查询失败折叠为 0，从而漏报配额读取异常。
 (
     get_port_monthly_usage() { return 42; }
-    status_output=$(get_port_status_label 3265)
-    grep -Fq '[流量读取失败]' <<< "$status_output"
+    status_result=0
+    status_output=$(get_port_status_label 3265) || status_result=$?
+    [ "$status_result" -ne 0 ]
     assert_fails grep -Fq '[已超限]' <<< "$status_output"
 )
 rm -f "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE"
@@ -953,7 +1101,11 @@ nft() {
         expected=$(get_expected_quota_rule_count "$mode")
         jq -n --argjson expected "$expected" '{
             nftables:
-                ([range(0; $expected) |
+                ([{counter:{name:"port_3265_in"}},
+                  {counter:{name:"port_3265_out"}},
+                  {counter:{name:"port_3000_4000_in"}},
+                  {counter:{name:"port_3000_4000_out"}}] +
+                 [range(0; $expected) |
                     {rule:{chain:"input",handle:(. + 1),expr:[{quota:"port_3265_quota"}]}}] +
                  [{quota:{name:"port_3265_quota",bytes:107374182400}}])
         }'
@@ -1348,14 +1500,16 @@ update_config_file '
     }
 '
 quota_removed=false
-remove_nftables_quota() {
-    quota_removed=true
-}
-log_notification() {
-    :
-}
-assert_fails apply_nftables_quota 2000 "invalid"
-[ "$quota_removed" = "false" ]
+(
+    remove_nftables_quota() {
+        quota_removed=true
+    }
+    log_notification() {
+        :
+    }
+    assert_fails apply_nftables_quota 2000 "invalid"
+    [ "$quota_removed" = "false" ]
+)
 
 update_config_file '
     .ports = {
@@ -1403,6 +1557,9 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     get_default_interface() { echo eth0; }
     tc_root_is_managed() { return 0; }
     tc_root_owner_marker_matches() { return 0; }
+    add_port_range_mark_rules() { :; }
+    tc_port_mark_filter_complete() { :; }
+    port_range_mark_rules_complete() { :; }
     tc_class_added=false
     tc() {
         if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
@@ -1601,6 +1758,8 @@ conntrack() { :; }
 get_default_interface() { echo eth0; }
 count_counter_rules() { echo 8; }
 count_quota_rules() { echo 0; }
+nftables_quota_is_absent() { :; }
+port_expiry_rules_complete() { :; }
 get_invalid_counter_order_directions() { :; }
 list_orphaned_runtime_objects() { :; }
 list_orphaned_expiry_rules() { :; }
@@ -2046,6 +2205,91 @@ assert_fails grep -Fq 'AUTO_RECOVERY_ENABLED' <<< "$tc_menu_output"
     grep -Fq 'exit "$result"' "$TC_RECOVERY_RUNNER"
 )
 
+# 统一 HTB 只能包含基础类和已配置的 Dog 端口类；未知 class/filter 或查询失败必须拒绝接管。
+(
+    unset -f read
+    class_fixture=$'class htb 1:1 root rate 100Mbit ceil 100Mbit\nclass htb 1:30 parent 1:1 rate 1Kbit ceil 100Mbit\nclass htb 1:1001 parent 1:1 rate 1Kbit ceil 10Mbit'
+    filter_fixture=$'filter protocol all pref 1 fw chain 0\nfilter protocol all pref 1 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001'
+    filter_status=0
+    tc() {
+        case "$*" in
+            'class show dev eth0') printf '%s\n' "$class_fixture" ;;
+            'filter show dev eth0 parent 1:0')
+                [ "$filter_status" -eq 0 ] || return "$filter_status"
+                printf '%s\n' "$filter_fixture"
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    tc_consumers_match_unified_contract eth0 1:1001
+    filter_fixture='filter protocol all pref 1 fw chain 0'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+    filter_fixture=$'filter protocol all pref 1 fw chain 0\nfilter protocol all pref 1 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001'
+
+    class_fixture+=$'\nclass htb 1:999 parent 1:1 rate 1Kbit ceil 1Mbit'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    class_fixture=$'class htb 1:1 root rate 100Mbit ceil 100Mbit\nclass htb 1:30 parent 1:1 rate 1Kbit ceil 100Mbit\nclass htb 1:1001 parent 1:30 rate 1Kbit ceil 10Mbit'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    class_fixture=$'class htb 1:1 root rate 100Mbit ceil 100Mbit\nclass htb 1:30 parent 1:1 rate 1Kbit ceil 100Mbit\nclass htb 1:1001 parent 1:1 rate 1Kbit ceil 10Mbit'
+    filter_fixture='filter protocol all pref 2 matchall chain 0 flowid 1:999'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+    filter_fixture='filter protocol all pref 2 bpf chain 0'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    filter_fixture='filter protocol all pref'
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    filter_fixture=''
+    filter_status=55
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    # v1.5.2 的已归属层级没有 1:30，单端口由四条 u32 过滤器指向同一类；
+    # 只允许在归属标记仍匹配且没有未知消费者时迁移。
+    filter_status=0
+    class_fixture=$'class htb 1:1 root rate 100Mbit ceil 100Mbit\nclass htb 1:1001 parent 1:1 rate 10Mbit ceil 10Mbit'
+    filter_fixture=$'filter protocol ip pref 2 u32 chain 0\nfilter protocol ip pref 2 u32 chain 0 fh 800: ht divisor 1\nfilter protocol ip pref 2 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 *flowid 1:1001 not_in_hw\n  match 00060000/00ff0000 at 8\nfilter protocol ip pref 2 u32 chain 0 fh 800::801 order 2049 key ht 800 bkt 0 *flowid 1:1001 not_in_hw\n  match 00000cc1/0000ffff at 20\nfilter protocol ip pref 1002 u32 chain 0\nfilter protocol ip pref 1002 u32 chain 0 fh 801: ht divisor 1\nfilter protocol ip pref 1002 u32 chain 0 fh 801::800 order 2048 key ht 801 bkt 0 *flowid 1:1001 not_in_hw\n  match 00110000/00ff0000 at 8\nfilter protocol ip pref 1002 u32 chain 0 fh 801::801 order 2049 key ht 801 bkt 0 *flowid 1:1001 not_in_hw\n  match 00000cc1/0000ffff at 20'
+    tc_root_owner_marker_matches() { return 0; }
+    tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+    assert_fails tc_consumers_match_unified_contract eth0 1:1001
+
+    tc_root_owner_marker_matches() { return 1; }
+    assert_fails tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+    tc_root_owner_marker_matches() { return 0; }
+
+    filter_fixture='filter protocol all pref 1 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001'
+    tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+    filter_fixture=$'filter protocol ip pref 2 u32 chain 0 flowid 1:1001\nfilter protocol ip pref 2 u32 chain 0 flowid 1:1001'
+    assert_fails tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+
+    filter_fixture=$'filter protocol ip pref 2 u32 chain 0 flowid 1:1001\nfilter protocol ip pref 2 u32 chain 0 flowid 1:1001\nfilter protocol ip pref 1002 u32 chain 0 flowid 1:1001\nfilter protocol ip pref 1002 u32 chain 0 flowid 1:1001\nfilter protocol ip pref 2002 u32 chain 0 flowid 1:1001'
+    assert_fails tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+
+    filter_fixture='filter protocol ip pref 2 u32 chain 0 flowid 1:1001'
+    class_fixture+=$'\nclass htb 1:999 parent 1:1 rate 1Kbit ceil 1Mbit'
+    assert_fails tc_consumers_match_unified_contract eth0 --owned-legacy-dog 1:1001
+)
+
+# 状态字段读取必须区分“缺失、重复、读取失败”，不能把 I/O/解析错误当成旧版状态。
+state_reader_fixture="$TEST_DIR/tc-state-reader.fixture"
+printf '%s\n' 'SCHEMA=v1' 'EMPTY=' 'VALUE=a=b' > "$state_reader_fixture"
+[ "$(tc_state_unique_value "$state_reader_fixture" SCHEMA)" = 'v1' ]
+[ -z "$(tc_state_unique_value "$state_reader_fixture" EMPTY)" ]
+[ "$(tc_state_unique_value "$state_reader_fixture" VALUE)" = 'a=b' ]
+[ -z "$(tc_state_optional_unique_value "$state_reader_fixture" MISSING)" ]
+[ "$(tc_state_key_count "$state_reader_fixture" SCHEMA)" -eq 1 ]
+printf '%s\n' 'SCHEMA=v1' 'SCHEMA=v2' > "$state_reader_fixture"
+assert_fails tc_state_unique_value "$state_reader_fixture" SCHEMA
+assert_fails tc_state_optional_unique_value "$state_reader_fixture" SCHEMA
+(
+    awk() { return 55; }
+    assert_fails tc_state_unique_value "$state_reader_fixture" SCHEMA
+    assert_fails tc_state_optional_unique_value "$state_reader_fixture" SCHEMA
+    assert_fails tc_state_key_count "$state_reader_fixture" SCHEMA
+)
+
 # NTC 已禁用时，Dog 不得使用残留状态恢复整机上限；配置恢复启用后仍读取原速率。
 printf '%s\n' 'DISABLED=true' > "$TRAFFICCOP_CONFIG_FILE"
 chmod 600 "$TRAFFICCOP_CONFIG_FILE"
@@ -2062,11 +2306,11 @@ trafficcop_unified_state_rate eth0 >/dev/null || ntc_state_status=$?
 
 # NTC 明确禁用后，残留 state 不得阻止 Dog 删除最后一个端口类或卸载遗留 root。
 (
-    owner_file="$TEST_DIR/disabled-ntc-cleanup.owner"
+    owner_fixture="$TEST_DIR/disabled-ntc-cleanup.owner"
     cleanup_capture="$TEST_DIR/disabled-ntc-cleanup.capture"
-    printf '%s\n' 'eth0|unified-htb-v3' > "$owner_file"
+    printf '%s\n' 'eth0|unified-htb-v3' > "$owner_fixture"
     get_default_interface() { printf '%s\n' eth0; }
-    get_tc_root_owner_file() { printf '%s\n' "$owner_file"; }
+    get_tc_root_owner_file() { printf '%s\n' "$owner_fixture"; }
     tc_root_is_owned() { return 0; }
     tc() {
         case "$*" in
