@@ -1187,7 +1187,7 @@ port_counter_objects_exist() {
     family=$(jq -er '.nftables.family // "inet" | strings | select(length > 0)' "$CONFIG_FILE") || return 2
     prefix=$(get_port_counter_prefix "$port")
     local table_json
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 2
+    table_json=$(nft_table_json_or_absent "$family" "$table_name") || return 2
     [ -n "$table_json" ] || return 2
     local object_count
     object_count=$(printf '%s\n' "$table_json" | jq -er \
@@ -1212,7 +1212,7 @@ port_counter_objects_are_absent() {
     family=$(jq -er '.nftables.family // "inet" | strings | select(length > 0)' "$CONFIG_FILE") || return 1
     prefix=$(get_port_counter_prefix "$port") || return 1
     local table_json
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 1
+    table_json=$(nft_table_json_or_absent "$family" "$table_name") || return 1
     [ -n "$table_json" ] || return 1
 
     printf '%s\n' "$table_json" | jq -e \
@@ -2831,7 +2831,7 @@ list_orphaned_expiry_rules() {
     local allowed_comments
     table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
+    table_json=$(nft_table_json_or_absent "$family" "$table_name" handles) || return 1
     allowed_comments=$(get_expected_expiry_comments_json) || return 1
     # 空读取不得被判成“没有孤儿到期规则”（jq 1.6 对空输入以 0 退出）。
     [ -n "$table_json" ] || return 1
@@ -2855,7 +2855,7 @@ reconcile_orphaned_expiry_rules_locked() {
     local cleanup_batch
     table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
+    table_json=$(nft_table_json_or_absent "$family" "$table_name" handles) || return 1
     allowed_comments=$(get_expected_expiry_comments_json) || return 1
     cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-expiry-orphans.XXXXXX") || return 1
 
@@ -2902,7 +2902,7 @@ list_orphaned_runtime_objects() {
     local allowed_prefixes
     table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
+    table_json=$(nft_table_json_or_absent "$family" "$table_name" handles) || return 1
     allowed_prefixes=$(get_active_runtime_prefixes_json) || return 1
     # 空读取不得被判成“运行对象与配置一致”（jq 1.6 对空输入以 0 退出）。
     [ -n "$table_json" ] || return 1
@@ -4178,7 +4178,12 @@ remove_port_range_mark_rules() {
     while true; do
         local match_line
         local table_state
-        table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null) || return 1
+        if ! table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null); then
+            local missing_state=0
+            nft_table_exists "$family" "$table_name" || missing_state=$?
+            [ "$missing_state" -eq 1 ] && break   # 表不存在：没有需要删除的标记规则
+            return 1
+        fi
         match_line=$(printf '%s\n' "$table_state" | awk -v marker="$comment" '
             /^[[:space:]]*chain[[:space:]]+/ { chain=$2; next }
             index($0, "comment \"" marker "\"") && /# handle [0-9]+/ {
@@ -6366,6 +6371,28 @@ add_nftables_rules() {
         "$port" "$current_input" "$current_output" rebuild
 }
 
+# 表确实不存在 => 视为空表（无对象）；查询失败/存在却读不到 => 返回 2（失败关闭）。
+nft_table_json_or_absent() {
+    local family="$1"
+    local table_name="$2"
+    local mode="${3:-plain}"
+    local table_json
+    local st=0
+    local table_state=0
+    if [ "$mode" = "handles" ]; then
+        table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || st=$?
+    else
+        table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || st=$?
+    fi
+    if [ "$st" -eq 0 ]; then
+        printf '%s\n' "$table_json"
+        return 0
+    fi
+    nft_table_exists "$family" "$table_name" || table_state=$?
+    [ "$table_state" -eq 1 ] || return 2
+    printf '%s\n' '{"nftables":[]}'
+}
+
 remove_nftables_rules() {
     local port="$1"
     local table_name
@@ -6376,6 +6403,11 @@ remove_nftables_rules() {
     prefix=$(get_port_counter_prefix "$port") || return 1
     local input_counter="${prefix}_in"
     local output_counter="${prefix}_out"
+    local early_table_state=0
+    nft_table_exists "$family" "$table_name" || early_table_state=$?
+    if [ "$early_table_state" -eq 1 ]; then
+        return 0   # 表不存在 => 对象已不存在，清理视为成功
+    fi
     local rules_json
     local cleanup_batch
     rules_json=$(mktemp "$CONFIG_DIR/.nft-counter-remove.XXXXXX") || return 1
@@ -7181,7 +7213,7 @@ nftables_quota_is_absent() {
     local quota_name
     quota_name=$(get_port_quota_name "$port")
     local table_json
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 1
+    table_json=$(nft_table_json_or_absent "$family" "$table_name") || return 1
     # nft 成功但输出为空属查询失败：jq 1.6 对空输入以 0 退出，
     # 会让“配额已删除”的校验伪成功。
     [ -n "$table_json" ] || return 1
