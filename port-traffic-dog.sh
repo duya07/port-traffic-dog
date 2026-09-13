@@ -381,7 +381,8 @@ ensure_nft_base_chain() {
     local expected_priority="$5"
     local table_json
 
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 1
+    # C 类：确证表不存在时注入空表 JSON 并继续建链；存在却读不到时失败关闭。
+    table_json=$(nft_table_json_or_absent "$family" "$table_name") || return 1
     # 空读取不得被当作“表存在且链契约成立”（jq 1.6 对空输入以 0 退出）。
     [ -n "$table_json" ] || return 1
     if printf '%s' "$table_json" | jq -e --arg name "$chain_name" \
@@ -416,28 +417,39 @@ nft_runtime_base_chains_valid() {
 init_nftables() {
     local table_name
     local family
-    local tables_output
-    local table_exists=false
     local table_json=""
+    local table_present=false
+    local table_state=0
     local batch_file
     table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
 
     # 查询失败与“对象不存在”严格区分；无法证明现状时禁止继续写规则。
-    tables_output=$(nft list tables 2>/dev/null) || {
-        echo "无法读取 nftables 表，已停止修改。" >&2
-        return 1
-    }
-    if printf '%s\n' "$tables_output" | grep -Eq "^table[[:space:]]+${family}[[:space:]]+${table_name}$"; then
-        table_exists=true
-        table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || {
+    nft_table_exists "$family" "$table_name" || table_state=$?
+    case "$table_state" in
+        0) table_present=true ;;
+        1) table_present=false ;;
+        *)
+            echo "无法读取 nftables 表，已停止修改。" >&2
+            return 1
+            ;;
+    esac
+    if [ "$table_present" = "true" ]; then
+        # 表已判定存在：只有读取成功且非空才允许继续；确证不存在按空表处理。
+        table_json=$(nft_table_json_or_absent "$family" "$table_name") || {
             echo "无法读取 nftables 表 $family $table_name，已停止修改。" >&2
             return 1
         }
+        [ -n "$table_json" ] || {
+            echo "无法读取 nftables 表 $family $table_name，已停止修改。" >&2
+            return 1
+        }
+    else
+        table_json='{"nftables":[]}'
     fi
 
     # 先对所有已有同名链做完整预检，任一契约冲突时零修改。
-    if [ "$table_exists" = "true" ]; then
+    if [ "$table_present" = "true" ]; then
         local chain_spec
         local chain_name
         local expected_hook
@@ -457,9 +469,8 @@ init_nftables() {
     fi
 
     batch_file=$(mktemp "$CONFIG_DIR/.nft-base-chains.XXXXXX") || return 1
-    if [ "$table_exists" != "true" ]; then
+    if [ "$table_present" != "true" ]; then
         printf 'add table %s %s\n' "$family" "$table_name" >> "$batch_file"
-        table_json='{"nftables":[]}'
     fi
     local chain_spec
     local chain_name
@@ -2632,20 +2643,26 @@ remove_port_expiry_rules_locked() {
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
     comment=$(get_port_expiry_comment "$port")
 
-    local table_state=0
-    nft_table_exists "$family" "$table_name" || table_state=$?
-    case "$table_state" in
-        0) ;;
-        1) return 0 ;;
-        *) return 1 ;;
-    esac
     rules_json=$(mktemp "$CONFIG_DIR/.nft-expiry-rules.XXXXXX") || return 1
     cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-expiry-cleanup.XXXXXX") || {
         rm -f "$rules_json"
         return 1
     }
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
+    local read_state=0
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    case "$read_state" in
+        0) ;;
+        1)
+            # 确证表不存在 => 没有到期封锁规则可删。
+            rm -f "$rules_json" "$cleanup_batch"
+            return 0
+            ;;
+        *)
+            rm -f "$rules_json" "$cleanup_batch"
+            return 1
+            ;;
+    esac
+    if ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
             .nftables[] | .rule? |
             select(.comment == $comment and .handle != null) |
             "delete rule \($family) \($table) \(.chain) handle \(.handle)"
@@ -2711,8 +2728,14 @@ apply_port_expiry_rules_locked() {
         rm -f "$rules_json"
         return 1
     }
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
+    local read_state=0
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    if [ "$read_state" -eq 2 ]; then
+        rm -f "$rules_json" "$rebuild_batch"
+        return 1
+    fi
+    # read_state 1：确证表不存在 => 按“无既有规则”继续重建事务。
+    if ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
             .nftables[] | .rule? |
             select(.comment == $comment and .handle != null) |
             "delete rule \($family) \($table) \(.chain) handle \(.handle)"
@@ -2942,6 +2965,7 @@ reconcile_orphaned_runtime_objects() {
     local rules_json
     local cleanup_batch
     local orphan_names
+    local read_state=0
     table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
     family=$(jq -r '.nftables.family' "$CONFIG_FILE")
     rules_json=$(mktemp "$CONFIG_DIR/.nft-orphans.XXXXXX") || return 1
@@ -2955,7 +2979,13 @@ reconcile_orphaned_runtime_objects() {
         return 1
     }
 
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    if [ "$read_state" -eq 1 ]; then
+        # 确证表不存在 => 孤儿运行对象已不存在，无需清理。
+        rm -f "$rules_json" "$cleanup_batch"
+        return 0
+    fi
+    if [ "$read_state" -eq 2 ] ||
        ! jq -r \
             --arg family "$family" \
             --arg table "$table_name" \
@@ -6393,6 +6423,29 @@ nft_table_json_or_absent() {
     printf '%s\n' '{"nftables":[]}'
 }
 
+# `> file` 形态的三态读取：0=读取成功，1=确证表不存在（写入空表 JSON），2=失败关闭。
+# 空输出同样属于查询失败：jq 1.6 对空输入以 0 退出，不允许落成“空表”证据。
+nft_table_json_to_file_or_absent() {
+    local family="$1"
+    local table_name="$2"
+    local out_file="$3"
+    local mode="${4:-plain}"
+    local st=0
+    local table_state=0
+    if [ "$mode" = "handles" ]; then
+        nft -j -a list table "$family" "$table_name" > "$out_file" 2>/dev/null || st=$?
+    else
+        nft -j list table "$family" "$table_name" > "$out_file" 2>/dev/null || st=$?
+    fi
+    if [ "$st" -eq 0 ] && [ -s "$out_file" ]; then
+        return 0
+    fi
+    nft_table_exists "$family" "$table_name" || table_state=$?
+    [ "$table_state" -eq 1 ] || return 2
+    printf '%s\n' '{"nftables":[]}' > "$out_file" || return 2
+    return 1
+}
+
 remove_nftables_rules() {
     local port="$1"
     local table_name
@@ -7139,7 +7192,9 @@ apply_nftables_quota() {
         return 1
     }
 
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+    local read_state=0
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    if [ "$read_state" -eq 2 ] ||
        ! jq -r \
             --arg family "$family" \
             --arg table "$table_name" \
@@ -7159,6 +7214,7 @@ apply_nftables_quota() {
         rm -f "$rules_json" "$quota_batch"
         return 1
     fi
+    # read_state 1：确证表不存在 => 按“无既有配额规则”继续建立配额事务。
 
     local listed_rule_count
     listed_rule_count=$(wc -l < "$quota_batch" 2>/dev/null) || {
@@ -7247,7 +7303,9 @@ remove_nftables_quota() {
         return 1
     }
 
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
+    local read_state=0
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    if [ "$read_state" -eq 2 ] ||
        ! jq -r \
             --arg family "$family" --arg table "$table_name" --arg quota "$quota_name" '
             def quota_name:
@@ -7263,6 +7321,7 @@ remove_nftables_quota() {
         log_notification "端口 $port 无法读取完整nftables规则，已停止删除配额"
         return 1
     fi
+    # read_state 1：确证表不存在 => 无配额对象/规则可删，继续走“已确认不存在”校验。
     if jq -e --arg name "$quota_name" \
         'any(.nftables[]; .quota?.name? == $name)' "$rules_json" >/dev/null 2>&1; then
         printf 'delete quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$cleanup_batch"
@@ -9233,10 +9292,13 @@ rebuild_port_counter_objects() {
         return 1
     }
 
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null; then
+    local read_state=0
+    nft_table_json_to_file_or_absent "$family" "$table_name" "$rules_json" handles || read_state=$?
+    if [ "$read_state" -eq 2 ]; then
         rm -f "$rules_json" "$rebuild_batch"
         return 1
     fi
+    # read_state 1：确证表不存在 => 按“无既有对象”继续重建事务。
 
     local input_exists=false
     local output_exists=false
