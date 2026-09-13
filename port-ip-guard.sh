@@ -784,7 +784,17 @@ run_daemon() {
     load_policies || return 1
     require_current_ssh_confirmation "$ssh_confirmation" || return 1
     mkdir -p "$(dirname "$LOCK_FILE")"
-    exec 9>"$LOCK_FILE"
+    # /run/lock 世界可写：拒绝符号链接并用 <> 打开，避免截断任意 root 文件。
+    if [ -L "$LOCK_FILE" ]; then
+        echo "IP Guard 锁文件被替换为符号链接，已拒绝: $LOCK_FILE" >&2
+        return 1
+    fi
+    exec 9<>"$LOCK_FILE"
+    if [ ! -f "$LOCK_FILE" ] || [ "$(stat -c %u "$LOCK_FILE" 2>/dev/null)" != "0" ]; then
+        exec 9>&-
+        echo "IP Guard 锁文件非 root 所有或不是普通文件，已拒绝: $LOCK_FILE" >&2
+        return 1
+    fi
     flock -n 9 || {
         echo "另一个 IP 上限守护进程正在运行。" >&2
         return 1

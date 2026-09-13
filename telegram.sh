@@ -111,15 +111,16 @@ telegram_do_post() {
     local curl_output=""
 
     if [ -n "$parse_mode" ]; then
-        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
-            "$send_url" \
+        curl_output=$(printf 'url = "%s"\n' "${send_url//\"/\\\"}" | curl -sS --config - \
+            --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "text=${message}" \
             -d "parse_mode=${parse_mode}" \
             2>&1) || curl_exit=$?
     else
-        curl_output=$(curl -sS --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
-            "$send_url" \
+        # 令牌在 URL 中：用 --config - 从 stdin 传入，避免出现在进程 argv（ps 可见）。
+        curl_output=$(printf 'url = "%s"\n' "${send_url//\"/\\\"}" | curl -sS --config - \
+            --connect-timeout $TELEGRAM_CONNECT_TIMEOUT --max-time $TELEGRAM_MAX_TIMEOUT -X POST \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "text=${message}" \
             2>&1) || curl_exit=$?
