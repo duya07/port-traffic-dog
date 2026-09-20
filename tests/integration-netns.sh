@@ -386,6 +386,22 @@ read -r repair_input_after repair_output_after < <(get_nftables_counter_data 326
 [ "$(count_counter_rules 3265 in)" -eq 8 ]
 [ "$(count_counter_rules 3265 out)" -eq 8 ]
 
+# counter/quota 删除必须按 JSON 中的 chain+handle 执行，并保留同表外部规则。
+nft add rule inet port_traffic_monitor input counter comment "external_survivor"
+remove_nftables_quota 3265
+nftables_quota_is_absent 3265
+remove_nftables_rules 3265
+port_counter_objects_are_absent 3265
+nft -j -a list table inet port_traffic_monitor |
+    jq -e 'any(.nftables[]; .rule?.comment? == "external_survivor")' >/dev/null
+external_rule=$(nft -j -a list table inet port_traffic_monitor |
+    jq -r '[.nftables[] | .rule? | select(.comment == "external_survivor")][0] |
+        [.chain, .handle] | @tsv')
+IFS=$'\t' read -r external_chain external_handle <<< "$external_rule"
+nft delete rule inet port_traffic_monitor "$external_chain" handle "$external_handle"
+add_nftables_rules 3265
+apply_nftables_quota 3265 1GB
+
 ip link add eth0 type veth peer name peer0
 ip link set eth0 up
 ip link set peer0 up
@@ -424,10 +440,19 @@ wait_for_tc_state() {
 
 apply_tc_limit 3265 10mbit
 class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
-[ "$(tc filter show dev eth0 protocol ipv6 parent 1:0 | grep -Fc "classid $class_id")" -eq 4 ]
+mark_id=$(jq -r '.ports["3265"].bandwidth_limit.mark_id' "$CONFIG_FILE")
+tc_port_mark_filter_complete eth0 "$class_id" "$mark_id"
+port_range_mark_rules_complete 3265 "$mark_id"
 [ -f "$(get_tc_root_owner_file)" ]
 tc_class_rate_matches eth0 1:30 "$TC_DEFAULT_CLASS_RATE" "$TC_PARENT_RATE"
 tc_class_rate_matches eth0 "$class_id" "$TC_PORT_CLASS_RATE" 10mbit
+tc_limit_runtime_complete 3265
+dog_tc_runtime_complete_all eth0
+
+# 完整新版层级在 owner 标记意外丢失后，仍可凭精确消费者契约重新认领。
+rm -f "$(get_tc_root_owner_file)"
+ensure_owned_tc_hierarchy eth0
+[ -f "$(get_tc_root_owner_file)" ]
 tc_limit_runtime_complete 3265
 
 # TrafficCop 状态是父类权威来源；Dog 只读状态并原地协调，不调用另一个项目。
@@ -442,13 +467,32 @@ ensure_owned_tc_hierarchy eth0
 tc_limit_runtime_complete 3265
 tc_class_rate_matches eth0 1:1 "$TC_PARENT_RATE"
 
-# Missing IPv4 UDP filters and rate drift must both fail runtime validation.
-filter_prio=$((3265 % 1000 + 1))
-tc filter del dev eth0 protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32
+# 任一 nft mark 规则缺失、额外 class/filter 或 class 速率漂移都必须判为冲突。
+mark_comment=$(get_port_range_mark_comment 3265)
+mark_rule=$(nft -j -a list table inet port_traffic_monitor |
+    jq -r --arg comment "$mark_comment" '
+        [.nftables[] | .rule? | select(.comment == $comment)][0] |
+        if . == null then empty else [.chain, .handle] | @tsv end
+    ')
+[ -n "$mark_rule" ]
+IFS=$'\t' read -r mark_chain mark_handle <<< "$mark_rule"
+nft delete rule inet port_traffic_monitor "$mark_chain" handle "$mark_handle"
 assert_fails tc_limit_runtime_complete 3265
 remove_tc_limit 3265
 apply_tc_limit 3265 10mbit
 tc_limit_runtime_complete 3265
+
+tc class add dev eth0 parent 1:1 classid 1:999 htb rate 1kbit ceil 1mbit
+assert_fails dog_tc_runtime_complete_all eth0
+tc class del dev eth0 classid 1:999
+dog_tc_runtime_complete_all eth0
+
+tc filter add dev eth0 protocol all parent 1:0 prio 500 matchall flowid 1:30
+assert_fails dog_tc_runtime_complete_all eth0
+tc filter del dev eth0 protocol all parent 1:0 prio 500
+dog_tc_runtime_complete_all eth0
+
+class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$CONFIG_FILE")
 tc class replace dev eth0 parent 1:1 classid "$class_id" htb rate 20mbit ceil 20mbit
 assert_fails tc_limit_runtime_complete 3265
 remove_tc_limit 3265
