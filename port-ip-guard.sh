@@ -18,6 +18,9 @@ INSTALLED_SCRIPT="${PTD_IP_GUARD_SCRIPT_PATH:-$CONFIG_DIR/port-ip-guard.sh}"
 SYSTEMCTL="${PTD_IP_GUARD_SYSTEMCTL:-systemctl}"
 RECONCILE_SECONDS="${PTD_IP_GUARD_RECONCILE_SECONDS:-60}"
 readonly MAX_LIMIT=1024
+# 一个来源 IP 没有任何活跃流之后，还保留多久名额（秒）。
+# 太小会让刚切走的 IP 立刻被顶掉，太大则断连的 IP 长期占位；300 秒是折中值。
+readonly DEFAULT_IDLE_TIMEOUT=300
 
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
@@ -26,19 +29,23 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 declare -A POLICY_LIMIT=()
+declare -A POLICY_IDLE=()
 declare -A FLOW_SOURCE=()
 declare -A ACTIVE_COUNT=()
 declare -A ADMITTED=()
 declare -A FIRST_SEEN=()
+declare -A LAST_SEEN=()
 declare -A ADMISSION_CHANGED_PORTS=()
 declare -A LOCAL_ADDRESSES=()
 SEQUENCE=0
+EPOCH_NOW=0
 ADMISSION_CHANGED=false
 PARSED_EVENT=""
 PARSED_SOURCE=""
 PARSED_DESTINATION=""
 PARSED_SPORT=""
 PARSED_DPORT=""
+PARSED_TCP_STATE=""
 PARSED_REPLY_SOURCE=""
 PARSED_REPLY_DESTINATION=""
 PARSED_REPLY_SPORT=""
@@ -183,12 +190,16 @@ validate_config_file() {
         ([.ports | to_entries[] |
             (.key | test("^[0-9]+$") and (tonumber >= 1) and (tonumber <= 65535) and ((tonumber | tostring) == .)) and
             (.value | type == "object") and
-            ((.value | keys) == ["max_ips"]) and
+            (((.value | keys) == ["max_ips"]) or ((.value | keys) == ["idle_timeout", "max_ips"])) and
             (.value.max_ips | type == "number") and
             (.value.max_ips >= 1) and (.value.max_ips <= $max) and
-            ((.value.max_ips | floor) == .value.max_ips)
+            ((.value.max_ips | floor) == .value.max_ips) and
+            ((.value.idle_timeout // $idle) | type == "number") and
+            ((.value.idle_timeout // $idle) >= 1) and
+            ((.value.idle_timeout // $idle) <= 86400) and
+            (((.value.idle_timeout // $idle) | floor) == (.value.idle_timeout // $idle))
         ] | all)
-    ' "$config_path" >/dev/null || {
+    ' --argjson idle "$DEFAULT_IDLE_TIMEOUT" "$config_path" >/dev/null || {
         echo "IP 上限配置格式或取值无效: $config_path" >&2
         return 1
     }
@@ -251,14 +262,37 @@ update_config_and_apply() {
 
 load_policies() {
     POLICY_LIMIT=()
-    local port limit policy_data
+    POLICY_IDLE=()
+    local port limit idle policy_data
     validate_config || return 1
-    policy_data=$(jq -r '.ports | to_entries[] | "\(.key) \(.value.max_ips)"' "$CONFIG_FILE") || return 1
-    while read -r port limit; do
+    policy_data=$(jq -r --argjson idle "$DEFAULT_IDLE_TIMEOUT" \
+        '.ports | to_entries[] | "\(.key) \(.value.max_ips) \(.value.idle_timeout // $idle)"' \
+        "$CONFIG_FILE") || return 1
+    while read -r port limit idle; do
         [ -n "$port" ] || continue
         validate_port "$port" && validate_limit "$limit" || return 1
         POLICY_LIMIT["$port"]="$limit"
+        POLICY_IDLE["$port"]="${idle:-$DEFAULT_IDLE_TIMEOUT}"
     done <<< "$policy_data"
+}
+
+# 只有真正在用的 TCP 状态才算“活跃”。
+# TIME_WAIT / CLOSE 是已结束连接的残留，不该继续占着来源 IP 名额——
+# 否则手机 Wi-Fi→5G 切换后会白占 60~120 秒，新 IP 进不来。
+# 拿不准的状态一律按活跃处理（宁可多保留，也不误踢正在用的用户）。
+is_active_tcp_state() {
+    case "${1:-}" in
+        TIME_WAIT|CLOSE) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# 刷新当前时间戳。用 bash 内建优先于 date：高流量下 conntrack 事件每秒可达数百条，
+# 每条都 fork 一次 date 会明显吃 CPU。
+refresh_epoch_now() {
+    if ! printf -v EPOCH_NOW '%(%s)T' -1 2>/dev/null; then
+        EPOCH_NOW=$(date +%s)
+    fi
 }
 
 set_name_v4() {
@@ -498,10 +532,16 @@ parse_conntrack_line() {
     PARSED_DESTINATION=""
     PARSED_SPORT=""
     PARSED_DPORT=""
+    PARSED_TCP_STATE=""
     PARSED_REPLY_SOURCE=""
     PARSED_REPLY_DESTINATION=""
     PARSED_REPLY_SPORT=""
     PARSED_REPLY_DPORT=""
+    # conntrack 的行格式是 `<proto> <family> <timeout> <state> ...`，
+    # 事件行前面还可能有 [NEW]/[UPDATE]/[DESTROY] 前缀。这里只取 TCP 状态。
+    if [[ "$line" =~ tcp[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+([A-Z_]+) ]]; then
+        PARSED_TCP_STATE="${BASH_REMATCH[1]}"
+    fi
     read -r -a tokens <<< "$line"
     for token in "${tokens[@]}"; do
         case "$token" in
@@ -576,6 +616,11 @@ flow_key_from_parsed() {
 record_flow() {
     local flow_key="$1"
     local active_key="$2"
+    local tcp_state="${3:-}"
+    # 任何流（含 TIME_WAIT 残留）都说明该 IP 最近还在活动，先刷新时间戳。
+    LAST_SEEN["$active_key"]="${EPOCH_NOW:-0}"
+    # 只有活跃状态的流才算“正在使用”；已结束连接的残留不占名额。
+    is_active_tcp_state "$tcp_state" || return 0
     [ -z "${FLOW_SOURCE[$flow_key]:-}" ] || return 0
     FLOW_SOURCE["$flow_key"]="$active_key"
     ACTIVE_COUNT["$active_key"]=$(( ${ACTIVE_COUNT[$active_key]:-0} + 1 ))
@@ -590,19 +635,27 @@ forget_flow() {
     local active_key="${FLOW_SOURCE[$flow_key]:-}"
     [ -n "$active_key" ] || return 1
     unset 'FLOW_SOURCE[$flow_key]'
+    LAST_SEEN["$active_key"]="${EPOCH_NOW:-0}"
     local count=$(( ${ACTIVE_COUNT[$active_key]:-1} - 1 ))
     if [ "$count" -le 0 ]; then
-        unset 'ACTIVE_COUNT[$active_key]' 'ADMITTED[$active_key]' 'FIRST_SEEN[$active_key]'
+        # 不在这里删 LAST_SEEN/ADMITTED：名额是否继续保留由准入重算决定，
+        # 无流的 IP 还享有保留期，不该被立刻踢出。
+        unset 'ACTIVE_COUNT[$active_key]'
     else
         ACTIVE_COUNT["$active_key"]="$count"
     fi
+    return 0
 }
 
 recalculate_port_admission() {
     local port="$1"
     local max_ips="${POLICY_LIMIT[$port]}"
+    local idle_timeout="${POLICY_IDLE[$port]:-$DEFAULT_IDLE_TIMEOUT}"
+    local now="${EPOCH_NOW:-0}"
     local key
-    local candidates=()
+    local active_candidates=()
+    local idle_candidates=()
+    local item
     local -A previous_admitted=()
     ADMISSION_CHANGED=false
     for key in "${!ADMITTED[@]}"; do
@@ -611,15 +664,52 @@ recalculate_port_admission() {
             unset 'ADMITTED[$key]'
         fi
     done
-    mapfile -t candidates < <(
-        for key in "${!ACTIVE_COUNT[@]}"; do
-            [[ "$key" == "$port|"* ]] || continue
-            printf '%012d %s\n' "${FIRST_SEEN[$key]:-999999999999}" "$key"
-        done | sort -n -k1,1 -k2,2
-    )
+
+    # 分流：有活跃流的优先；无流但还在保留期内的次之；超期空闲的直接回收名额。
+    for key in "${!LAST_SEEN[@]}"; do
+        [[ "$key" == "$port|"* ]] || continue
+        if [ "${ACTIVE_COUNT[$key]:-0}" -gt 0 ]; then
+            active_candidates+=("$key")
+        elif [ $(( now - ${LAST_SEEN[$key]:-0} )) -le "$idle_timeout" ]; then
+            idle_candidates+=("$key")
+        else
+            unset 'LAST_SEEN[$key]' 'ACTIVE_COUNT[$key]' 'FIRST_SEEN[$key]'
+        fi
+    done
+
+    # 活跃候选按“先到先得”（FIRST_SEEN）排序：他们正在用连接，名额不够时
+    # 也不能被后来的顶掉——否则就是在用限额功能踢掉正在下载/看视频的用户。
+    local active_sorted=() idle_sorted=()
+    if [ "${#active_candidates[@]}" -gt 0 ]; then
+        mapfile -t active_sorted < <(
+            for item in "${active_candidates[@]}"; do
+                printf '%012d %s\n' "${FIRST_SEEN[$item]:-999999999999}" "$item"
+            done | sort -n -k1,1 -k2,2
+        )
+    fi
+    # 空闲候选按“最近活动”新→旧排序：他们当前没有连接，名额富余时优先给
+    # 刚用过的；名额满时他们自然被挤出去，把位置让给新来的 IP。
+    if [ "${#idle_candidates[@]}" -gt 0 ]; then
+        mapfile -t idle_sorted < <(
+            for item in "${idle_candidates[@]}"; do
+                printf '%012d %s\n' $(( 999999999999 - ${LAST_SEEN[$item]:-0} )) "$item"
+            done | sort -n -k1,1 -k2,2
+        )
+    fi
+
+    # 名额分配：有活跃流的先占满，剩余名额才轮到空闲候选。
+    # 空闲候选排在后面，所以名额一满它们自然被挤出去；
+    # 反过来，任何“有活跃流”的 IP 都不会被无流的新 IP 顶掉——不会踢掉正在用的连接。
     local index=0
-    local item
-    for item in "${candidates[@]}"; do
+    for item in "${active_sorted[@]}"; do
+        key=${item#* }
+        if [ "$index" -lt "$max_ips" ]; then
+            ADMITTED["$key"]=1
+            [ -n "${previous_admitted[$key]:-}" ] || ADMISSION_CHANGED=true
+        fi
+        index=$((index + 1))
+    done
+    for item in "${idle_sorted[@]}"; do
         key=${item#* }
         if [ "$index" -lt "$max_ips" ]; then
             ADMITTED["$key"]=1
@@ -630,6 +720,7 @@ recalculate_port_admission() {
     for key in "${!previous_admitted[@]}"; do
         [ -n "${ADMITTED[$key]:-}" ] || ADMISSION_CHANGED=true
     done
+    return 0
 }
 
 recalculate_all_admission() {
@@ -657,21 +748,20 @@ load_conntrack_snapshot() {
         rm -f "$snapshot_file"
         return 1
     fi
+    refresh_epoch_now
     FLOW_SOURCE=()
     ACTIVE_COUNT=()
+    # 注意：LAST_SEEN 故意不在这里清空——它记录“最后活动时间”，
+    # 正是保留期与空闲回收的唯一依据，必须跨对账保留。
     local line flow_key active_key policy_port
     while IFS= read -r line; do
         parse_conntrack_line "$line" || continue
         policy_port=$(parsed_inbound_policy_port) || continue
         flow_key=$(flow_key_from_parsed)
         active_key="$policy_port|$PARSED_SOURCE"
-        record_flow "$flow_key" "$active_key"
+        record_flow "$flow_key" "$active_key" "$PARSED_TCP_STATE"
     done < "$snapshot_file"
     rm -f "$snapshot_file"
-    local key
-    for key in "${!FIRST_SEEN[@]}"; do
-        [ -n "${ACTIVE_COUNT[$key]:-}" ] || unset 'FIRST_SEEN[$key]' 'ADMITTED[$key]'
-    done
     recalculate_all_admission
 }
 
@@ -683,9 +773,10 @@ process_conntrack_event() {
     local flow_key
     local active_key="$policy_port|$PARSED_SOURCE"
     flow_key=$(flow_key_from_parsed)
+    refresh_epoch_now
     case "$PARSED_EVENT" in
         NEW)
-            record_flow "$flow_key" "$active_key"
+            record_flow "$flow_key" "$active_key" "$PARSED_TCP_STATE"
             ;;
         DESTROY)
             forget_flow "$flow_key" || return 0

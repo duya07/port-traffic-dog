@@ -29,6 +29,10 @@ export PTD_IP_GUARD_SYSTEMCTL="mock_systemctl"
 
 source "$SCRIPT_FILE"
 
+# 后续不少用例会用同名函数覆盖 load_policies 做故障注入，而这些覆盖不在子 shell 里，
+# 会一直泄漏到文件末尾。需要真实行为的用例用下面这份原定义恢复。
+readonly ORIGINAL_LOAD_POLICIES_DEFINITION="$(declare -f load_policies)"
+
 # 当前实验功能只保护本机 INPUT；不得对无法可靠识别来源的 FORWARD/DNAT 流量下发 drop。
 (
     POLICY_LIMIT=([3265]=2)
@@ -440,5 +444,142 @@ apply_if_configured() {
 assert_fails update_config_and_apply 'del(.ports[$port])' token --arg port 3265 >/dev/null 2>&1
 cmp -s "$CONFIG_FILE" "$TEST_DIR/config.before-transaction"
 [ "$APPLY_TRANSACTION_COUNT" -eq 2 ]
+
+# ——— 准入优先级：有活跃流的绝不被抢；无流的可被抢；超时空闲要回收 ———
+
+# 旧配置没有 idle_timeout 字段时必须照旧可用，并取默认 300 秒。
+printf '%s\n' '{"schema":"port-traffic-dog-ip-guard-v1","ports":{"3265":{"max_ips":1}}}' > "$CONFIG_FILE"
+# 注意：第 390 行的 `jq() { :; }` 和第 384 行的 `load_policies() { ... }` 都不在
+# 子 shell 里，会一直泄漏到文件末尾。这条用例必须用真实实现解析真实配置。
+(
+    unset -f jq
+    eval "$ORIGINAL_LOAD_POLICIES_DEFINITION"
+    load_policies
+    [ "${POLICY_LIMIT[3265]:-}" = "1" ]
+    [ "${POLICY_IDLE[3265]:-}" = "300" ]
+)
+
+# 显式写了 idle_timeout 时要按配置值生效，而不是默认值。
+printf '%s\n' '{"schema":"port-traffic-dog-ip-guard-v1","ports":{"3265":{"max_ips":2,"idle_timeout":45}}}' > "$CONFIG_FILE"
+(
+    unset -f jq
+    eval "$ORIGINAL_LOAD_POLICIES_DEFINITION"
+    load_policies
+    [ "${POLICY_LIMIT[3265]:-}" = "2" ]
+    [ "${POLICY_IDLE[3265]:-}" = "45" ]
+)
+
+# 非法的 idle_timeout 必须被拒绝，不能静默当成默认值。
+printf '%s\n' '{"schema":"port-traffic-dog-ip-guard-v1","ports":{"3265":{"max_ips":2,"idle_timeout":0}}}' > "$CONFIG_FILE"
+(
+    unset -f jq
+    assert_fails validate_config
+)
+printf '%s\n' '{"schema":"port-traffic-dog-ip-guard-v1","ports":{"3265":{"max_ips":2,"idle_timeout":"abc"}}}' > "$CONFIG_FILE"
+(
+    unset -f jq
+    assert_fails validate_config
+)
+
+# 有活跃 TCP 流的 IP 不能被新来的 IP 挤掉（最重要的安全属性：
+# 否则正在下载/看视频的用户会被限额功能本身踢下线）。
+# EPOCH_NOW 在生产里由对账/事件路径设置，这里显式给出，模拟同一次判定。
+(
+    EPOCH_NOW=$(date +%s)
+    POLICY_LIMIT=([3265]=1)
+    POLICY_IDLE=([3265]=300)
+    ACTIVE_COUNT=(["3265|10.0.0.1"]=1)
+    LAST_SEEN=(["3265|10.0.0.1"]=$(( EPOCH_NOW - 5 )))
+    ADMITTED=(["3265|10.0.0.1"]=1)
+    # 新 IP 只有 TIME_WAIT 残留，没有活跃流
+    ACTIVE_COUNT["3265|10.0.0.2"]=0
+    LAST_SEEN["3265|10.0.0.2"]="$EPOCH_NOW"
+
+    recalculate_port_admission 3265
+
+    [ -n "${ADMITTED[3265|10.0.0.1]:-}" ]
+    [ -z "${ADMITTED[3265|10.0.0.2]:-}" ]
+)
+
+# 两个都有活跃流的 IP 争一个名额时，必须保住“先到的”，而不是“最近活跃的”。
+# 这是上面那条的加强版：如果按最近活动排序，后到的 IP 会把先到、且此刻仍在
+# 传输的连接顶掉——那就等于限额功能自己去踢正在用的人。
+(
+    EPOCH_NOW=$(date +%s)
+    POLICY_LIMIT=([3265]=1)
+    POLICY_IDLE=([3265]=300)
+    # 老 IP：先到（FIRST_SEEN 小），但最近没有新的活动
+    ACTIVE_COUNT=(["3265|10.0.0.1"]=1)
+    FIRST_SEEN=(["3265|10.0.0.1"]=1)
+    LAST_SEEN=(["3265|10.0.0.1"]=$(( EPOCH_NOW - 200 )))
+    ADMITTED=(["3265|10.0.0.1"]=1)
+    # 新 IP：后到，但刚刚建立连接
+    ACTIVE_COUNT["3265|10.0.0.2"]=1
+    FIRST_SEEN["3265|10.0.0.2"]=2
+    LAST_SEEN["3265|10.0.0.2"]="$EPOCH_NOW"
+
+    recalculate_port_admission 3265
+
+    [ -n "${ADMITTED[3265|10.0.0.1]:-}" ]
+    [ -z "${ADMITTED[3265|10.0.0.2]:-}" ]
+)
+# 名额满但现有 IP 都没有活跃流时，新 IP 必须能抢占名额
+# （否则手机 Wi-Fi→5G 切换后，新 IP 永远进不来）。
+(
+    EPOCH_NOW=$(date +%s)
+    POLICY_LIMIT=([3265]=1)
+    POLICY_IDLE=([3265]=300)
+    ACTIVE_COUNT=(["3265|10.0.0.1"]=0)
+    LAST_SEEN=(["3265|10.0.0.1"]=$(( EPOCH_NOW - 60 )))
+    ADMITTED=(["3265|10.0.0.1"]=1)
+
+    ACTIVE_COUNT["3265|10.0.0.2"]=1
+    LAST_SEEN["3265|10.0.0.2"]="$EPOCH_NOW"
+
+    recalculate_port_admission 3265
+
+    [ -n "${ADMITTED[3265|10.0.0.2]:-}" ]
+    [ -z "${ADMITTED[3265|10.0.0.1]:-}" ]
+)
+
+# 空闲超过 idle_timeout 的 IP 被彻底回收，不再长期占位。
+(
+    EPOCH_NOW=$(date +%s)
+    POLICY_LIMIT=([3265]=2)
+    POLICY_IDLE=([3265]=300)
+    ACTIVE_COUNT=(["3265|10.0.0.9"]=0)
+    LAST_SEEN=(["3265|10.0.0.9"]=$(( EPOCH_NOW - 400 )))
+    ADMITTED=(["3265|10.0.0.9"]=1)
+    FIRST_SEEN=(["3265|10.0.0.9"]=1)
+
+    recalculate_port_admission 3265
+
+    [ -z "${LAST_SEEN[3265|10.0.0.9]:-}" ]
+    [ -z "${ADMITTED[3265|10.0.0.9]:-}" ]
+)
+
+# 刚发生过的活动（在保留期内的无流 IP）不该被回收，名额仍留给它。
+(
+    EPOCH_NOW=$(date +%s)
+    POLICY_LIMIT=([3265]=2)
+    POLICY_IDLE=([3265]=300)
+    ACTIVE_COUNT=(["3265|10.0.0.1"]=0)
+    LAST_SEEN=(["3265|10.0.0.1"]=$(( EPOCH_NOW - 250 )))
+    ADMITTED=(["3265|10.0.0.1"]=1)
+
+    recalculate_port_admission 3265
+
+    [ -n "${LAST_SEEN[3265|10.0.0.1]:-}" ]
+    [ -n "${ADMITTED[3265|10.0.0.1]:-}" ]
+)
+
+# 已结束的连接状态不算活跃：TIME_WAIT/CLOSE 只是残留，不该继续占名额。
+(
+    if is_active_tcp_state TIME_WAIT; then exit 1; fi
+    if is_active_tcp_state CLOSE; then exit 1; fi
+    is_active_tcp_state ESTABLISHED
+    is_active_tcp_state SYN_SENT
+    is_active_tcp_state CLOSE_WAIT
+)
 
 echo "ip guard regression passed"
