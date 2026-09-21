@@ -42,6 +42,10 @@ source <(sed \
 ORIGINAL_INSTALL_UPDATE_SCRIPT_DEFINITION=$(declare -f install_update_script)
 ORIGINAL_INSTALL_TC_RECOVERY_FILES_DEFINITION=$(declare -f install_tc_recovery_service_files)
 ORIGINAL_REFRESH_ALL_CRON_DEFINITION=$(declare -f refresh_all_cron_from_config)
+# 后面的启动追踪用例会在顶层把这两个函数替换成桩并一直生效，
+# 本轮新增的用例需要真实实现，所以先留一份原始定义。
+ORIGINAL_SETUP_TRAFFIC_SNAPSHOT_CRON_DEFINITION=$(declare -f setup_traffic_snapshot_cron)
+ORIGINAL_GET_DEFAULT_INTERFACE_DEFINITION=$(declare -f get_default_interface)
 
 mkdir -p "$CONFIG_DIR/logs"
 flock() { :; }
@@ -2148,5 +2152,113 @@ uninstall_status=0
     main --uninstall
 ) >/dev/null 2>&1 || uninstall_status=$?
 [ "$uninstall_status" -eq 23 ]
+
+# ---- 本轮修复的回归保护 ----
+
+# cron 候选生成失败时必须中止：宁可不动 crontab，也不能把用户无关任务整体清空。
+rm -f "$TEST_DIR/cron-committed"
+if (
+    eval "$ORIGINAL_SETUP_TRAFFIC_SNAPSHOT_CRON_DEFINITION"
+    filter_traffic_snapshot_cron_entries() { return 1; }
+    read_current_crontab() { printf '%s\n' '0 3 * * * /usr/bin/backup.sh'; }
+    begin_cron_update() { :; }
+    release_cron_update() { :; }
+    finish_cron_update() { touch "$TEST_DIR/cron-committed"; }
+    has_active_ports() { return 0; }
+    get_script_exec_path() { printf '%s\n' /usr/local/bin/port-traffic-dog.sh; }
+    validate_config_file() { :; }
+    setup_traffic_snapshot_cron
+) >/dev/null 2>&1; then
+    echo "cron 候选失败时不应报成功" >&2
+    exit 1
+fi
+[ ! -e "$TEST_DIR/cron-committed" ]
+
+# 删除路径同型：过滤器失败也必须中止，不能提交半成品候选。
+rm -f "$TEST_DIR/cron-committed"
+if (
+    filter_runtime_restore_cron_entries() { return 1; }
+    read_current_crontab() { printf '%s\n' '0 3 * * * /usr/bin/backup.sh'; }
+    begin_cron_update() { :; }
+    release_cron_update() { :; }
+    finish_cron_update() { touch "$TEST_DIR/cron-committed"; }
+    remove_runtime_restore_cron
+) >/dev/null 2>&1; then
+    echo "cron 删除路径失败时不应报成功" >&2
+    exit 1
+fi
+[ ! -e "$TEST_DIR/cron-committed" ]
+
+# mktemp 失败不得继续：否则会拿空文件名当候选去覆盖 crontab。
+if (
+    eval "$ORIGINAL_SETUP_TRAFFIC_SNAPSHOT_CRON_DEFINITION"
+    mktemp() { return 1; }
+    setup_traffic_snapshot_cron
+) >/dev/null 2>&1; then
+    echo "mktemp 失败时不应报成功" >&2
+    exit 1
+fi
+
+# 过滤器语义必须保持不变：只删自己的条目，不碰用户无关任务。
+cron_fixture=$(printf '%s\n' \
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+    '0 3 * * * /usr/bin/backup.sh' \
+    '* * * * * /usr/local/bin/port-traffic-dog.sh --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot')
+filtered_cron=$(printf '%s\n' "$cron_fixture" | filter_traffic_snapshot_cron_entries)
+grep -Fq '/usr/bin/backup.sh' <<< "$filtered_cron"
+assert_fails grep -Fq 'traffic snapshot' <<< "$filtered_cron" 2>/dev/null
+grep -q '^PATH=' <<< "$filtered_cron"
+
+# 到期/重置过滤器：@reboot 的到期检查归 runtime restore 管，必须保留。
+auto_reset_fixture=$(printf '%s\n' \
+    '@reboot /usr/local/bin/port-traffic-dog.sh --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry reboot check' \
+    '0 3 * * * /usr/bin/backup.sh' \
+    '15 4 * * * /usr/local/bin/port-traffic-dog.sh --reset-port 3265  # 端口流量狗自动重置端口')
+kept_cron=$(printf '%s\n' "$auto_reset_fixture" | filter_port_auto_reset_cron_entries)
+grep -Fq -- '--check-port-expirations' <<< "$kept_cron"
+grep -Fq '/usr/bin/backup.sh' <<< "$kept_cron"
+assert_fails grep -Fq '端口流量狗自动重置端口' <<< "$kept_cron" 2>/dev/null
+
+# 归属标记写不进去必须报失败：调用方靠它区分“自己的 HTB”和“别人的 HTB”。
+if (
+    get_tc_root_owner_file() { printf '%s\n' "$TEST_DIR/absent-dir/tc-root-qdisc.owner"; }
+    mark_tc_root_owned eth0
+) 2>/dev/null; then
+    echo "归属标记写入失败时必须报失败" >&2
+    exit 1
+fi
+
+# 无法识别 root qdisc 类型时不得当成“可替换”，否则会删掉别人的 qdisc。
+assert_fails tc_root_qdisc_is_replaceable "" 2>/dev/null
+tc_root_qdisc_is_replaceable 'qdisc fq 0: root refcnt 2 limit 10000p'
+tc_root_qdisc_is_replaceable 'qdisc noqueue 0: root'
+assert_fails tc_root_qdisc_is_replaceable 'qdisc htb 1: root' 2>/dev/null
+
+# 无法确定默认网卡时必须中止，不能猜一个名字去动错设备。
+if (
+    eval "$ORIGINAL_GET_DEFAULT_INTERFACE_DEFINITION"
+    ip() { return 1; }
+    get_network_interfaces() { :; }
+    get_default_interface
+) >/dev/null 2>&1; then
+    echo "无法确定默认网卡时不应猜出网卡名" >&2
+    exit 1
+fi
+
+# 共享恢复入口：必须能生成、语法正确，并在“入口在而配置不可读”时报错。
+rm -f "$TC_RECOVERY_RUNNER"
+if ! (
+    eval "$ORIGINAL_INSTALL_TC_RECOVERY_FILES_DEFINITION"
+    tc_recovery_systemd_available() { return 1; }
+    install_tc_recovery_service_files
+) >/dev/null 2>&1; then
+    echo "共享恢复入口生成失败" >&2
+    exit 1
+fi
+[ -x "$TC_RECOVERY_RUNNER" ]
+bash -n "$TC_RECOVERY_RUNNER"
+grep -Fq '已安装但配置不可读，跳过 TC 恢复' "$TC_RECOVERY_RUNNER"
+grep -Fq 'handled=true' "$TC_RECOVERY_RUNNER"
+rm -f "$TC_RECOVERY_RUNNER"
 
 echo "regression tests passed"

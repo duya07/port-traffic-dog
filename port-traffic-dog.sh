@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.17"
+readonly SCRIPT_VERSION="1.5.19"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -235,9 +235,18 @@ setup_cron_environment() {
         return 1
     fi
     if ! echo "$current_cron" | grep -q "^PATH=.*sbin"; then
-        local temp_cron=$(mktemp)
-        echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" > "$temp_cron"
-        printf '%s\n' "$current_cron" | grep -v "^PATH=" >> "$temp_cron" || true
+        local temp_cron
+        temp_cron=$(mktemp) || { release_cron_update; return 1; }
+        echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" > "$temp_cron" || {
+            rm -f "$temp_cron"
+            release_cron_update
+            return 1
+        }
+        printf '%s\n' "$current_cron" | filter_cron_path_entries >> "$temp_cron" || {
+            rm -f "$temp_cron"
+            release_cron_update
+            return 1
+        }
         finish_cron_update "$temp_cron"
         return
     fi
@@ -479,9 +488,12 @@ get_default_interface() {
     local interfaces=($(get_network_interfaces))
     if [ ${#interfaces[@]} -gt 0 ]; then
         echo "${interfaces[0]}"
-    else
-        echo "eth0"
+        return
     fi
+
+    # 不能猜网卡名：猜错会在错误的设备上重建 HTB。宁可中止，也不要动错设备。
+    echo "无法确定默认出口网卡，已中止 TC 相关操作" >&2
+    return 1
 }
 
 format_bytes() {
@@ -3595,6 +3607,9 @@ get_active_ports() {
     [ -f "$CONFIG_FILE" ] || return 1
     jq -e '.ports | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
     ports_output=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    # 没有端口时必须“不输出任何内容”，不能输出一个空行：
+    # 调用方用 mapfile 读取，空行会变成一个“端口名为空”的元素，接着被当成真实端口去建规则、恢复状态。
+    [ -n "$ports_output" ] || return 0
     printf '%s\n' "${ports_output//$'\r'/}" | sort -n
 }
 
@@ -4870,7 +4885,7 @@ install_tc_recovery_service_files() {
         return 1
     fi
     mkdir -p "$runner_dir" || return 1
-    cat > "$runner_tmp" <<'EOF'
+    if ! cat > "$runner_tmp" <<'EOF'
 #!/bin/bash
 # traffic-tools-tc-recovery-v1
 set -euo pipefail
@@ -4888,18 +4903,34 @@ ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
 handled=false
 result=0
 
-if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
-    bash "$dog_script" --recover-tc "$mode" || result=1
+# 入口在而配置不可读属于异常：必须报出来，不能静默跳过恢复。
+# 此模板由 dog 与 ntc 共用，两边必须逐字一致，否则后运行的一方会覆盖先运行的一方。
+if [ -r "$dog_script" ]; then
+    if [ -r "$dog_config" ]; then
+        bash "$dog_script" --recover-tc "$mode" || result=1
+    else
+        echo "port-traffic-dog 已安装但配置不可读，跳过 TC 恢复: $dog_config" >&2
+        result=1
+    fi
     handled=true
 fi
-if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
-    bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+if [ -r "$ntc_monitor" ]; then
+    if [ -r "$ntc_config" ]; then
+        bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+    else
+        echo "trafficcop-lite 已安装但配置不可读，跳过 TC 恢复: $ntc_config" >&2
+        result=1
+    fi
     handled=true
 fi
 
 $handled || exit 0
 exit "$result"
 EOF
+    then
+        rm -f "$runner_tmp"
+        return 1
+    fi
     chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
     if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
         mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
@@ -4909,7 +4940,7 @@ EOF
 
     tc_recovery_systemd_available || return 0
     mkdir -p "$unit_dir" || return 1
-    cat > "$unit_tmp" <<EOF
+    if ! cat > "$unit_tmp" <<EOF
 # traffic-tools-tc-recovery-v1
 [Unit]
 Description=Recover Dog and TrafficCop Lite unified HTB
@@ -4923,6 +4954,10 @@ ExecStart=$TC_RECOVERY_RUNNER --auto
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$unit_tmp"
+        return 1
+    fi
     chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
     if ! cmp -s "$unit_tmp" "$TC_RECOVERY_UNIT_FILE"; then
         mv -f "$unit_tmp" "$TC_RECOVERY_UNIT_FILE" || { rm -f "$unit_tmp"; return 1; }
@@ -5307,7 +5342,7 @@ add_port_monitoring() {
     echo "────────────────────────────────────────────────────────"
 
     # 解析ss输出，聚合同程序的端口
-    declare -A program_ports
+    declare -A program_ports=()
     while read line; do
         if [[ "$line" =~ LISTEN|UNCONN ]]; then
             local_addr=$(echo "$line" | awk '{print $5}')
@@ -6629,8 +6664,11 @@ mark_tc_root_owned() {
     local interface="$1"
     local machine_id=""
     [ -r /etc/machine-id ] && machine_id=$(tr -d '\r\n' < /etc/machine-id)
-    printf '%s|%s\n' "$interface" "$machine_id" > "$(get_tc_root_owner_file)"
-    chmod 600 "$(get_tc_root_owner_file)" 2>/dev/null || true
+    local owner_file
+    owner_file=$(get_tc_root_owner_file)
+    # 归属标记写不进去就必须报出来：调用方靠它区分“自己的 HTB”和“别人的 HTB”。
+    printf '%s|%s\n' "$interface" "$machine_id" > "$owner_file" || return 1
+    chmod 600 "$owner_file" 2>/dev/null || true
 }
 
 tc_root_owner_marker_matches() {
@@ -6888,7 +6926,12 @@ tc_root_qdisc_is_replaceable() {
     local qdisc_type
     qdisc_type=$(printf '%s\n' "$qdisc_state" | awk 'NR == 1 {print $2}')
     case "$qdisc_type" in
-        ""|noqueue|fq_codel|pfifo_fast|mq|fq) return 0 ;;
+        noqueue|fq_codel|pfifo_fast|mq|fq) return 0 ;;
+        "")
+            # 解析不出类型只可能是 tc 查询异常。当成“可替换”会删掉别人的 root qdisc。
+            echo "无法识别 root qdisc 类型（tc 查询异常），按不可替换处理" >&2
+            return 1
+            ;;
         *) return 1 ;;
     esac
 }
@@ -10070,7 +10113,8 @@ notification_interval_cron_expression() {
 setup_telegram_notification_cron() {
     local script_path
     script_path=$(get_script_exec_path)
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
 
     validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
@@ -10080,7 +10124,11 @@ setup_telegram_notification_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_telegram_notification_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
 
     # 通道总开关和状态通知开关必须同时启用。
     local telegram_channel_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE")
@@ -10110,7 +10158,8 @@ setup_telegram_notification_cron() {
 setup_wecom_notification_cron() {
     local script_path
     script_path=$(get_script_exec_path)
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
     validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
@@ -10119,7 +10168,11 @@ setup_wecom_notification_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_wecom_notification_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
 
     # 通道总开关和状态通知开关必须同时启用。
     local wecom_channel_enabled=$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE")
@@ -10172,7 +10225,8 @@ select_notification_interval() {
 }
 
 remove_telegram_notification_cron() {
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
@@ -10180,12 +10234,17 @@ remove_telegram_notification_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | grep -v "# 端口流量狗Telegram通知" > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_telegram_notification_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
     finish_cron_update "$temp_cron"
 }
 
 remove_wecom_notification_cron() {
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
@@ -10193,12 +10252,17 @@ remove_wecom_notification_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | grep -v "# 端口流量狗企业wx 通知" > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_wecom_notification_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
     finish_cron_update "$temp_cron"
 }
 
 remove_all_port_auto_reset_cron() {
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
@@ -10206,15 +10270,11 @@ remove_all_port_auto_reset_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | \
-        grep -v "端口流量狗自动重置端口" | \
-        grep -v "# port-traffic-dog scheduled reset check" | \
-        grep -v "# port-traffic-dog expiry check" | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)' | \
-        grep -vE '^[^@].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)' \
-        > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_port_auto_reset_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
     finish_cron_update "$temp_cron"
 }
 
@@ -10228,6 +10288,34 @@ filter_all_dog_cron_entries() {
         /\/usr\/local\/bin\/dog[[:space:]]+--/ { next }
         { print }
     '
+}
+
+# 与上面的过滤器同型：用 awk 而非 grep，保证“无匹配行”不产生非零退出码，
+# 这样调用方才能把真实的过滤失败与“过滤后为空”区分开。
+filter_port_auto_reset_cron_entries() {
+    awk '
+        /端口流量狗自动重置端口/ { next }
+        /# port-traffic-dog scheduled reset check/ { next }
+        /# port-traffic-dog expiry check/ { next }
+        /port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)/ { next }
+        /port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)/ { next }
+        /port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)/ { next }
+        /^[^@].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)/ { next }
+        { print }
+    '
+}
+
+filter_telegram_notification_cron_entries() {
+    awk '!/# 端口流量狗Telegram通知/'
+}
+
+filter_wecom_notification_cron_entries() {
+    awk '!/# 端口流量狗企业wx 通知/'
+}
+
+# PATH 行由 setup_cron_environment 单独重写，这里只剔除旧的 PATH 行。
+filter_cron_path_entries() {
+    awk '!/^PATH=/'
 }
 
 remove_all_dog_cron_entries() {
@@ -10312,7 +10400,7 @@ setup_traffic_snapshot_cron() {
     local script_path
     script_path=$(get_script_exec_path)
     local temp_cron
-    temp_cron=$(mktemp)
+    temp_cron=$(mktemp) || return 1
     local current_cron
 
     validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
@@ -10322,7 +10410,11 @@ setup_traffic_snapshot_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
 
     local active_ports_status=0
     has_active_ports || active_ports_status=$?
@@ -10343,7 +10435,7 @@ setup_traffic_snapshot_cron() {
 
 remove_traffic_snapshot_cron() {
     local temp_cron
-    temp_cron=$(mktemp)
+    temp_cron=$(mktemp) || return 1
     local current_cron
 
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
@@ -10352,7 +10444,11 @@ remove_traffic_snapshot_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
 
     finish_cron_update "$temp_cron"
 }
@@ -10373,7 +10469,7 @@ setup_runtime_restore_cron() {
     local script_path
     script_path=$(get_script_exec_path)
     local temp_cron
-    temp_cron=$(mktemp)
+    temp_cron=$(mktemp) || return 1
     local current_cron
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
@@ -10381,7 +10477,11 @@ setup_runtime_restore_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
     # 到期封锁和 nftables 计数不依赖 TC；TC 开机恢复只由共享 systemd oneshot 负责。
     echo "@reboot $script_path --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry reboot check" >> "$temp_cron"
     echo "@reboot $script_path --restore-nft-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
@@ -10391,7 +10491,7 @@ setup_runtime_restore_cron() {
 remove_runtime_restore_cron() {
     command -v crontab >/dev/null 2>&1 || return 0
     local temp_cron
-    temp_cron=$(mktemp)
+    temp_cron=$(mktemp) || return 1
     local current_cron
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
     if ! current_cron=$(read_current_crontab); then
@@ -10399,7 +10499,11 @@ remove_runtime_restore_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
     finish_cron_update "$temp_cron"
 }
 
@@ -10416,7 +10520,8 @@ setup_port_auto_reset_cron() {
 setup_auto_reset_cron() {
     local script_path
     script_path=$(get_script_exec_path)
-    local temp_cron=$(mktemp)
+    local temp_cron
+    temp_cron=$(mktemp) || return 1
     local current_cron
 
     begin_cron_update || { rm -f "$temp_cron"; return 1; }
@@ -10425,15 +10530,11 @@ setup_auto_reset_cron() {
         release_cron_update
         return 1
     fi
-    printf '%s\n' "$current_cron" | \
-        grep -v "端口流量狗自动重置端口" | \
-        grep -v "# port-traffic-dog scheduled reset check" | \
-        grep -v "# port-traffic-dog expiry check" | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)' | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)' | \
-        grep -vE '(^|[[:space:]])[^[:space:]]*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)' | \
-        grep -vE '^[^@].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)' \
-        > "$temp_cron" || true
+    printf '%s\n' "$current_cron" | filter_port_auto_reset_cron_entries > "$temp_cron" || {
+        rm -f "$temp_cron"
+        release_cron_update
+        return 1
+    }
 
     local active_ports=()
     local ports_output
