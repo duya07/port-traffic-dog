@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.19"
+readonly SCRIPT_VERSION="1.5.20"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -1358,12 +1358,20 @@ restore_port_counters_from_backup() {
     local port="$1"
     acquire_traffic_stats_lock || return 1
 
-    if ! read_nftables_counter_data "$port"; then
-        release_traffic_stats_lock
-        return 1
+    # 读不到现有计数不等于出错：规则可能从未建立过（全新装机、nft 被外部清空、
+    # 只恢复了配置而运行态没有）。此时以 0 为基准，再让下面的灾备值和
+    # rebuild_port_counter_objects 去重建规则。
+    # 绝不能因为读不到就直接 return 1：那会让 restore_runtime_state 失败、
+    # 连带 init_config 失败，最后连菜单都进不去，而且没有任何命令能修回来。
+    #
+    # 数据安全：规则存在时本函数行为与以前完全一致；灾备值只用于“取较大值”，
+    # 永远不会用更小的数覆盖当前累计。
+    local target_input=0
+    local target_output=0
+    if read_nftables_counter_data "$port"; then
+        target_input="$NFT_COUNTER_INPUT"
+        target_output="$NFT_COUNTER_OUTPUT"
     fi
-    local target_input="$NFT_COUNTER_INPUT"
-    local target_output="$NFT_COUNTER_OUTPUT"
 
     if [ -f "$TRAFFIC_DATA_FILE" ] && jq -e --arg port "$port" '.[$port] | type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
         local backup_input

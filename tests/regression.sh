@@ -2261,4 +2261,42 @@ grep -Fq '已安装但配置不可读，跳过 TC 恢复' "$TC_RECOVERY_RUNNER"
 grep -Fq 'handled=true' "$TC_RECOVERY_RUNNER"
 rm -f "$TC_RECOVERY_RUNNER"
 
+# 计数恢复：规则缺失时必须能重建（否则 restore_runtime_state 失败 → init_config 失败 →
+# main 的 `init_config || exit 1` 让菜单直接退出，且没有任何命令能修回来）。
+# 同时绝不能用更小的灾备值覆盖更大的当前累计。
+readonly COUNTER_RESTORE_CAPTURE="$TEST_DIR/counter-restore.capture"
+
+# 场景一：当前累计大于灾备值 —— 必须保留较大的当前值
+(
+    read_nftables_counter_data() { NFT_COUNTER_INPUT=5000; NFT_COUNTER_OUTPUT=6000; }
+    acquire_traffic_stats_lock() { return 0; }
+    release_traffic_stats_lock() { :; }
+    rebuild_port_counter_objects() { printf '%s %s\n' "$2" "$3" > "$COUNTER_RESTORE_CAPTURE"; }
+    printf '{"3265":{"input":100,"output":200}}\n' > "$TRAFFIC_DATA_FILE"
+    restore_port_counters_from_backup 3265
+    [ "$(cat "$COUNTER_RESTORE_CAPTURE")" = "5000 6000" ]
+)
+
+# 场景二：规则不存在（读不到计数）—— 必须继续，用灾备值重建
+(
+    read_nftables_counter_data() { return 1; }
+    acquire_traffic_stats_lock() { return 0; }
+    release_traffic_stats_lock() { :; }
+    rebuild_port_counter_objects() { printf '%s %s\n' "$2" "$3" > "$COUNTER_RESTORE_CAPTURE"; }
+    printf '{"3265":{"input":8000,"output":9000}}\n' > "$TRAFFIC_DATA_FILE"
+    restore_port_counters_from_backup 3265
+    [ "$(cat "$COUNTER_RESTORE_CAPTURE")" = "8000 9000" ]
+)
+
+# 场景三：规则不存在且没有灾备 —— 仍要重建（计数从 0 起，而不是失败放弃）
+(
+    read_nftables_counter_data() { return 1; }
+    acquire_traffic_stats_lock() { return 0; }
+    release_traffic_stats_lock() { :; }
+    rebuild_port_counter_objects() { printf '%s %s\n' "$2" "$3" > "$COUNTER_RESTORE_CAPTURE"; }
+    rm -f "$TRAFFIC_DATA_FILE"
+    restore_port_counters_from_backup 3265
+    [ "$(cat "$COUNTER_RESTORE_CAPTURE")" = "0 0" ]
+)
+
 echo "regression tests passed"
