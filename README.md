@@ -57,8 +57,11 @@
 45. Dog 与 TrafficCop Lite 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认不启用；用户启用后在网络就绪时执行一次，不依赖固定延迟，也不会在运行期间高频轮询抢占。
 46. 每个端口可单独设置服务到期日 `YYYY-MM-DD`。到期前流量周期照常重置；北京时间到期日当天起独立封锁该端口的 TCP/UDP 入站、出站和转发流量，延期或取消后立即解锁。
 47. 服务到期检查每分钟运行，并通过独立 `@reboot` 任务在开机时立即恢复；设置、导入、删除和卸载均与检查任务共用到期锁，避免留下孤儿封锁规则。
-48. 主菜单增加“来源 IP 并发限制（测试中）”。该功能位于独立的 `port-ip-guard.sh`，主脚本只负责校验、安装和调用，未启用时不会创建额外防火墙规则或服务。
-49. 来源 IP 守护会在全量 conntrack 快照前先建立事件监听，避免启动空窗；它通过 conntrack 回复方向的本机地址和服务端口识别真正进入本机 TCP 服务的连接，不会把本机主动访问远端同号端口算作来源；只有准入集合实际变化时才按受影响端口原子刷新 nftables。该测试功能不处理内核 FORWARD/DNAT 流量，也不会对其下发 drop。
+48. 主菜单 `10` 提供“在线 IP / 并发连接限制（测试中）”，独立组件 `port-ip-guard.sh` 按本机 TCP 服务端口分别设置两项上限，IPv4/IPv6 合计，每项 `0` 表示不限。
+49. 新 SYN 通过独占 NFQUEUE 串行准入，同源 IP 去重、每条 TCP 流独立计数；首次接入不依赖被丢弃 SYN 的 conntrack 事件。定期快照回收关闭连接，保留已有活跃连接与旧配置。
+50. 与 TrafficCop Lite 兼容时，两个项目可独立安装且顺序不限；Dog 维护端口 class/filter，NTC 维护 `1:1`/`1:30` 整机父类，只有共享 TC 锁内才会协调同一层级。NTC 整机上限优先于端口父类，第三方 TC 管理器不自动迁移。
+51. Debian/Ubuntu 没有可用 systemd 或 `service` 入口时，刷新 cron 会尝试直接启动 `cron` 守护进程；生产环境仍优先使用系统服务管理器。容器/测试环境需要可写的私有 crontab spool。
+52. IP Guard 随单个脚本分发准入引擎，额外需要 `python3` 与 `libnetfilter_queue.so.1`；队列冲突时拒绝启动。消费者退出或队列满时采用故障放行，systemd 停止后清理本组件拥有的表，不接管其他程序。
 
 ## 下载方式说明
 
@@ -220,16 +223,47 @@ sudo dog --uninstall
 - 每分钟 cron 负责跨日检查；独立 `@reboot` 检查不等待网络或 TC。若规则被删除，下一次检查会按现有配置恢复。
 - 到期规则使用 `ptd_expiry_<端口>` 固定 comment。自检发现缺失、重复、附加了未知条件或存在孤儿规则时会报告异常，不会把外部规则当成自身规则。
 
-### 5.2 来源 IP 并发限制（测试中）
+### 5.2 在线 IP / 并发连接限制（测试中）
 
-主菜单 `10` 会按需安装并调用独立脚本 `/etc/port-traffic-dog/port-ip-guard.sh`。它限制的是进入本机 TCP 服务端口、当前 conntrack 中允许准入的来源 IP 数，不是账号数，也不支持 UDP。该实验组件只挂载 nftables `input` hook；内核转发或 DNAT 流量不受它限制。
+主菜单 `10` 按需安装并调用 `/etc/port-traffic-dog/port-ip-guard.sh`。借鉴分别限制在线 IP 与连接数的思路，统计单位为本机 TCP 服务端口，IPv4/IPv6 合计；同一 IP 的多条连接占一个 IP 名额、多个连接名额。它无法识别代理账号，不统计 UDP，也不保护内核 FORWARD（包括转发到容器的 DNAT 流量）。
 
-- NAT、CDN、反向代理或用户态四层代理后的多名用户可能共享同一个来源 IP。
-- 守护进程会读取本机 IPv4/IPv6 地址，并结合 conntrack 原始/回复两个方向确认本机服务端口；本机主动连接远端同号端口不会占用准入名额。接口地址读取失败时不会按不完整快照刷新名单。
-- 半开连接、conntrack 超时和地址伪造会影响统计；新来源的首个 SYN 会被丢弃，准入后依靠 TCP 重传建立连接。
-- 组件使用独立 nftables 表和 systemd 服务；进程停止时会尝试 fail-open 解封。无法确认同名表归属时会拒绝覆盖或删除。
-- 对当前 SSH 服务端口设置限制需要双重确认。建议先在有控制台或备用管理入口的机器测试。
-- Dog 卸载时会先调用独立组件的安全卸载；若无法确认能解除其规则，Dog 会中止卸载而不是遗留封锁。
+两项上限独立设置：`max_ips` 和 `max_connections`，范围 `0–65535`，`0` 为不限。两项同时为 `0` 时，该端口不创建限制。原来只有 `max_ips` 的配置继续可用，`max_connections` 默认 `0`。例如：
+
+```json
+{
+  "schema": "port-traffic-dog-ip-guard-v1",
+  "ports": {
+    "8443": {"max_ips": 2, "max_connections": 20, "idle_timeout": 300},
+    "9443": {"max_ips": 0, "max_connections": 10}
+  }
+}
+```
+
+- 需要 Bash 4+、nftables、jq、conntrack、iproute2、flock、Python 3 和系统 NFQUEUE 库；持久运行还需要 systemd。Debian/Ubuntu 可执行 `apt install nftables jq conntrack iproute2 python3 libnetfilter-queue1`。Python 无需 pip 包。
+- 首个 SYN 直接进入准入队列，不先丢包等待事件。一个消费者串行决定两种上限，重传使用同一连接名额；普通已建立连接的数据包不经过用户态。
+- 默认拒绝超限的新连接，保护已有连接；启动或调低上限时若已有连接超限，也不会主动断开它们，直到自然释放名额后才接纳新连接。
+- 每 2 秒读取 IPv4/IPv6 conntrack 和本机 `ss` socket 快照，导入在跟踪启用前已经存在的连接，关闭连接在下一轮校准释放。TIME_WAIT/CLOSE 不计活跃连接；未确认 SYN 暂留最多 30 秒，其重传不延长该预留。已确认半开连接仍受内核 conntrack 生命周期影响。
+- `idle_timeout` 保留已断开 IP 的空闲偏好，默认 300 秒，`0` 不保留。保留期不会被 TIME_WAIT 刷新；空闲 IP 可让位给新的活跃来源，不能挤掉现有活跃来源。
+- NAT、CDN 或反向代理后的多名用户可能共享一个来源 IP，连接数仍按不同 TCP 流计数。本机主动访问远端同号端口不占名额。
+- 队列默认 `47683`，可用 `PTD_IP_GUARD_QUEUE_NUMBER` 指定其他空闲队列；已有消费者时拒绝启动，不解绑其他程序。消费者不可用或队列满时放行；这保证可用性，也表示故障或过载期间限制会暂时失效。
+- 组件使用独立表和 systemd 服务；停止时仅删除自己拥有的表。自检核对规则语义、消费者、运行态时效和配置哈希。运行状态在 `ip-guard-state.json`，用于展示在线 IP 和连接数，不作为持久配额。
+- 当前 SSH 服务端口需要明确确认；Dog 卸载先调用组件的安全卸载，无法确认解封时中止。使用自定义运行参数时，应在 systemd 单元环境中配置同样的参数。
+
+验证入口：`bash tests/ip-guard-limits.sh`、`bash tests/ip-guard-regression.sh`。真实双栈 TCP/NFQUEUE 测试为 `tests/ip-guard-integration.sh`，只允许在已设置 `PI_NTC_DOG_ISOLATED=1` 的一次性 mount/net/pid 隔离环境运行。
+
+### 5.3 操作与连接日志
+
+主菜单 `11` 或 `dog --logs` 查看最近 50 条记录；Guard 子菜单 `5` 或 `bash /etc/port-traffic-dog/port-ip-guard.sh --logs` 查看准入日志。查看入口不会初始化配置、重建规则或写入“查看成功”记录。
+
+| 日志 | 内容 |
+| --- | --- |
+| `/etc/port-traffic-dog/logs/traffic.log` | 监控/配置变更、带宽限速、配额、到期封锁、流量重置、运行恢复、导入导出、更新及回滚结果 |
+| `/etc/port-traffic-dog/logs/ip-guard.log` | 启停、首次准入、超限拒绝原因、名额释放、退出和故障放行 |
+| `/etc/port-traffic-dog/logs/notification.log` | 现有 Telegram / 企业微信通知与维护异常记录 |
+
+新增操作日志使用中文说明并保留 `event`、`result` 和端口等安全字段，例如“应用端口带宽限制成功”；Guard 保存含中文 `message` 的 JSONL，查看时展示自然语言。日志不记录通知 token、完整配置或请求内容；Guard 来源使用每次运行重新生成的匿名标识，日志中不保存原始来源 IP。
+
+操作和 Guard 日志目录为 `0700`、文件为 `0600`，单份达到 1 MiB 时轮转，保留 3 份备份。Guard 相同端口/原因的重复事件在 10 秒内汇总计数；到期规则没有变化时不重复写成功记录。日志写入失败会单独提示，保留已经确定的业务结果。这里借鉴了 `personal-scripts` 中 IP allowlist 脚本的审计、限频、轮转和只读诊断思路。
 
 ## 6) 流量统计口径
 

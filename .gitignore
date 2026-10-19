@@ -1,0 +1,28 @@
+# 本地调试与临时产物（不入库）
+*.log
+*.tmp
+*.tgz
+*.tar.gz
+*.zip
+*.jsonl
+
+# 编辑器与系统杂项
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 临时脚本与备份（本地排查用，不随仓库分发）
+test-*.sh
+*.bak
+*.orig
+*.rej
+
+# 敏感信息兜底：这些一律不入库
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+*.credentials
+*credentials*

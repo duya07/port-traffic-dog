@@ -10,7 +10,7 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
-trap 'echo "regression failed at line $LINENO" >&2' ERR
+trap 'echo "regression failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 assert_fails() {
     if "$@"; then
@@ -50,6 +50,23 @@ ORIGINAL_GET_DEFAULT_INTERFACE_DEFINITION=$(declare -f get_default_interface)
 mkdir -p "$CONFIG_DIR/logs"
 flock() { :; }
 
+# 入向整形会调用真实的 ip 命令（ifb0 的查询/创建/删除）。这里必须一并桩掉：
+# 否则 apply_tc_limit 会在测试机上真的建出 ifb0，既污染宿主，又让断言结果取决于
+# 宿主机有没有 ifb 内核模块。指定设备时一律报告"存在且 UP"，无参时给一份接口列表。
+ip() {
+    if [ "$1" = "link" ] && [ "$2" = "show" ]; then
+        if [ -n "${3:-}" ]; then
+            printf '%s: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc htb state UNKNOWN mode DEFAULT group default qlen 32\n' "$3"
+            printf '    link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff\n'
+        else
+            printf '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default\n'
+            printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default\n'
+        fi
+        return 0
+    fi
+    return 0
+}
+
 write_base_config() {
     jq -n '{
         global: {
@@ -83,7 +100,7 @@ cmp -s "$PROJECT_DIR/port-ip-guard.sh" "$IP_GUARD_SCRIPT_PATH"
 
 jq -n '{schema:"port-traffic-dog-ip-guard-v1",ports:{"3265":{max_ips:2}}}' > "$TEST_DIR/ip-guard.valid.json"
 bash "$PROJECT_DIR/port-ip-guard.sh" --validate-config "$TEST_DIR/ip-guard.valid.json"
-jq -n '{schema:"port-traffic-dog-ip-guard-v1",ports:{"3265":{max_ips:0}}}' > "$TEST_DIR/ip-guard.invalid.json"
+jq -n '{schema:"port-traffic-dog-ip-guard-v1",ports:{"3265":{max_ips:-1}}}' > "$TEST_DIR/ip-guard.invalid.json"
 assert_fails bash "$PROJECT_DIR/port-ip-guard.sh" --validate-config "$TEST_DIR/ip-guard.invalid.json" >/dev/null 2>&1
 
 # 新安装必须默认走 Telegram 官方线路，且不预填自定义 API 地址。
@@ -1366,7 +1383,13 @@ update_config_file '
         "65535": {enabled: true, bandwidth_limit: {enabled: true, rate: "1Mbps"}}
     }
 '
-class_id=$(generate_tc_class_id 65535)
+# Class allocation needs a readable empty kernel class inventory, independent of
+# the real host's default interface (the suite runs in a private namespace too).
+class_id=$(
+    get_default_interface() { printf '%s\n' eth0; }
+    tc() { [ "${1:-} ${2:-}" = 'class show' ]; }
+    generate_tc_class_id 65535
+)
 class_minor=$(tc_class_id_minor "$class_id")
 [ "$class_minor" -ge 2 ]
 [ "$class_minor" -le 65535 ]
@@ -1407,6 +1430,8 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
     get_default_interface() { echo eth0; }
     tc_root_is_managed() { return 0; }
     tc_root_owner_marker_matches() { return 0; }
+    # 此用例只验证最高端口的物理 TC class；完整 IFB 由 compat/netns 套件实测。
+    ensure_ingress_redirect_locked() { return 0; }
     tc_class_added=false
     tc() {
         if [ "$1" = "qdisc" ] && [ "$2" = "show" ]; then
@@ -1416,7 +1441,7 @@ jq -e --arg class_id "$class_id" '.ports["65535"].bandwidth_limit.class_id == $c
             echo 'class htb 1:30 parent 1:1 rate 1Kbit ceil 100Gbit'
             [ "$tc_class_added" = "true" ] && echo "class htb $class_id parent 1:1 rate 1Kbit ceil 1Mbit"
         elif [ "$1" = "class" ] && [ "$2" = "replace" ] &&
-             [[ " $* " == *" classid $class_id "* ]]; then
+             [[ " $* " == *"classid ${class_id:-} "* ]]; then
             tc_class_added=true
         fi
         return 0
@@ -1955,7 +1980,20 @@ readonly AUTO_FOREIGN_TC_CAPTURE="$TEST_DIR/auto-foreign-tc.capture"
             echo 'qdisc tbf 8001: root refcnt 2 rate 100Mbit burst 32Kb lat 50ms'
             return 0
         fi
-        printf '%s\n' "$*" >> "$AUTO_FOREIGN_TC_CAPTURE"
+        # 只记录「修改性」调用。若把 class/filter show 这类只读查询也算作修改，
+        # recover_tc_runtime 光是读取当前 TC 状态就会被判成「动过外部 qdisc」而假失败。
+        case "${1:-}" in
+            qdisc|class|filter)
+                case "${2:-}" in
+                    add|del|delete|replace|change)
+                        printf '%s\n' "$*" >> "$AUTO_FOREIGN_TC_CAPTURE"
+                        ;;
+                esac
+                ;;
+            *)
+                printf '%s\n' "$*" >> "$AUTO_FOREIGN_TC_CAPTURE"
+                ;;
+        esac
     }
     if recover_tc_runtime --auto >/dev/null 2>&1; then
         exit 1

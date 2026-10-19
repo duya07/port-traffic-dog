@@ -468,14 +468,20 @@ if tc class show dev eth0 | grep -Eq '^class htb 1:1([[:space:]]|$)'; then
 fi
 tc qdisc del dev eth0 root handle 1:
 
+# Compare configuration, not asynchronously changing packet/ref counters.
+foreign_tc_configuration() {
+    tc qdisc show dev eth0 | sed -E 's/ refcnt [0-9]+//g; s/ direct_packets_stat [0-9]+//g'
+    tc class show dev eth0
+    tc filter show dev eth0 parent 1:0
+}
 # An unrelated HTB hierarchy must remain untouched.
 tc qdisc add dev eth0 root handle 1: htb default 30
 tc class add dev eth0 parent 1: classid 1:1 htb rate 1mbit
-foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+foreign_before="$(foreign_tc_configuration)"
 assert_fails apply_tc_limit 3265 10mbit
 write_ntc_unified_state 5000
 assert_fails apply_tc_limit 3265 10mbit
-[ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+[ "$foreign_before" = "$(foreign_tc_configuration)" ]
 rm -f "$TRAFFICCOP_TC_STATE_FILE"
 tc class show dev eth0 | grep -Eq '^class htb 1:1 .*rate 1Mbit([[:space:]]|$)'
 tc qdisc del dev eth0 root handle 1:
