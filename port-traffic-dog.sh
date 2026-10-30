@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.22"
+readonly SCRIPT_VERSION="1.5.23"
 readonly SCRIPT_NAME="端口流量狗"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
@@ -44,11 +44,12 @@ readonly LEGACY_LOCK_MAX_AGE=86400
 readonly TC_IFB_DEVICE="ifb0"
 readonly TC_IFB_INGRESS_HANDLE="ffff:"
 
-readonly RED='\033[0;31m'
-readonly YELLOW='\033[0;33m'
-readonly BLUE='\033[0;34m'
-readonly GREEN='\033[0;32m'
-readonly NC='\033[0m'
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
+    RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; GREEN='\033[0;32m'; NC='\033[0m'
+else
+    RED=''; YELLOW=''; BLUE=''; GREEN=''; NC=''
+fi
+readonly RED YELLOW BLUE GREEN NC
 # 网络超时设置
 readonly SHORT_CONNECT_TIMEOUT=5
 readonly SHORT_MAX_TIMEOUT=7
@@ -57,6 +58,408 @@ readonly IP_GUARD_SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traf
 readonly MODULES_ARCHIVE_URL="https://github.com/duya07/port-traffic-dog/archive/refs/heads/main.zip"
 readonly SHORTCUT_COMMAND="dog"
 readonly SHORTCUT_PATH="${PORT_TRAFFIC_DOG_SHORTCUT_PATH:-/usr/local/bin/$SHORTCUT_COMMAND}"
+readonly DEPENDENCY_STATE_DIR="${PORT_TRAFFIC_DOG_DEPENDENCY_STATE_DIR:-/var/lib/port-traffic-dog/dependencies}"
+
+# 依赖账本独立于配置；保留现有软件包的归属，不自动认领旧安装。
+dependency_manifest() {
+    cat <<'PACKAGES'
+nftables|nft|防火墙与流量统计
+iproute2|ip tc ss|连接、网卡与限速
+jq|jq|配置处理
+mawk|awk|文本处理（任意可用 awk 均可）
+bc|bc|流量换算
+unzip|unzip|更新包解压
+cron|cron crontab|定时任务
+curl|curl|下载与通知
+conntrack|conntrack|连接状态
+util-linux|flock|并发锁
+procps|pgrep|守护进程状态检测
+kmod|modprobe|IFB 内核模块加载
+ca-certificates|@ca-certificates|HTTPS 证书
+PACKAGES
+    if [ "${1:-all}" = all ]; then
+        printf '%s\n' 'python3|python3|IP Guard 准入引擎' 'libnetfilter-queue1|@nfqueue|IP Guard 首 SYN 准入运行库'
+    fi
+}
+
+dependency_peer_uses_package() {
+    [ -f /etc/trafficcop-lite/trafficcop-lite-monitor.sh ] ||
+        [ -f /etc/trafficcop-lite/trafficcop-lite.sh ] || [ -e /usr/local/bin/ntc ] || return 1
+    # 保守保留可能的传递依赖，只允许移除明确属于 Dog 的非共享项。
+    case "${1%%:*}" in nftables|conntrack|unzip|libnetfilter-queue1) return 1 ;; *) return 0 ;; esac
+}
+
+dependency_removal_is_safe() {
+    if [ -e "$INSTALLED_SCRIPT_PATH" ] || [ -e "$CONFIG_FILE" ] || [ -e "$IP_GUARD_SERVICE_FILE" ]; then
+        dependency_error 'Dog 或 IP Guard 仍已安装；请先卸载脚本，再用下载的脚本执行 --dependencies remove。'
+        return 1
+    fi
+}
+
+dependency_audit() {
+    [ ! -d "$CONFIG_DIR" ] || dog_log_event "$@"
+    return 0
+}
+
+# BEGIN MANAGED DEPENDENCIES
+# Adapted from easy_Caddy 843e7b4; embedded so standalone installs need no helper file.
+dependency_error() { printf '依赖管理：%s\n' "$*" >&2; }
+dependency_package_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?$ ]]; }
+
+dependency_installed() {
+    local state
+    state=$(dpkg-query -W -f='${db:Status-Status}\n' -- "$1" 2>/dev/null) || return 1
+    [ "$state" = installed ]
+}
+
+dependency_tools_available() {
+    local package="$1" tools="$2" tool
+    if [ -z "$tools" ]; then dependency_installed "$package"; return; fi
+    for tool in $tools; do
+        case "$tool" in
+            @ca-certificates)
+                [ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/ssl/cert.pem ] || return 1
+                ;;
+            @nfqueue)
+                command -v python3 >/dev/null 2>&1 || return 3
+                python3 -c 'import ctypes; ctypes.CDLL("libnetfilter_queue.so.1")' >/dev/null 2>&1 || return 1
+                ;;
+            *) command -v "$tool" >/dev/null 2>&1 || return 1 ;;
+        esac
+    done
+}
+
+dependency_portable_report() {
+    local package tools description status missing=0
+    printf '依赖检测（当前平台；包账本安装/卸载仅支持 Debian/Ubuntu）：\n'
+    while IFS='|' read -r package tools description; do
+        [ -n "$package" ] || continue
+        status=0
+        if [ -z "$tools" ]; then
+            [ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/ssl/cert.pem ] || status=1
+        else dependency_tools_available "$package" "$tools" || status=$?; fi
+        if [ "$status" -eq 0 ]; then printf '  [可用] %s\n' "$package"
+        else printf '  [缺失] %s：%s\n' "$package" "$description"; DEPENDENCY_MISSING_PACKAGES+=("$package"); missing=1; fi
+    done < <(dependency_manifest "${1:-all}")
+    return "$missing"
+}
+
+dependency_report() {
+    local profile="${1:-all}" package tools description status broken=0
+    DEPENDENCY_MISSING_PACKAGES=()
+    command -v dpkg-query >/dev/null 2>&1 || { dependency_portable_report "$profile"; return $?; }
+    printf '依赖检测（命令与运行库实际可用性）：\n'
+    dependency_no_pending || broken=1
+    while IFS='|' read -r package tools description; do
+        [ -n "$package" ] || continue
+        status=0
+        dependency_tools_available "$package" "$tools" || status=$?
+        if [ "$status" -eq 0 ]; then
+            printf '  [可用] %s%s\n' "$package" "${description:+：$description}"
+        elif [ "$status" -eq 3 ] && dependency_installed "$package"; then
+            printf '  [待复检] %s：先安装 Python 3，再验证运行库。\n' "$package"
+        elif dependency_installed "$package"; then
+            printf '  [异常] %s：包已安装，但命令或运行库不可用；请检查 PATH 或修复软件包。\n' "$package"
+            broken=1
+        else
+            printf '  [缺失] %s%s\n' "$package" "${description:+：$description}"
+            DEPENDENCY_MISSING_PACKAGES+=("$package")
+        fi
+    done < <(dependency_manifest "$profile")
+    [ "$broken" -eq 0 ] || return 2
+    [ "${#DEPENDENCY_MISSING_PACKAGES[@]}" -eq 0 ]
+}
+
+dependency_safe_record() {
+    local mode
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u -- "$1")" = 0 ] || return 1
+    mode=$(stat -c %a -- "$1") || return 1
+    (( (8#$mode & 0022) == 0 ))
+}
+
+dependency_prepare_state() {
+    local part current='' mode file
+    [ "$EUID" -eq 0 ] || { dependency_error '安装或卸载需要 root。'; return 1; }
+    command -v apt-get >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 || {
+        dependency_error '需要 apt-get 和 flock；请先确认系统包管理器及基础工具。'; return 1;
+    }
+    [[ "$DEPENDENCY_STATE_DIR" == /* && "$DEPENDENCY_STATE_DIR" != / ]] || return 1
+    local -a parts=()
+    IFS=/ read -r -a parts <<< "$DEPENDENCY_STATE_DIR"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        case "$part" in .|..) return 1 ;; esac
+        current+="/$part"
+        [ ! -L "$current" ] || { dependency_error '依赖状态路径包含符号链接，已拒绝。'; return 1; }
+    done
+    if [ -e "$DEPENDENCY_STATE_DIR" ]; then
+        [ -d "$DEPENDENCY_STATE_DIR" ] && [ "$(stat -c %u -- "$DEPENDENCY_STATE_DIR")" = 0 ] || return 1
+        mode=$(stat -c %a -- "$DEPENDENCY_STATE_DIR") || return 1
+        (( (8#$mode & 0022) == 0 )) || { dependency_error '依赖目录可被其他用户写入，已拒绝。'; return 1; }
+    else
+        mkdir -p -- "$DEPENDENCY_STATE_DIR" || return 1
+    fi
+    chmod 700 -- "$DEPENDENCY_STATE_DIR" || return 1
+    for file in installed-packages pending-before pending-plan lock; do
+        if [ -e "$DEPENDENCY_STATE_DIR/$file" ] || [ -L "$DEPENDENCY_STATE_DIR/$file" ]; then
+            dependency_safe_record "$DEPENDENCY_STATE_DIR/$file" || { dependency_error "不安全的依赖记录：$file"; return 1; }
+        fi
+    done
+}
+
+dependency_read_owned() {
+    local package path="$DEPENDENCY_STATE_DIR/installed-packages"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then return 0; fi
+    dependency_safe_record "$path" || { dependency_error '新增包账本不是安全的普通文件。'; return 1; }
+    while IFS= read -r package || [ -n "$package" ]; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || { dependency_error '新增包账本含无效包名。'; return 1; }
+        printf '%s\n' "$package"
+    done < "$path"
+}
+
+dependency_snapshot() {
+    local rows
+    rows=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Essential}\t${Protected}\n') || return 1
+    printf '%s\n' "$rows" | awk -F '\t' -v phase="${2:-after}" '
+        (phase == "before" && $2 != "not-installed") || (phase == "after" && $2 == "installed") ||
+        (phase == "incomplete" && $2 ~ /^(unpacked|half-installed|half-configured|triggers-awaited|triggers-pending)$/) {print $1}
+    ' | LC_ALL=C sort -u > "$1" || return 1
+    chmod 600 -- "$1"
+}
+
+dependency_save_owned() {
+    local stage
+    stage=$(mktemp "$DEPENDENCY_STATE_DIR/.owned.XXXXXX") || return 1
+    if ! LC_ALL=C sort -u -- "$1" > "$stage" || ! chmod 600 -- "$stage" ||
+       ! mv -f -- "$stage" "$DEPENDENCY_STATE_DIR/installed-packages"; then
+        rm -f -- "$stage"
+        dependency_error '新增包账本保存失败，事务快照已保留。'
+        return 1
+    fi
+}
+
+dependency_no_pending() {
+    if [ -e "$DEPENDENCY_STATE_DIR/pending-before" ] || [ -L "$DEPENDENCY_STATE_DIR/pending-before" ] ||
+       [ -e "$DEPENDENCY_STATE_DIR/pending-plan" ] || [ -L "$DEPENDENCY_STATE_DIR/pending-plan" ]; then
+        dependency_error "发现未完成安装事务；请核对 $DEPENDENCY_STATE_DIR 的 pending-before/pending-plan，本次不自动认领或卸载。"
+        return 1
+    fi
+}
+
+dependency_install_missing() (
+    umask 077
+    local assume_yes="${1:-false}" profile="${2:-all}" status=0 answer stage plan owned package rc=0 lock_fd incomplete=false
+    dependency_report "$profile" || status=$?
+    [ "$status" -ne 2 ] || return 1
+    [ "${#DEPENDENCY_MISSING_PACKAGES[@]}" -gt 0 ] || { printf '依赖全部可用，无需安装；原有包不会记为新增。\n'; return 0; }
+    printf '仅安装缺失项：\n'; printf '  %s\n' "${DEPENDENCY_MISSING_PACKAGES[@]}"
+    if [ "$assume_yes" != true ]; then
+        read -r -p '确认安装？[y/yes，默认 n]：' answer || return 1
+        case "${answer,,}" in y|yes) ;; *) printf '安装已取消。\n'; return 1 ;; esac
+    fi
+    dependency_prepare_state || return 1
+    exec {lock_fd}> "$DEPENDENCY_STATE_DIR/lock" || return 1
+    chmod 600 -- "$DEPENDENCY_STATE_DIR/lock" || return 1
+    flock -x -w 30 "$lock_fd" || { dependency_error '依赖管理锁暂忙。'; return 1; }
+    dependency_no_pending || return 1
+    owned=$(dependency_read_owned) || return 1
+    status=0; dependency_report "$profile" || status=$?
+    [ "$status" -ne 2 ] || return 1
+    [ "${#DEPENDENCY_MISSING_PACKAGES[@]}" -gt 0 ] || return 0
+    stage=$(mktemp -d "$DEPENDENCY_STATE_DIR/.transaction.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    apt-get update || { dependency_error '软件包索引更新失败，未安装。'; return 1; }
+    dependency_snapshot "$stage/before" before || return 1
+    plan=$(LC_ALL=C apt-get --simulate --no-remove --no-install-recommends install -- "${DEPENDENCY_MISSING_PACKAGES[@]}") || return 1
+    if printf '%s\n' "$plan" | grep -q '^Remv '; then dependency_error '安装计划包含删除，已停止。'; return 1; fi
+    printf '%s\n' "$plan" | awk '$1 == "Inst" {print $2}' | LC_ALL=C sort -u > "$stage/plan"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || return 1
+    done < "$stage/plan"
+    printf '安装计划（含传递依赖）：\n'; cat -- "$stage/plan"
+    install -m 600 -- "$stage/before" "$DEPENDENCY_STATE_DIR/pending-before" &&
+        install -m 600 -- "$stage/plan" "$DEPENDENCY_STATE_DIR/pending-plan" || return 1
+    apt-get --no-remove --no-install-recommends install -y -- "${DEPENDENCY_MISSING_PACKAGES[@]}" || rc=$?
+    dependency_snapshot "$stage/after" || { dependency_error '无法读取安装后状态，保留事务快照。'; return 1; }
+    dependency_snapshot "$stage/incomplete" incomplete || { dependency_error '无法读取未完成包状态，保留事务快照。'; return 1; }
+    printf '%s\n' "$owned" | sed '/^$/d' > "$stage/owned"
+    LC_ALL=C comm -13 "$stage/before" "$stage/after" > "$stage/new" || return 1
+    local -A planned=()
+    while IFS= read -r package; do
+        [ -n "$package" ] && planned["${package%%:*}"]=1
+    done < "$stage/plan"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if [ "${planned[${package%%:*}]:-0}" = 1 ]; then incomplete=true; fi
+    done < "$stage/incomplete"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if [ "${planned[${package%%:*}]:-0}" = 1 ]; then
+            printf '%s\n' "$package" >> "$stage/owned"
+            printf '已记录本脚本新增依赖：%s\n' "$package"
+        fi
+    done < "$stage/new"
+    dependency_save_owned "$stage/owned" || return 1
+    if [ "$incomplete" = true ]; then
+        dependency_error '安装后仍有未配置完成的计划包；已记录成功新增项并保留事务快照，请人工核对。'
+        dependency_audit dependency_install 1
+        return 1
+    fi
+    rm -f -- "$DEPENDENCY_STATE_DIR/pending-before" "$DEPENDENCY_STATE_DIR/pending-plan" || return 1
+    if [ "$rc" -ne 0 ]; then
+        dependency_error '安装未全部成功；实际已装的新包已记录，可重试或按账本卸载。'
+        dependency_audit dependency_install "$rc"
+        return "$rc"
+    fi
+    if ! dependency_report "$profile"; then
+        dependency_error '安装命令已完成，但命令/运行库复检失败，未报告成功。'
+        dependency_audit dependency_install 1
+        return 1
+    fi
+    dependency_audit dependency_install 0
+    printf '依赖安装并复检完成；已有依赖的归属保持不变。\n'
+)
+
+dependency_protected() {
+    local flags base="${1%%:*}"
+    case "$base" in bash|apt|dpkg|systemd*|libsystemd*|libpam*|libudev*|coreutils|findutils|grep|sed|mawk|gawk|util-linux|libc6|libc-bin|libgcc-s1|libstdc++6) return 0 ;; esac
+    flags=$(dpkg-query -W -f='${Essential}\t${Protected}\n' -- "$1" 2>/dev/null) || return 0
+    [[ "$flags" == *yes* ]]
+}
+
+dependency_retained_dependencies() {
+    [ "$#" -gt 0 ] || return 0
+    local records
+    records=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Pre-Depends}, ${Depends}\n') || return 1
+    # 保留受保护包及其已安装的直接/间接依赖；替代依赖保守保留已安装项。
+    printf '%s\n' "$records" | awk -F '\t' -v roots="$*" '
+        function base(name) { sub(/:[A-Za-z0-9-]+$/, "", name); return name }
+        $2 == "installed" { name=base($1); present[name]=1; deps[name]=$3 }
+        END {
+            count=split(roots, initial, " "); last=0
+            for (i=1; i<=count; i++) { name=base(initial[i]); if (!seen[name]++) queue[++last]=name }
+            for (first=1; first<=last; first++) {
+                name=queue[first]; print name
+                count=split(deps[name], edges, /[,|]/)
+                for (i=1; i<=count; i++) {
+                    gsub(/^[ \t]+|[ \t]+$/, "", edges[i]); split(edges[i], words, /[ \t]+/)
+                    child=base(words[1]); if (present[child] && !seen[child]++) queue[++last]=child
+                }
+            }
+        }'
+}
+
+dependency_remove() (
+    umask 077
+    local scope="${1:-owned}" assume_yes="${2:-false}" owned candidates package plan answer stage rc=0 lock_fd
+    dependency_removal_is_safe || return 1
+    dependency_prepare_state || return 1
+    exec {lock_fd}> "$DEPENDENCY_STATE_DIR/lock" || return 1
+    chmod 600 -- "$DEPENDENCY_STATE_DIR/lock" || return 1
+    flock -x -w 30 "$lock_fd" || return 1
+    dependency_no_pending || return 1
+    owned=$(dependency_read_owned) || return 1
+    if [ "$scope" = all ]; then
+        candidates=$(printf '%s\n%s\n' "$(dependency_manifest all | cut -d '|' -f1)" "$owned" | sed '/^$/d' | LC_ALL=C sort -u)
+        printf '已选择全部相关依赖，包括安装前已有的包；系统基础包和另一脚本仍使用的包仍会保留。\n'
+    else
+        candidates="$owned"
+        printf '卸载范围：仅本脚本新增并记录的依赖。\n'
+    fi
+    local -a selected=() removals=() protected_roots=() filtered=()
+    local -A allowed=()
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || return 1
+        dependency_installed "$package" || continue
+        if dependency_protected "$package"; then printf '保留系统基础/受保护包：%s\n' "$package"; protected_roots+=("$package"); continue; fi
+        if dependency_peer_uses_package "$package"; then printf '保留另一脚本仍需使用的包：%s\n' "$package"; protected_roots+=("$package"); continue; fi
+        selected+=("$package"); allowed["${package%%:*}"]=1
+    done <<< "$candidates"
+    local retained
+    retained=$(dependency_retained_dependencies "${protected_roots[@]}") || return 1
+    local -A required=()
+    while IFS= read -r package; do [ -z "$package" ] || required["${package%%:*}"]=1; done <<< "$retained"
+    allowed=()
+    for package in "${selected[@]}"; do
+        if [ "${required[${package%%:*}]:-0}" = 1 ]; then
+            printf '保留受保护/共享组件所需的依赖：%s\n' "$package"
+        else filtered+=("$package"); allowed["${package%%:*}"]=1; fi
+    done
+    selected=("${filtered[@]}")
+    [ "${#selected[@]}" -gt 0 ] || { printf '没有可卸载的新依赖；未改动系统软件包。\n'; return 0; }
+    plan=$(LC_ALL=C apt-get --simulate -o APT::Get::AutomaticRemove=false remove -- "${selected[@]}") || return 1
+    if printf '%s\n' "$plan" | grep -q '^Inst '; then dependency_error '卸载计划会安装其他包，已停止。'; return 1; fi
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || return 1
+        if [ "${allowed[${package%%:*}]:-0}" != 1 ] || dependency_protected "$package" || dependency_peer_uses_package "$package"; then
+            dependency_error "计划会额外删除范围外/受保护包 $package，已停止。"
+            return 1
+        fi
+        removals+=("$package")
+    done < <(printf '%s\n' "$plan" | awk '$1 == "Remv" {print $2}')
+    [ "${#removals[@]}" -gt 0 ] || { printf '卸载计划为空，未改动软件包。\n'; return 0; }
+    printf '本次将删除以下依赖，不执行 autoremove/purge：\n'; printf '  %s\n' "${removals[@]}"
+    if [ "$assume_yes" != true ]; then
+        read -r -p '确认卸载上述依赖？[y/yes，默认 n]：' answer || return 0
+        case "${answer,,}" in y|yes) ;; *) printf '卸载已取消。\n'; return 0 ;; esac
+    fi
+    stage=$(mktemp -d "$DEPENDENCY_STATE_DIR/.uninstall.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    apt-get -o APT::Get::AutomaticRemove=false remove -y -- "${removals[@]}" || rc=$?
+    : > "$stage/owned"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if dependency_installed "$package"; then printf '%s\n' "$package" >> "$stage/owned"; fi
+    done <<< "$owned"
+    dependency_save_owned "$stage/owned" || return 1
+    for package in "${removals[@]}"; do
+        if dependency_installed "$package"; then rc=1; fi
+    done
+    dependency_audit dependency_remove "$rc"
+    [ "$rc" -eq 0 ] || { dependency_error '卸载未全部完成；剩余新增依赖已保留在账本中。'; return "$rc"; }
+    printf '依赖卸载完成；范围外和原有依赖保持不变。\n'
+)
+
+dependency_cli() {
+    local action="${1:-check}" scope=owned yes=false option
+    [ "$#" -eq 0 ] || shift
+    for option in "$@"; do
+        case "$option" in --yes) yes=true ;; --all) scope=all ;; *) dependency_error "未知参数：$option"; return 2 ;; esac
+    done
+    case "$action" in
+        check) [ "$scope" = owned ] && [ "$yes" = false ] || return 2; dependency_report all ;;
+        install) [ "$scope" = owned ] || return 2; dependency_install_missing "$yes" all ;;
+        remove) dependency_remove "$scope" "$yes" ;;
+        owned) [ "$scope" = owned ] && [ "$yes" = false ] || return 2; dependency_read_owned ;;
+        *) dependency_error '用法：--dependencies check|install [--yes]|remove [--all] [--yes]|owned'; return 2 ;;
+    esac
+}
+
+dependency_menu() {
+    local choice scope
+    while true; do
+        printf '\n=== 依赖检测、安装与卸载 ===\n'
+        printf ' 1. 检测全部依赖（只读）\n 2. 仅安装缺失依赖\n 3. 查看本脚本新增包账本\n 4. 卸载依赖\n 0. 返回\n'
+        read -r -p '请选择 [0-4]：' choice || return 0
+        case "$choice" in
+            1) dependency_report all || true ;;
+            2) dependency_install_missing false all || true ;;
+            3) dependency_read_owned || true; printf '账本位置：%s/installed-packages\n' "$DEPENDENCY_STATE_DIR" ;;
+            4)
+                read -r -p '范围：1 仅本脚本新增（默认），2 全部相关，0 取消：' scope || return 0
+                case "$scope" in ''|1) dependency_remove owned false || true ;; 2) dependency_remove all false || true ;; 0) ;; *) printf '无效范围。\n' ;; esac
+                ;;
+            0) return 0 ;;
+            *) printf '无效选择。\n' ;;
+        esac
+        read -r -p '按回车返回依赖管理...' choice || return 0
+    done
+}
+# END MANAGED DEPENDENCIES
 
 # 业务日志仅接收固定事件、结果码及安全标量，不接收配置/通知文本。
 dog_write_event() (
@@ -104,6 +507,8 @@ dog_write_event() (
         runtime_restore) description="恢复监控规则和限速" ;;
         import_config) description="导入配置并恢复运行状态" ;;
         export_config) description="导出配置备份" ;;
+        dependency_install) description="安装并复检缺失依赖" ;;
+        dependency_remove) description="按确认计划卸载依赖" ;;
         *) description="记录操作" ;;
     esac
     if [ "$result" -eq 0 ]; then description+="：成功"; else description+="：失败（返回码 $result）"; fi
@@ -154,80 +559,22 @@ detect_system() {
     echo "unknown"
 }
 
-install_missing_tools() {
-    local missing_tools=("$@")
-    local system_type=$(detect_system)
-    local pkg_cmd
-    case $system_type in
-        "ubuntu") pkg_cmd="apt" ;;
-        "debian") pkg_cmd="apt-get" ;;
-        *)
-            echo -e "${RED}不支持的系统类型: $system_type${NC}"
-            echo "支持的系统: Ubuntu, Debian"
-            echo "请手动安装: ${missing_tools[*]}"
-            exit 1
-            ;;
-    esac
-
-    echo -e "${YELLOW}检测到缺少工具: ${missing_tools[*]}${NC}"
-    echo "正在自动安装..."
-
-    $pkg_cmd update -qq
-    for tool in "${missing_tools[@]}"; do
-        case $tool in
-            "nft") $pkg_cmd install -y nftables ;;
-            "tc") $pkg_cmd install -y iproute2 ;;
-            "ss") $pkg_cmd install -y iproute2 ;;
-            "jq") $pkg_cmd install -y jq ;;
-            "awk") $pkg_cmd install -y gawk ;;
-            "bc") $pkg_cmd install -y bc ;;
-            "curl") $pkg_cmd install -y curl ;;
-            "conntrack") $pkg_cmd install -y conntrack ;;
-            "flock") $pkg_cmd install -y util-linux ;;
-            "cron")
-                $pkg_cmd install -y cron
-                systemctl enable cron 2>/dev/null || true
-                systemctl start cron 2>/dev/null || true
-                ;;
-            *) $pkg_cmd install -y "$tool" ;;
-        esac
-    done
-
-    echo -e "${GREEN}依赖工具安装完成${NC}"
-}
+# 保持原自动检查调用约定；显式更新和 Guard 使用 all，普通监控仅 core。
+install_missing_tools() { dependency_install_missing true core; }
 
 check_dependencies() {
-    local silent_mode=${1:-false}
-    local missing_tools=()
-    local required_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack" "flock")
-
-    for tool in "${required_tools[@]}"; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            missing_tools+=("$tool")
-        fi
-    done
-
-    if [ ${#missing_tools[@]} -gt 0 ]; then
-        install_missing_tools "${missing_tools[@]}"
-
-        local still_missing=()
-        for tool in "${missing_tools[@]}"; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-                still_missing+=("$tool")
-            fi
-        done
-
-        if [ ${#still_missing[@]} -gt 0 ]; then
-            echo -e "${RED}安装失败，仍缺少工具: ${still_missing[*]}${NC}"
-            echo "请手动安装后重试"
-            exit 1
-        fi
+    local silent_mode="${1:-false}" profile="${2:-core}" report status=0
+    report=$(dependency_report "$profile") || status=$?
+    if [ "$status" -eq 2 ]; then
+        printf '%s\n' "$report" >&2
+        return 1
     fi
-
-    if [ "$silent_mode" != "true" ]; then
-        echo -e "${GREEN}依赖检查通过${NC}"
+    if [ "$status" -ne 0 ]; then
+        printf '%s\n' "$report"
+        dependency_install_missing true "$profile" || return 1
+    elif [ "$silent_mode" != true ]; then
+        printf '%s\n依赖检查通过。\n' "$report"
     fi
-
 }
 
 setup_script_permissions() {
@@ -5707,13 +6054,18 @@ ensure_ip_guard_script() {
 }
 
 manage_ip_guard() {
-    clear 2>/dev/null || true
+    if [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
     echo -e "${BLUE}=== 在线 IP / 并发连接限制（测试中） ===${NC}"
     echo -e "${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
     echo "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
     echo "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
     echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
     echo
+    if ! dependency_install_missing false all; then
+        echo '依赖未就绪；可在主菜单 12 管理依赖。未启用新的防火墙限制。' >&2
+        read -r -p '按回车返回主菜单...' || return 0
+        return 0
+    fi
     if ! ensure_ip_guard_script; then
         echo -e "${RED}独立组件下载或校验失败，未修改防火墙。${NC}"
     elif ! bash "$IP_GUARD_SCRIPT_PATH"; then
@@ -5725,9 +6077,69 @@ manage_ip_guard() {
 }
 
 # 显示主界面
+# 中文按终端显示列宽布局，避免用固定空格拼接菜单列。
+menu_text_width() {
+    local text="$1" index character code width=0 LC_CTYPE=C.UTF-8
+    for ((index=0; index<${#text}; index++)); do
+        character="${text:index:1}"
+        printf -v code '%d' "'$character"
+        if (( code >= 0x300 && code <= 0x36f )); then continue; fi
+        if (( code >= 0x1100 && (code <= 0x115f || code >= 0x2e80) )); then
+            width=$((width+2))
+        else width=$((width+1)); fi
+    done
+    printf '%s' "$width"
+}
+
+menu_columns() {
+    local columns="${COLUMNS:-80}" size
+    if [ -t 1 ]; then
+        size=$(stty size 2>/dev/null) || size=''
+        [ -z "$size" ] || columns="${size##* }"
+    fi
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
+    printf '%s' "$columns"
+}
+
+menu_item() {
+    local number="$1" text="$2" columns="${3:-80}" index character width=4 amount
+    local LC_CTYPE=C.UTF-8
+    printf '%b%2s.%b ' "$BLUE" "$number" "$NC"
+    for ((index=0; index<${#text}; index++)); do
+        character="${text:index:1}"
+        amount=$(menu_text_width "$character")
+        if [ "$((width+amount))" -gt "$columns" ]; then printf '\n    '; width=4; fi
+        printf '%s' "$character"
+        width=$((width+amount))
+    done
+    printf '\n'
+}
+
+show_main_menu_options() {
+    local columns left right index width gap
+    columns=$(menu_columns)
+    local -a labels=('添加/删除端口监控' '端口限制设置管理' '流量重置管理' '一键导出/导入配置'
+        '安装依赖（更新）脚本' '卸载脚本' '通知管理' '系统自检/修复'
+        'TC 冲突处理/自动恢复' '在线 IP / 并发连接限制（测试中）'
+        '查看操作 / IP Guard 日志' '依赖检测 / 安装 / 卸载')
+    for index in 0 2 4 6; do
+        if [ "$columns" -ge 60 ]; then
+            left="${labels[index]}"; right="${labels[index+1]}"
+            width=$(menu_text_width "$left"); gap=$((32-4-width))
+            printf '%b%2d.%b %s%*s%b%2d.%b %s\n' "$BLUE" "$((index+1))" "$NC" "$left" "$gap" '' \
+                "$BLUE" "$((index+2))" "$NC" "$right"
+        else
+            menu_item "$((index+1))" "${labels[index]}" "$columns"
+            menu_item "$((index+2))" "${labels[index+1]}" "$columns"
+        fi
+    done
+    for index in 8 9 10 11; do menu_item "$((index+1))" "${labels[index]}" "$columns"; done
+    menu_item 0 退出 "$columns"
+}
+
 show_main_menu() {
     while true; do
-        clear 2>/dev/null || true
+        if [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
 
     local active_ports=($(get_active_ports))
     local port_count=${#active_ports[@]}
@@ -5753,16 +6165,9 @@ show_main_menu() {
 
     echo "────────────────────────────────────────────────────────"
 
-    echo -e "${BLUE}1.${NC} 添加/删除端口监控     ${BLUE}2.${NC} 端口限制设置管理"
-    echo -e "${BLUE}3.${NC} 流量重置管理          ${BLUE}4.${NC} 一键导出/导入配置"
-    echo -e "${BLUE}5.${NC} 安装依赖(更新)脚本    ${BLUE}6.${NC} 卸载脚本"
-    echo -e "${BLUE}7.${NC} 通知管理              ${BLUE}8.${NC} 系统自检/修复"
-    echo -e "${BLUE}9.${NC} TC 冲突处理/自动恢复"
-    echo -e "${BLUE}10.${NC} 在线 IP / 并发连接限制（测试中）"
-    echo -e "${BLUE}11.${NC} 查看操作 / IP Guard 日志"
-    echo -e "${BLUE}0.${NC} 退出"
+    show_main_menu_options
     echo
-    read -p "请选择操作 [0-11]: " choice
+    read -r -p "请选择操作 [0-12]: " choice || return 0
 
         case $choice in
             1) manage_port_monitoring; return ;;
@@ -5776,8 +6181,9 @@ show_main_menu() {
             9) manage_tc_recovery; return ;;
             10) manage_ip_guard; return ;;
             11) show_operation_logs; read -r -p "按回车返回..."; ;;
+            12) dependency_menu ;;
             0) exit 0 ;;
-            *) echo -e "${RED}无效选择，请输入0-10${NC}"; sleep 1 ;;
+            *) echo -e "${RED}无效选择，请输入0-12${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -10127,7 +10533,7 @@ download_notification_modules() {
 
 finalize_script_update() {
     echo -e "${YELLOW}[1/3] 初始化并迁移现有配置...${NC}"
-    check_dependencies true
+    check_dependencies true all || return 1
     if ! init_config; then
         echo -e "${RED}新版本配置初始化失败${NC}"
         return 1
@@ -10168,7 +10574,7 @@ install_update_script() {
     echo "────────────────────────────────────────────────────────"
 
     echo -e "${YELLOW}正在检查系统依赖...${NC}"
-    check_dependencies true
+    check_dependencies true all || return 1
     init_config || return 1
     record_traffic_snapshot >/dev/null 2>&1 || true
     if has_active_ports && ! save_traffic_data; then
@@ -10757,6 +11163,8 @@ uninstall_script() {
 
         echo -e "${GREEN}卸载完成！${NC}"
         echo -e "${YELLOW}感谢使用端口流量狗！${NC}"
+        echo "系统依赖默认保留；新增包账本仍位于 $DEPENDENCY_STATE_DIR。"
+        echo '如需清理，使用下载的本脚本执行：bash port-traffic-dog.sh --dependencies remove'
         exit 0
     else
         echo "取消卸载"
@@ -12307,6 +12715,12 @@ main() {
     # cron 快速路径：跳过重型初始化（依赖检查、通知模块下载、规则恢复等）
     if [ $# -gt 0 ]; then
         case $1 in
+            --dependencies)
+                shift
+                local dependency_status=0
+                dependency_cli "$@" || dependency_status=$?
+                exit "$dependency_status"
+                ;;
             --logs)
                 [ $# -eq 1 ] || exit 2
                 show_operation_logs
@@ -12461,8 +12875,8 @@ main() {
                 exit $?
                 ;;
             --check-deps)
-                check_dependencies
-                exit 0
+                check_dependencies false all
+                exit $?
                 ;;
             --finalize-update)
                 local finalize_status=0
@@ -12552,6 +12966,10 @@ main() {
                 echo -e "${YELLOW}用法: $0 [选项]${NC}"
                 echo "选项:"
                 echo "  --check-deps              检查依赖工具"
+                echo '  --dependencies check      只读检测全部命令和 IP Guard 运行库'
+                echo '  --dependencies install [--yes]  仅补装缺失项并记录新增包'
+                echo '  --dependencies remove [--all] [--yes]  预览并卸载依赖（先卸载脚本）'
+                echo '  --dependencies owned      查看本脚本实际新增的软件包'
                 echo "  --version                 显示版本信息"
                 echo "  --logs                    查看主要操作 / IP Guard / 通知日志（不初始化配置）"
                 echo "  --install                 安装/更新脚本"

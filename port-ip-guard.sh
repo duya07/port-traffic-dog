@@ -1156,6 +1156,18 @@ EOF
     return 1
 }
 
+systemd_runtime_available() { [ -d /run/systemd/system ]; }
+
+guard_absent_without_manager() {
+    # systemctl 可随依赖被装入容器；命令存在不表示 systemd 正在运行。
+    systemd_runtime_available && return 1
+    [ ! -e "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] || return 1
+    [ ! -e "$DAEMON_STATE_FILE" ] && [ ! -L "$DAEMON_STATE_FILE" ] || return 1
+    [ ! -L "$LOCK_FILE" ] || return 1
+    if [ -e "$LOCK_FILE" ]; then flock -n "$LOCK_FILE" true || return 1; fi
+    return 0
+}
+
 stop_service_strict() {
     local load_state active_state enabled_state
     if [ -e "$SERVICE_FILE" ] && ! service_file_is_owned; then
@@ -1163,11 +1175,12 @@ stop_service_strict() {
         return 1
     fi
     command_exists "$SYSTEMCTL" || {
-        [ ! -e "$SERVICE_FILE" ] && return 0
+        guard_absent_without_manager && return 0
         echo "缺少 systemctl，无法确认守护服务已停止。" >&2
         return 1
     }
     load_state=$("$SYSTEMCTL" show "$SERVICE_NAME" --property=LoadState --value 2>/dev/null) || {
+        guard_absent_without_manager && return 0
         echo "无法查询 $SERVICE_NAME 的加载状态。" >&2
         return 1
     }
@@ -1369,7 +1382,7 @@ uninstall_feature() {
     stop_service_strict || return 1
     remove_owned_table || return 1
     rm -f "$SERVICE_FILE" "$CONFIG_FILE"
-    if ! "$SYSTEMCTL" daemon-reload >/dev/null 2>&1; then
+    if systemd_runtime_available && ! "$SYSTEMCTL" daemon-reload >/dev/null 2>&1; then
         echo "警告：组件已停止、解封并删除，但 systemd daemon-reload 失败；请稍后手动执行 systemctl daemon-reload。" >&2
     fi
     echo "IP 上限测试功能已卸载。"

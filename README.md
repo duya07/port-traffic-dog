@@ -174,6 +174,16 @@ sudo dog --uninstall
 - `--tc-status`: 只读检查当前 Dog/NTC 统一 HTB 是否完整。
 - `--recover-tc --manual`: 显式重建入口。它可能删除当前 root qdisc，通常应优先通过主菜单 `9` 阅读提示并确认后执行。
 - `--validate-config FILE`: 只校验指定 JSON 配置，不安装依赖或修改运行状态，供升级和迁移预检使用。
+- `--dependencies check`: 只读检测全部命令和 Guard 运行库，缺失返回非零，不创建配置或修改包。
+- `--dependencies install [--yes]`: 展示缺失项与安装计划，仅安装缺失项，完成后实际加载 `libnetfilter_queue.so.1` 复检。
+- `--dependencies owned`: 查看本脚本实际新增的包账本。
+- `--dependencies remove [--all] [--yes]`: 先卸载 Dog / Guard 后，使用下载的主脚本执行；默认仅处理账本新增包，`--all` 才包括原有相关包，仍保留系统基础包与 NTC 需要的依赖。
+
+菜单 `5` 安装／更新会检查完整依赖，包括 Python 3、`libnetfilter-queue1`、用于 cron 状态检测的 `procps` 及 IFB 模块加载的 `kmod`。从旧版本更新后，新版本维护阶段也会补检。菜单 `10` 缺依赖时可确认补装；菜单 `12` 是独立依赖检测／安装／卸载页。
+
+Debian/Ubuntu 依赖管理借鉴 `duya07/easy_Caddy` 的前快照、安装计划和后快照：只登记计划内实际新增的包及传递依赖，已有软件包不会被认领；部分失败保留成功部分，未完成事务保留证据并阻止误卸载。账本位于 `/var/lib/port-traffic-dog/dependencies/installed-packages`，独立于配置目录。卸载脚本默认保留依赖，之后可预览并确认依赖移除计划；拒绝范围外级联，不运行 `autoremove` 或 `purge`。其他发行版仍可检测已具备的运行环境，自动包账本／卸载仅支持 Debian/Ubuntu。
+
+主菜单使用显示列宽对齐中文和编号；窄于 60 列时改为单列，支持 `NO_COLOR`、`TERM=dumb` 和输入结束退出。
 - `--sync-notification-modules`: 从仓库强制覆盖同步 `telegram.sh` / `wecom.sh`。
 - `--refresh-notification-cron`: 根据当前配置和监控端口重建通知定时任务，并尝试启动 `cron` / `crond`；没有监控端口时不会保留状态报告任务。
 - `--refresh-port-reset-cron`: 根据当前端口重置策略重建自动重置任务，并清理旧版 `--reset-port` 和失效端口残留任务。
@@ -250,6 +260,7 @@ sudo dog --uninstall
 - 当前 SSH 服务端口需要明确确认；Dog 卸载先调用组件的安全卸载，无法确认解封时中止。使用自定义运行参数时，应在 systemd 单元环境中配置同样的参数。
 
 验证入口：`bash tests/ip-guard-limits.sh`、`bash tests/ip-guard-regression.sh`。真实双栈 TCP/NFQUEUE 测试为 `tests/ip-guard-integration.sh`，只允许在已设置 `PI_NTC_DOG_ISOLATED=1` 的一次性 mount/net/pid 隔离环境运行。
+依赖与终端回归：`python3 tests/dependencies.py`、`python3 tests/menu-layout.py`。包管理回归使用隔离夹具，真实 APT 安装／卸载须在一次性系统或容器中验收，不应在生产主机直接运行测试安装入口。
 
 ### 5.3 操作与连接日志
 

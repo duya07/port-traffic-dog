@@ -91,6 +91,8 @@ MOCK_STOP_RC=0
 MOCK_DAEMON_RELOAD_RC=0
 MOCK_RESTART_RC=0
 
+# 下列 systemctl 状态模拟默认代表运行中的管理器；无管理器用例在子 shell 覆盖。
+systemd_runtime_available() { return 0; }
 mock_systemctl() {
     printf '%s\n' "$*" >> "$SYSTEMCTL_TRACE"
     local action="${1:-}"
@@ -176,6 +178,21 @@ MOCK_LOAD_STATE="not-found"
 assert_fails stop_service_strict >/dev/null 2>&1
 rm -f "$SERVICE_FILE"
 stop_service_strict
+
+# 安装了 systemctl 命令但没有 systemd 管理器的容器：未安装服务可清理。
+(
+    mock_systemctl() { return 1; }
+    systemd_runtime_available() { return 1; }
+    stop_service_strict
+    mkdir -p "$(dirname "$DAEMON_STATE_FILE")"
+    printf '{}\n' > "$DAEMON_STATE_FILE"
+    assert_fails stop_service_strict >/dev/null 2>&1
+    rm -f "$DAEMON_STATE_FILE"
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 8>"$LOCK_FILE"
+    flock -n 8
+    assert_fails stop_service_strict >/dev/null 2>&1
+)
 
 # 陌生同名单元不得被停止或被安装流程覆盖。
 printf '%s\n' '[Service]' 'ExecStart=/usr/local/bin/foreign-service' > "$SERVICE_FILE"
