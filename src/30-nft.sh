@@ -44,7 +44,9 @@ nft_apply() {
 # {counters:{name:bytes}, quotas:{name:{limit,used}}, chains:{name:[rule 摘要]}, maps:{name:{key:target}}}
 nft_runtime_json() {
     local raw
-    raw=$(nft -j list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null) || { echo 'null'; return 1; }
+    # 表不存在时只返回 1、不输出：调用方统一用 `$(nft_runtime_json || echo null)` 取得单个 null
+    #（若这里也输出 null，会得到两行 null，jq 解析失败，漂移检测结果变空）。
+    raw=$(nft -j list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null) || return 1
     jq -c '
         def key: if type == "object" and has("range") then "\(.range[0])-\(.range[1])" else tostring end;
         .nftables as $o |

@@ -156,5 +156,18 @@ eq "repair 依赖：交互模式询问" "$(sed -n 1p "$T/repair-deps.out")" "rep
 eq "repair 依赖：--yes 免确认且只装一次" "$(sed -n 2p "$T/repair-deps.out")" "report;install:true;"
 eq "repair 依赖：齐全时不安装" "$(sed -n 3p "$T/repair-deps.out")" "report;"
 
+# nft 表不存在：nft_runtime_json 不得输出内容；调用方 `|| echo null` 必须得到单个 null，
+# 漂移检测必须明确报告“表不存在”（曾输出两行 null，jq 失败，开机日志里漂移明细为空）。
+(
+    nft() { return 1; }
+    has_monitors() { return 0; }
+    echo "json=[$(nft_runtime_json 2>/dev/null)]"
+    echo "fallback=[$(nft_runtime_json 2>/dev/null || echo null)]"
+    d=$(nft_runtime_drift 2>/dev/null); echo "drift=$? $d"
+) > "$T/drift.out"
+eq "缺表：runtime_json 无输出" "$(sed -n 1p "$T/drift.out")" "json=[]"
+eq "缺表：调用方得到单个 null" "$(sed -n 2p "$T/drift.out")" "fallback=[null]"
+eq "缺表：漂移明细为表不存在" "$(sed -n 3p "$T/drift.out")" "drift=1 nftables 表 port_traffic_monitor 不存在"
+
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]
