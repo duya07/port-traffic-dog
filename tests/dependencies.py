@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Public CLI dependency contracts, with isolated fake package-manager boundaries."""
+"""Public CLI dependency contracts, with isolated fake package-manager boundaries.
+路径通过 PORT_TRAFFIC_DOG_CONFIG_DIR / PORT_TRAFFIC_DOG_INSTALL_PATH / PORT_TRAFFIC_DOG_DEPENDENCY_STATE_DIR 隔离。"""
 import json
 import os
 from pathlib import Path
@@ -67,15 +68,14 @@ class DependencyFlow(unittest.TestCase):
         self.config = self.root / "config"
         self.installed = self.root / "installed-dog.sh"
         text = PRODUCT.read_text()
+        # 仍为硬编码的路径用文本替换；替换不到即测试失效，必须报错而不是静默跳过。
         for old, new in {
-            'readonly CONFIG_DIR="/etc/port-traffic-dog"': f'readonly CONFIG_DIR="{self.config}"',
-            'readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"': f'readonly INSTALLED_SCRIPT_PATH="{self.installed}"',
             'readonly IP_GUARD_SERVICE_FILE="/etc/systemd/system/port-traffic-dog-ip-guard.service"': f'readonly IP_GUARD_SERVICE_FILE="{self.root}/guard.service"',
             '/etc/trafficcop-lite/': str(self.root / "ntc") + '/',
             '/usr/local/bin/ntc': str(self.root / "ntc-command"),
         }.items():
-            if old in text:
-                text = text.replace(old, new)
+            assert old in text, old
+            text = text.replace(old, new)
         self.script = self.root / "dog.sh"
         self.script.write_text(text)
         self.state = self.root / "state.json"
@@ -90,7 +90,8 @@ class DependencyFlow(unittest.TestCase):
             target = self.bin / name
             target.write_text("#!" + REAL_PYTHON + "\n" + MANAGER)
             target.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.bin), FAKE_PACKAGE_STATE=str(self.state), PORT_TRAFFIC_DOG_DEPENDENCY_STATE_DIR=str(self.ledger))
+        self.env = dict(os.environ, PATH=str(self.bin), FAKE_PACKAGE_STATE=str(self.state), PORT_TRAFFIC_DOG_DEPENDENCY_STATE_DIR=str(self.ledger),
+                        PORT_TRAFFIC_DOG_CONFIG_DIR=str(self.config), PORT_TRAFFIC_DOG_INSTALL_PATH=str(self.installed))
 
     def run_cli(self, *args, input=""):
         return subprocess.run(["/bin/bash", str(self.script), "--dependencies", *args], env=self.env,

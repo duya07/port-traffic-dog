@@ -26,3 +26,6 @@ test-*.sh
 id_rsa*
 *.credentials
 *credentials*
+
+# 发版产物（tools/release.sh 生成，作为 Release 资产上传，不入库）
+dist/

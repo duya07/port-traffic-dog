@@ -1,48 +1,82 @@
 #!/bin/bash
+# 端口流量狗（Port Traffic Dog）——由 src/ 下的模块经 tools/build.sh 拼接生成，请勿直接编辑本文件。
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.5.23"
+# cron、systemd、ssh 非交互会话的 PATH/locale 各不相同。脚本自己固定运行环境，
+# 不再依赖 crontab 首行的 PATH=（1.5.x 曾因该行丢失导致 nft 找不到、推送内容为空）。
+# 只补齐缺失的系统目录（追加在末尾），不打乱调用方已有的 PATH 顺序。
+for _ptd_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    case ":${PATH:-}:" in *":$_ptd_dir:"*) ;; *) PATH="${PATH:+$PATH:}$_ptd_dir" ;; esac
+done
+export PATH
+unset _ptd_dir
+for _ptd_locale in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    if grep -qxF "$_ptd_locale" <<< "$(locale -a 2>/dev/null)"; then
+        export LC_ALL="$_ptd_locale"
+        break
+    fi
+done
+unset _ptd_locale
+# 北京时间使用固定偏移，不依赖 tzdata（缺 tzdata 时 Asia/Shanghai 会静默退回 UTC）。
+readonly DOG_TZ="CST-8"
+
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_NAME="端口流量狗"
-readonly SCRIPT_PATH="$(realpath "$0")"
-readonly INSTALLED_SCRIPT_PATH="/usr/local/bin/port-traffic-dog.sh"
-readonly CONFIG_DIR="/etc/port-traffic-dog"
+readonly CONFIG_SCHEMA=2
+_ptd_self=$(realpath "$0" 2>/dev/null || printf '%s' "$0")
+readonly SCRIPT_PATH="$_ptd_self"
+unset _ptd_self
+readonly INSTALLED_SCRIPT_PATH="${PORT_TRAFFIC_DOG_INSTALL_PATH:-/usr/local/bin/port-traffic-dog.sh}"
+readonly CONFIG_DIR="${PORT_TRAFFIC_DOG_CONFIG_DIR:-/etc/port-traffic-dog}"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
+readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"
+readonly RESET_HISTORY_FILE="$CONFIG_DIR/reset_history.json"
+readonly TC_INTEROP_FILE="$CONFIG_DIR/tc-interop.json"
+readonly MACHINE_TRAFFIC_FILE="$CONFIG_DIR/machine_traffic.json"
+readonly BACKUP_DIR="$CONFIG_DIR/backups"
+readonly LOG_DIR="$CONFIG_DIR/logs"
+readonly LOG_FILE="${PORT_TRAFFIC_DOG_LOG_FILE:-$LOG_DIR/traffic.log}"
+readonly NOTIFY_LOG_FILE="$LOG_DIR/notification.log"
 readonly IP_GUARD_SCRIPT_PATH="$CONFIG_DIR/port-ip-guard.sh"
 readonly IP_GUARD_SERVICE_FILE="/etc/systemd/system/port-traffic-dog-ip-guard.service"
 readonly IP_GUARD_SERVICE="port-traffic-dog-ip-guard.service"
 readonly IP_GUARD_SYSTEMCTL="${PORT_TRAFFIC_DOG_IP_GUARD_SYSTEMCTL:-systemctl}"
-readonly LOG_FILE="${PORT_TRAFFIC_DOG_LOG_FILE:-$CONFIG_DIR/logs/traffic.log}"
-readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
-readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"
-readonly TRAFFIC_STATS_LOCK_DIR="${PORT_TRAFFIC_DOG_TRAFFIC_STATS_LOCK_DIR:-/run/lock/port-traffic-dog-traffic-stats.lock}"
-readonly CONFIG_LOCK_DIR="${PORT_TRAFFIC_DOG_CONFIG_LOCK_DIR:-/run/lock/port-traffic-dog-config.lock}"
-readonly RESET_LOCK_DIR="${PORT_TRAFFIC_DOG_RESET_LOCK_DIR:-/run/lock/port-traffic-dog-reset.lock}"
-readonly CRON_LOCK_DIR="${PORT_TRAFFIC_DOG_CRON_LOCK_DIR:-/run/lock/port-traffic-dog-root-crontab.lock}"
-readonly EXPIRY_LOCK_FILE="${PORT_TRAFFIC_DOG_EXPIRY_LOCK_FILE:-/run/lock/port-traffic-dog-expiry.lock}"
+
+# Dog 自身状态（配置、统计、nft 对象、cron）只用一把可重入锁，避免多把锁的顺序问题。
+readonly DOG_LOCK_FILE="${PORT_TRAFFIC_DOG_LOCK_FILE:-/run/lock/port-traffic-dog.lock}"
+readonly DOG_LOCK_WAIT="${PORT_TRAFFIC_DOG_LOCK_WAIT:-30}"
+
+# nftables：表名沿用 1.5.x，便于升级与外部工具识别。
+readonly NFT_FAMILY="inet"
+readonly NFT_TABLE="port_traffic_monitor"
+readonly NFT_MAP_IN="ptd_in_dport"
+readonly NFT_MAP_OUT="ptd_out_sport"
+readonly NFT_MAP_MARK_SPORT="ptd_mark_sport"
+readonly NFT_MAP_MARK_DPORT="ptd_mark_dport"
+
+# 与 TrafficCop Lite（NTC）共享的 TC 契约。
 readonly TC_SHARED_LOCK_FILE="${TRAFFIC_TOOLS_TC_LOCK_FILE:-/run/lock/traffic-tools-tc.lock}"
 readonly TRAFFICCOP_TC_STATE_FILE="${TRAFFICCOP_TC_STATE_FILE:-/etc/trafficcop-lite/tc_limit_state}"
 readonly TRAFFICCOP_CONFIG_FILE="${TRAFFICCOP_CONFIG_FILE:-/etc/trafficcop-lite/traffic_monitor_config.txt}"
+readonly TRAFFICCOP_MONITOR_SCRIPT="${TRAFFICCOP_MONITOR_SCRIPT:-/etc/trafficcop-lite/trafficcop-lite-monitor.sh}"
 readonly TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
 readonly TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
-# 整机流量（只读）的独立数据文件：不写 config.json，也不创建任何 nftables/tc 对象。
-readonly MACHINE_TRAFFIC_FILE="$CONFIG_DIR/machine_traffic.json"
 readonly TC_RECOVERY_SERVICE="traffic-tools-tc-recovery.service"
 readonly TC_RECOVERY_SYSTEMCTL="${TRAFFIC_TOOLS_SYSTEMCTL:-systemctl}"
 readonly TC_INTEROP_SCHEMA="traffic-tools-unified-htb-v1"
-readonly TRAFFIC_ACCOUNTING_MODEL="upstream-weighted-v2"
-readonly TC_RUNTIME_MODEL="unified-htb-v3"
-readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
+readonly TC_CLASS_MANIFEST_SCHEMA="traffic-tools-dog-classes-v1"
 readonly TC_PARENT_RATE="100gbit"
 readonly TC_DEFAULT_CLASS_RATE="1kbit"
 readonly TC_PORT_CLASS_RATE="1kbit"
+readonly TC_MARK_BASE=0x50000000
 readonly TC_MARK_MASK=0xfffff000
 readonly TC_MARK_PRESERVE_MASK=0x00000fff
-readonly LEGACY_LOCK_MAX_AGE=86400
-# 入向整形用的虚拟设备。tc 只能整形出向流量，入向必须先经 ingress qdisc
-# 重定向到这里再整形；ifb0 与物理网卡共用同一套统一 HTB 契约。
 readonly TC_IFB_DEVICE="ifb0"
 readonly TC_IFB_INGRESS_HANDLE="ffff:"
+
+readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
 
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
     RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; GREEN='\033[0;32m'; NC='\033[0m'
@@ -50,28 +84,28 @@ else
     RED=''; YELLOW=''; BLUE=''; GREEN=''; NC=''
 fi
 readonly RED YELLOW BLUE GREEN NC
-# 网络超时设置
+
 readonly SHORT_CONNECT_TIMEOUT=5
-readonly SHORT_MAX_TIMEOUT=7
-readonly SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-traffic-dog.sh"
-readonly IP_GUARD_SCRIPT_URL="https://raw.githubusercontent.com/duya07/port-traffic-dog/main/port-ip-guard.sh"
-readonly MODULES_ARCHIVE_URL="https://github.com/duya07/port-traffic-dog/archive/refs/heads/main.zip"
+readonly DOG_REPO="${PORT_TRAFFIC_DOG_REPO:-duya07/port-traffic-dog}"
 readonly SHORTCUT_COMMAND="dog"
 readonly SHORTCUT_PATH="${PORT_TRAFFIC_DOG_SHORTCUT_PATH:-/usr/local/bin/$SHORTCUT_COMMAND}"
 readonly DEPENDENCY_STATE_DIR="${PORT_TRAFFIC_DOG_DEPENDENCY_STATE_DIR:-/var/lib/port-traffic-dog/dependencies}"
 
+# 运行期全局状态
+DOG_LOCK_DEPTH=0
+TC_SHARED_LOCK_DEPTH=0
+DOG_NONINTERACTIVE=false
+
 # 依赖账本独立于配置；保留现有软件包的归属，不自动认领旧安装。
+# 2.0 起不再使用 bc、unzip、conntrack；此前由 Dog 安装并记入账本的仍可用 --dependencies remove 卸载。
 dependency_manifest() {
     cat <<'PACKAGES'
 nftables|nft|防火墙与流量统计
 iproute2|ip tc ss|连接、网卡与限速
 jq|jq|配置处理
 mawk|awk|文本处理（任意可用 awk 均可）
-bc|bc|流量换算
-unzip|unzip|更新包解压
 cron|cron crontab|定时任务
 curl|curl|下载与通知
-conntrack|conntrack|连接状态
 util-linux|flock|并发锁
 procps|pgrep|守护进程状态检测
 kmod|modprobe|IFB 内核模块加载
@@ -104,6 +138,7 @@ dependency_audit() {
 # BEGIN MANAGED DEPENDENCIES
 # Adapted from easy_Caddy 843e7b4; embedded so standalone installs need no helper file.
 dependency_error() { printf '依赖管理：%s\n' "$*" >&2; }
+
 dependency_package_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?$ ]]; }
 
 dependency_installed() {
@@ -272,7 +307,7 @@ dependency_install_missing() (
     apt-get update || { dependency_error '软件包索引更新失败，未安装。'; return 1; }
     dependency_snapshot "$stage/before" before || return 1
     plan=$(LC_ALL=C apt-get --simulate --no-remove --no-install-recommends install -- "${DEPENDENCY_MISSING_PACKAGES[@]}") || return 1
-    if printf '%s\n' "$plan" | grep -q '^Remv '; then dependency_error '安装计划包含删除，已停止。'; return 1; fi
+    if grep -q '^Remv ' <<< "$plan"; then dependency_error '安装计划包含删除，已停止。'; return 1; fi
     printf '%s\n' "$plan" | awk '$1 == "Inst" {print $2}' | LC_ALL=C sort -u > "$stage/plan"
     while IFS= read -r package; do
         [ -n "$package" ] || continue
@@ -391,7 +426,7 @@ dependency_remove() (
     selected=("${filtered[@]}")
     [ "${#selected[@]}" -gt 0 ] || { printf '没有可卸载的新依赖；未改动系统软件包。\n'; return 0; }
     plan=$(LC_ALL=C apt-get --simulate -o APT::Get::AutomaticRemove=false remove -- "${selected[@]}") || return 1
-    if printf '%s\n' "$plan" | grep -q '^Inst '; then dependency_error '卸载计划会安装其他包，已停止。'; return 1; fi
+    if grep -q '^Inst ' <<< "$plan"; then dependency_error '卸载计划会安装其他包，已停止。'; return 1; fi
     while IFS= read -r package; do
         [ -n "$package" ] || continue
         dependency_package_name "$package" || return 1
@@ -425,7 +460,8 @@ dependency_remove() (
 )
 
 dependency_cli() {
-    local action="${1:-check}" scope=owned yes=false option
+    # main() 已把 --yes/-y 从参数中取出并设置 DOG_NONINTERACTIVE；这里两种来源都认。
+    local action="${1:-check}" scope=owned yes="${DOG_NONINTERACTIVE:-false}" option
     [ "$#" -eq 0 ] || shift
     for option in "$@"; do
         case "$option" in --yes) yes=true ;; --all) scope=all ;; *) dependency_error "未知参数：$option"; return 2 ;; esac
@@ -458,90 +494,6 @@ dependency_menu() {
         esac
         read -r -p '按回车返回依赖管理...' choice || return 0
     done
-}
-# END MANAGED DEPENDENCIES
-
-# 业务日志仅接收固定事件、结果码及安全标量，不接收配置/通知文本。
-dog_write_event() (
-    umask 077
-    local event="$1" result="$2" field safe_fields="" directory index description
-    [[ "$event" =~ ^[a-z][a-z0-9_]{0,63}$ ]] || return 0
-    [[ "$result" =~ ^[0-9]{1,3}$ ]] || return 0
-    shift 2
-    for field in "$@"; do
-        case "$field" in
-            port=*) [[ "${field#*=}" =~ ^[0-9,-]{1,128}$ ]] || continue ;;
-            rate=*) [[ "${field#*=}" =~ ^[0-9]+([kKmMgG]?[bB]it|[KMG]bps)?$ ]] || continue ;;
-            mode=*) [[ "${field#*=}" =~ ^[a-z_-]{1,32}$ ]] || continue ;;
-            *) continue ;;
-        esac
-        safe_fields+=" $field"
-    done
-    directory=$(dirname "$LOG_FILE")
-    [ ! -L "$directory" ] && [ ! -L "$LOG_FILE" ] && [ ! -L "$LOG_FILE.lock" ] || return 1
-    mkdir -p "$directory" || return 1
-    chmod 700 "$directory" || return 1
-    exec 7>>"$LOG_FILE.lock" || return 1
-    chmod 600 "$LOG_FILE.lock" || return 1
-    flock -x -w 2 7 || return 1
-    for index in 1 2 3; do [ ! -L "$LOG_FILE.$index" ] || return 1; done
-    if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -ge 1048576 ]; then
-        rm -f "$LOG_FILE.3" || return 1
-        for index in 2 1; do
-            if [ -f "$LOG_FILE.$index" ]; then mv -f "$LOG_FILE.$index" "$LOG_FILE.$((index+1))" || return 1; fi
-        done
-        mv -f "$LOG_FILE" "$LOG_FILE.1" || return 1
-    fi
-    case "$event" in
-        config_update) description="保存监控、配额或通知配置" ;;
-        tc_apply) description="应用端口带宽限制" ;;
-        tc_replace) description="更新端口带宽限制" ;;
-        tc_clear) description="撤销端口带宽限制" ;;
-        expiry_apply) description="应用服务到期封锁" ;;
-        expiry_clear) description="解除服务到期封锁" ;;
-        traffic_reset) description="重置端口流量" ;;
-        monitor_apply) description="添加或恢复端口监控" ;;
-        quota_apply) description="应用端口流量配额" ;;
-        install) description="安装或更新 Dog" ;;
-        install_rollback) description="恢复更新前的 Dog 文件和状态" ;;
-        runtime_restore) description="恢复监控规则和限速" ;;
-        import_config) description="导入配置并恢复运行状态" ;;
-        export_config) description="导出配置备份" ;;
-        dependency_install) description="安装并复检缺失依赖" ;;
-        dependency_remove) description="按确认计划卸载依赖" ;;
-        *) description="记录操作" ;;
-    esac
-    if [ "$result" -eq 0 ]; then description+="：成功"; else description+="：失败（返回码 $result）"; fi
-    printf '%s %s%s event=%s result=%s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        "$description" "$safe_fields" "$event" "$result" "$safe_fields" >> "$LOG_FILE" || return 1
-    chmod 600 "$LOG_FILE" || return 1
-)
-
-dog_log_event() {
-    if ! dog_write_event "$@"; then
-        echo "警告：Dog 操作日志写入失败，业务返回状态保持原值。" >&2
-    fi
-    return 0
-}
-
-show_operation_logs() {
-    local file
-    for file in "$LOG_FILE" "$CONFIG_DIR/logs/ip-guard.log" "$CONFIG_DIR/logs/notification.log"; do
-        printf '\n=== %s ===\n' "${file##*/}"
-        if [ -f "$file" ] && [ ! -L "$file" ]; then
-            if [[ "$file" == */ip-guard.log ]]; then
-                tail -n 50 -- "$file" | jq -r '"\(.time) \(.message // .event)"'
-            else tail -n 50 -- "$file"; fi
-        else echo '暂无日志'; fi
-    done
-}
-
-get_script_exec_path() {
-    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        echo "$INSTALLED_SCRIPT_PATH"
-    else
-        echo "$SCRIPT_PATH"
-    fi
 }
 
 detect_system() {
@@ -577,4370 +529,298 @@ check_dependencies() {
     fi
 }
 
-setup_script_permissions() {
-    local result=0
-    if [ -f "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH" 2>/dev/null || result=1
-    fi
+# ── 日志 ──────────────────────────────────────────────────────────
+# traffic.log 是结构化操作日志：只接收固定事件名、返回码和经过白名单校验的标量，
+# 不写入通知正文、token 等敏感内容。notification.log 记录推送与告警摘要。
 
-    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        chmod +x "$INSTALLED_SCRIPT_PATH" 2>/dev/null || result=1
-    fi
-    return "$result"
-}
-
-read_current_crontab() {
-    local output
-    local result=0
-    output=$(crontab -l 2>&1) || result=$?
-    if [ "$result" -ne 0 ]; then
-        if printf '%s' "$output" | grep -qi "no crontab for"; then
-            return 0
-        fi
-        echo "读取 root crontab 失败: $output" >&2
-        return 1
-    fi
-    printf '%s\n' "$output"
-}
-
-CRON_LOCK_DEPTH=0
-
-begin_cron_update() {
-    if [ "$CRON_LOCK_DEPTH" -gt 0 ]; then
-        CRON_LOCK_DEPTH=$((CRON_LOCK_DEPTH + 1))
-        return 0
-    fi
-    acquire_directory_lock "$CRON_LOCK_DIR" || return 1
-    CRON_LOCK_DEPTH=1
-}
-
-release_cron_update() {
-    [ "$CRON_LOCK_DEPTH" -gt 0 ] || return 0
-    CRON_LOCK_DEPTH=$((CRON_LOCK_DEPTH - 1))
-    if [ "$CRON_LOCK_DEPTH" -eq 0 ]; then
-        release_directory_lock "$CRON_LOCK_DIR"
-    fi
-}
-
-read_root_crontab_locked() {
-    local output=""
-    local result=0
-
-    begin_cron_update || return 1
-    output=$(read_current_crontab) || result=$?
-    release_cron_update
-    [ "$result" -eq 0 ] || return "$result"
-    printf '%s\n' "$output"
-}
-
-restore_root_crontab_from_file() {
-    local backup_file="$1"
-    [ -f "$backup_file" ] || return 1
-    begin_cron_update || return 1
-    local result=0
-    crontab "$backup_file" >/dev/null 2>&1 || result=1
-    release_cron_update
-    return "$result"
-}
-
-finish_cron_update() {
-    local cron_file="$1"
-    local result=0
-    crontab "$cron_file" || result=1
-    rm -f "$cron_file"
-    release_cron_update
-    return "$result"
-}
-
-setup_cron_environment() {
-    # cron环境PATH不完整，需要设置完整路径
-    begin_cron_update || return 1
-    local current_cron
-    if ! current_cron=$(read_current_crontab); then
-        release_cron_update
-        return 1
-    fi
-    if ! echo "$current_cron" | grep -q "^PATH=.*sbin"; then
-        local temp_cron
-        temp_cron=$(mktemp) || { release_cron_update; return 1; }
-        echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" > "$temp_cron" || {
-            rm -f "$temp_cron"
-            release_cron_update
-            return 1
-        }
-        printf '%s\n' "$current_cron" | filter_cron_path_entries >> "$temp_cron" || {
-            rm -f "$temp_cron"
-            release_cron_update
-            return 1
-        }
-        finish_cron_update "$temp_cron"
-        return
-    fi
-    release_cron_update
-}
-
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误：此脚本需要root权限运行${NC}"
-        exit 1
-    fi
-}
-
-init_config() {
-    mkdir -p "$CONFIG_DIR" "$(dirname "$LOG_FILE")"
-
-    if [ ! -f "$CONFIG_FILE" ]; then
-        cat > "$CONFIG_FILE" << 'EOF'
-{
-  "global": {
-    "billing_mode": "double"
-  },
-  "ports": {},
-  "nftables": {
-    "table_name": "port_traffic_monitor",
-    "family": "inet"
-  },
-  "notifications": {
-    "telegram": {
-      "enabled": false,
-      "bot_token": "",
-      "chat_id": "",
-      "server_name": "",
-      "api_route": "official",
-      "custom_api_base": "",
-      "status_notifications": {
-        "enabled": false,
-        "interval": "1h"
-      }
-    },
-    "email": {
-      "enabled": false,
-      "status": "coming_soon"
-    },
-    "wecom": {
-      "enabled": false,
-      "webhook_url": "",
-      "server_name": "",
-      "status_notifications": {
-        "enabled": false,
-        "interval": "1h"
-      }
-    }
-  }
-}
-EOF
-    fi
-
-    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}错误：配置文件不是有效 JSON: $CONFIG_FILE${NC}"
-        return 1
-    fi
-    if ! validate_config_file "$CONFIG_FILE"; then
-        echo -e "${RED}错误：配置文件内容无效，已停止加载${NC}"
-        return 1
-    fi
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-
-    init_nftables || return 1
-    setup_exit_hooks
-    restore_monitoring_if_needed || return 1
-    ensure_traffic_accounting_model || return 1
-    ensure_tc_runtime_model || return 1
-}
-
-nft_base_chain_contract_valid() {
-    local family="$1"
-    local table_name="$2"
-    local chain_name="$3"
-    local expected_hook="$4"
-    local expected_priority="$5"
-
-    nft -j list chain "$family" "$table_name" "$chain_name" 2>/dev/null |
-        jq -e --arg name "$chain_name" --arg hook "$expected_hook" --argjson priority "$expected_priority" '
-            any(.nftables[]; .chain? |
-                .name == $name and .type == "filter" and
-                .hook == $hook and .prio == $priority)
-        ' >/dev/null
-}
-
-# 返回 0=表存在，1=明确不存在，2=查询失败。
-nft_table_exists() {
-    local family="$1"
-    local table_name="$2"
-    local tables_output
-    tables_output=$(nft list tables 2>/dev/null) || return 2
-    printf '%s\n' "$tables_output" |
-        grep -Eq "^table[[:space:]]+${family}[[:space:]]+${table_name}$"
-}
-
-ensure_nft_base_chain() {
-    local family="$1"
-    local table_name="$2"
-    local chain_name="$3"
-    local expected_hook="$4"
-    local expected_priority="$5"
-    local table_json
-
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 1
-    if printf '%s' "$table_json" | jq -e --arg name "$chain_name" \
-        'any(.nftables[]; .chain?.name == $name)' >/dev/null; then
-        nft_base_chain_contract_valid \
-            "$family" "$table_name" "$chain_name" "$expected_hook" "$expected_priority"
-        return $?
-    fi
-
-    if ! nft add chain "$family" "$table_name" "$chain_name" \
-        "{ type filter hook $expected_hook priority $expected_priority; }" >/dev/null 2>&1; then
-        return 1
-    fi
-    nft_base_chain_contract_valid \
-        "$family" "$table_name" "$chain_name" "$expected_hook" "$expected_priority"
-}
-
-nft_runtime_base_chains_valid() {
-    local table_name
-    local family
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-
-    nft_base_chain_contract_valid "$family" "$table_name" input input 0 &&
-        nft_base_chain_contract_valid "$family" "$table_name" output output 0 &&
-        nft_base_chain_contract_valid "$family" "$table_name" forward forward 0 &&
-        nft_base_chain_contract_valid "$family" "$table_name" expiry_input input -30 &&
-        nft_base_chain_contract_valid "$family" "$table_name" expiry_output output -30 &&
-        nft_base_chain_contract_valid "$family" "$table_name" expiry_forward forward -30
-}
-
-init_nftables() {
-    local table_name
-    local family
-    local tables_output
-    local table_exists=false
-    local table_json=""
-    local batch_file
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-
-    # 查询失败与“对象不存在”严格区分；无法证明现状时禁止继续写规则。
-    tables_output=$(nft list tables 2>/dev/null) || {
-        echo "无法读取 nftables 表，已停止修改。" >&2
-        return 1
-    }
-    if printf '%s\n' "$tables_output" | grep -Eq "^table[[:space:]]+${family}[[:space:]]+${table_name}$"; then
-        table_exists=true
-        table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || {
-            echo "无法读取 nftables 表 $family $table_name，已停止修改。" >&2
-            return 1
-        }
-    fi
-
-    # 先对所有已有同名链做完整预检，任一契约冲突时零修改。
-    if [ "$table_exists" = "true" ]; then
-        local chain_spec
-        local chain_name
-        local expected_hook
-        local expected_priority
-        for chain_spec in \
-            "input:input:0" "output:output:0" "forward:forward:0" \
-            "expiry_input:input:-30" "expiry_output:output:-30" "expiry_forward:forward:-30"; do
-            IFS=: read -r chain_name expected_hook expected_priority <<< "$chain_spec"
-            if printf '%s' "$table_json" | jq -e --arg name "$chain_name" \
-                'any(.nftables[]; .chain?.name == $name)' >/dev/null &&
-               ! nft_base_chain_contract_valid "$family" "$table_name" "$chain_name" \
-                    "$expected_hook" "$expected_priority"; then
-                echo "nftables 链 $chain_name 的 type/hook/priority 契约冲突，已停止修改。" >&2
-                return 1
-            fi
+dog_write_event() (
+    umask 077
+    local event="$1" result="$2" field safe_fields="" directory index description
+    [[ "$event" =~ ^[a-z][a-z0-9_]{0,63}$ ]] || return 0
+    [[ "$result" =~ ^[0-9]{1,3}$ ]] || return 0
+    shift 2
+    for field in "$@"; do
+        case "$field" in
+            id=*) [[ "${field#*=}" =~ ^m[0-9]{1,6}$ ]] || continue ;;
+            port=*|ports=*) [[ "${field#*=}" =~ ^[0-9,-]{1,256}$ ]] || continue ;;
+            rate=*) [[ "${field#*=}" =~ ^[0-9]+([kKmMgG]?[bB]it|[KMG]bps)?$ ]] || continue ;;
+            mode=*|step=*) [[ "${field#*=}" =~ ^[a-z_-]{1,32}$ ]] || continue ;;
+            *) continue ;;
+        esac
+        safe_fields+=" $field"
+    done
+    directory=$(dirname "$LOG_FILE")
+    [ ! -L "$directory" ] && [ ! -L "$LOG_FILE" ] && [ ! -L "$LOG_FILE.lock" ] || return 1
+    mkdir -p "$directory" || return 1
+    chmod 700 "$directory" || return 1
+    exec 7>>"$LOG_FILE.lock" || return 1
+    chmod 600 "$LOG_FILE.lock" || return 1
+    flock -x -w 2 7 || return 1
+    for index in 1 2 3; do [ ! -L "$LOG_FILE.$index" ] || return 1; done
+    if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -ge 1048576 ]; then
+        rm -f "$LOG_FILE.3" || return 1
+        for index in 2 1; do
+            if [ -f "$LOG_FILE.$index" ]; then mv -f "$LOG_FILE.$index" "$LOG_FILE.$((index+1))" || return 1; fi
         done
+        mv -f "$LOG_FILE" "$LOG_FILE.1" || return 1
     fi
+    case "$event" in
+        config_update) description="保存配置" ;;
+        monitor_add) description="添加监控项" ;;
+        monitor_remove) description="删除监控项" ;;
+        monitor_edit) description="修改监控项端口" ;;
+        monitor_split) description="拆分监控项" ;;
+        monitor_merge) description="合并监控项" ;;
+        tc_apply) description="应用带宽限制" ;;
+        tc_clear) description="撤销带宽限制" ;;
+        expiry_apply) description="应用服务到期封锁" ;;
+        expiry_clear) description="解除服务到期封锁" ;;
+        traffic_reset) description="重置流量" ;;
+        quota_apply) description="应用流量配额" ;;
+        install) description="安装或更新 Dog" ;;
+        install_rollback) description="恢复更新前的 Dog 文件和状态" ;;
+        migrate) description="从 1.5.x 迁移配置与流量" ;;
+        runtime_restore) description="恢复监控规则和限速" ;;
+        import_config) description="导入配置并恢复运行状态" ;;
+        export_config) description="导出配置备份" ;;
+        cron_task) description="定时任务" ;;
+        dependency_install) description="安装并复检缺失依赖" ;;
+        dependency_remove) description="按确认计划卸载依赖" ;;
+        *) description="记录操作" ;;
+    esac
+    if [ "$result" -eq 0 ]; then description+="：成功"; else description+="：失败（返回码 $result）"; fi
+    printf '%s %s%s event=%s result=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$description" "$safe_fields" "$event" "$result" >> "$LOG_FILE" || return 1
+    chmod 600 "$LOG_FILE" || return 1
+)
 
-    batch_file=$(mktemp "$CONFIG_DIR/.nft-base-chains.XXXXXX") || return 1
-    if [ "$table_exists" != "true" ]; then
-        printf 'add table %s %s\n' "$family" "$table_name" >> "$batch_file"
-        table_json='{"nftables":[]}'
+dog_log_event() {
+    if ! dog_write_event "$@"; then
+        echo "警告：Dog 操作日志写入失败，业务返回状态保持原值。" >&2
     fi
-    local chain_spec
-    local chain_name
-    local expected_hook
-    local expected_priority
-    for chain_spec in \
-        "input:input:0" "output:output:0" "forward:forward:0" \
-        "expiry_input:input:-30" "expiry_output:output:-30" "expiry_forward:forward:-30"; do
-        IFS=: read -r chain_name expected_hook expected_priority <<< "$chain_spec"
-        if ! printf '%s' "$table_json" | jq -e --arg name "$chain_name" \
-            'any(.nftables[]; .chain?.name == $name)' >/dev/null; then
-            printf 'add chain %s %s %s { type filter hook %s priority %s; }\n' \
-                "$family" "$table_name" "$chain_name" "$expected_hook" "$expected_priority" >> "$batch_file"
-        fi
+    return 0
+}
+
+# 通知与告警摘要日志（人类可读，按大小轮转）。
+log_notification() {
+    local message="$1"
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    if [ -f "$NOTIFY_LOG_FILE" ] && [ "$(stat -c %s "$NOTIFY_LOG_FILE" 2>/dev/null || echo 0)" -ge 524288 ]; then
+        tail -n 1000 "$NOTIFY_LOG_FILE" 2>/dev/null | atomic_write "$NOTIFY_LOG_FILE" 600 || true
+    fi
+    printf '[%s] %s\n' "$(beijing_date '+%Y-%m-%d %H:%M:%S')" "$message" >> "$NOTIFY_LOG_FILE" 2>/dev/null || true
+    chmod 600 "$NOTIFY_LOG_FILE" 2>/dev/null || true
+}
+
+# 打印错误到 stderr，并写入通知日志，cron 下失败也能看到原因。
+dog_error() {
+    echo -e "${RED}$*${NC}" >&2
+    log_notification "错误：$*"
+}
+
+show_operation_logs() {
+    local file
+    for file in "$LOG_FILE" "$LOG_DIR/ip-guard.log" "$NOTIFY_LOG_FILE"; do
+        printf '\n=== %s ===\n' "${file##*/}"
+        if [ -f "$file" ] && [ ! -L "$file" ]; then
+            if [[ "$file" == */ip-guard.log ]]; then
+                tail -n 50 -- "$file" | jq -r '"\(.time) \(.message // .event)"' 2>/dev/null || tail -n 50 -- "$file"
+            else tail -n 50 -- "$file"; fi
+        else echo '暂无日志'; fi
     done
-
-    if [ -s "$batch_file" ]; then
-        if ! nft -c -f "$batch_file" >/dev/null 2>&1 ||
-           ! nft -f "$batch_file" >/dev/null 2>&1; then
-            rm -f "$batch_file"
-            return 1
-        fi
-    fi
-    rm -f "$batch_file"
-    nft_runtime_base_chains_valid
 }
 
-get_network_interfaces() {
-    local interfaces=()
+# ── 锁与原子写入 ──────────────────────────────────────────────────
+# fd 约定：7=日志锁（子 shell 内）、8=Dog 状态锁、9=与 NTC 共享的 TC 锁。
 
-    while IFS= read -r interface; do
-        if [[ "$interface" != "lo" ]] && [[ "$interface" != "" ]]; then
-            interfaces+=("$interface")
-        fi
-    done < <(ip link show | grep "state UP" | awk -F': ' '{print $2}' | cut -d'@' -f1)
-
-    printf '%s\n' "${interfaces[@]}"
-}
-
-get_default_interface() {
-    local default_interface
-    default_interface=$(ip -o route show default 2>/dev/null |
-        awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
-    if [ -z "$default_interface" ]; then
-        default_interface=$(ip -o -6 route show default 2>/dev/null |
-            awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+# 获取 Dog 状态锁（可重入）。$1 可指定等待秒数，0 表示不等待。
+dog_lock() {
+    local wait_seconds="${1:-$DOG_LOCK_WAIT}"
+    if [ "$DOG_LOCK_DEPTH" -gt 0 ]; then
+        DOG_LOCK_DEPTH=$((DOG_LOCK_DEPTH + 1))
+        return 0
     fi
-
-    if [ -n "$default_interface" ]; then
-        echo "$default_interface"
-        return
-    fi
-
-    local interfaces=($(get_network_interfaces))
-    if [ ${#interfaces[@]} -gt 0 ]; then
-        echo "${interfaces[0]}"
-        return
-    fi
-
-    # 不能猜网卡名：猜错会在错误的设备上重建 HTB。宁可中止，也不要动错设备。
-    echo "无法确定默认出口网卡，已中止 TC 相关操作" >&2
-    return 1
-}
-
-format_bytes() {
-    local bytes=$1
-
-    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
-        bytes=0
-    fi
-
-    if [ $bytes -ge 1073741824 ]; then
-        local gb=$(echo "scale=2; $bytes / 1073741824" | bc)
-        echo "${gb}GB"
-    elif [ $bytes -ge 1048576 ]; then
-        local mb=$(echo "scale=2; $bytes / 1048576" | bc)
-        echo "${mb}MB"
-    elif [ $bytes -ge 1024 ]; then
-        local kb=$(echo "scale=2; $bytes / 1024" | bc)
-        echo "${kb}KB"
+    mkdir -p "$(dirname "$DOG_LOCK_FILE")" 2>/dev/null || true
+    exec 8>>"$DOG_LOCK_FILE" || return 1
+    if [ "$wait_seconds" -eq 0 ]; then
+        flock -n 8 || { exec 8>&-; return 1; }
     else
-        echo "${bytes}B"
+        flock -w "$wait_seconds" 8 || { exec 8>&-; return 1; }
     fi
+    DOG_LOCK_DEPTH=1
 }
 
-get_beijing_time() {
-    TZ='Asia/Shanghai' date "$@"
-}
-
-update_config() {
-    local jq_expression="$1"
-    update_config_file "$jq_expression"
-}
-
-acquire_directory_lock() {
-    local lock_dir="$1"
-    mkdir -p "$CONFIG_DIR"
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        if mkdir "$lock_dir" 2>/dev/null; then
-            local current_pid="${BASHPID:-$$}"
-            local current_boot_id="-"
-            local current_start_time="-"
-            [ -r /proc/sys/kernel/random/boot_id ] && \
-                current_boot_id=$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)
-            [ -r "/proc/$current_pid/stat" ] && \
-                current_start_time=$(awk '{print $22}' "/proc/$current_pid/stat" 2>/dev/null || echo "-")
-            if printf '%s %s %s %s\n' \
-                "$current_pid" "$(date +%s)" "$current_boot_id" "$current_start_time" > "$lock_dir/owner"; then
-                return 0
-            fi
-            rm -f "$lock_dir/owner" 2>/dev/null || true
-            rmdir "$lock_dir" 2>/dev/null || true
-            continue
-        fi
-
-        local owner_pid=""
-        local owner_time=0
-        local owner_boot_id=""
-        local owner_start_time=""
-        local stale_lock=false
-        if read -r owner_pid owner_time owner_boot_id owner_start_time 2>/dev/null < "$lock_dir/owner"; then
-            local now
-            now=$(date +%s)
-            if ! [[ "$owner_pid" =~ ^[0-9]+$ ]] || ! [[ "$owner_time" =~ ^[0-9]+$ ]] || \
-               ! kill -0 "$owner_pid" 2>/dev/null || [ "$now" -lt "$owner_time" ]; then
-                stale_lock=true
-            else
-                local current_boot_id=""
-                local current_start_time=""
-                local boot_epoch=""
-                [ -r /proc/sys/kernel/random/boot_id ] && \
-                    current_boot_id=$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)
-                [ -r "/proc/$owner_pid/stat" ] && \
-                    current_start_time=$(awk '{print $22}' "/proc/$owner_pid/stat" 2>/dev/null || true)
-
-                if [ -n "$owner_boot_id" ] && [ "$owner_boot_id" != "-" ] && \
-                   [ -n "$current_boot_id" ] && [ "$owner_boot_id" != "$current_boot_id" ]; then
-                    stale_lock=true
-                elif [ -n "$owner_start_time" ] && [ "$owner_start_time" != "-" ] && \
-                     [ -n "$current_start_time" ] && [ "$owner_start_time" != "$current_start_time" ]; then
-                    stale_lock=true
-                elif [ -z "$owner_boot_id" ] || [ "$owner_boot_id" = "-" ]; then
-                    boot_epoch=$(awk '$1 == "btime" {print $2; exit}' /proc/stat 2>/dev/null || true)
-                    if [[ "$boot_epoch" =~ ^[0-9]+$ ]] && [ "$owner_time" -lt "$boot_epoch" ]; then
-                        stale_lock=true
-                    elif [ $((now - owner_time)) -gt "$LEGACY_LOCK_MAX_AGE" ]; then
-                        stale_lock=true
-                    fi
-                fi
-            fi
-        else
-            # 新锁创建后会有极短的 owner 写入窗口，先等待再判断残留锁。
-            sleep 1
-            if [ ! -s "$lock_dir/owner" ]; then
-                stale_lock=true
-            fi
-        fi
-        if [ "$stale_lock" = "true" ]; then
-            rm -f "$lock_dir/owner" 2>/dev/null || true
-            rmdir "$lock_dir" 2>/dev/null || true
-            continue
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-directory_lock_owned_by_current_process() {
-    local lock_dir="$1"
-    local owner_pid=""
-    local owner_time=""
-    local owner_boot_id=""
-    local owner_start_time=""
-    local current_pid="${BASHPID:-$$}"
-    read -r owner_pid owner_time owner_boot_id owner_start_time 2>/dev/null < "$lock_dir/owner" || return 1
-    [ "$owner_pid" = "$current_pid" ] || return 1
-
-    if [ -n "$owner_boot_id" ] && [ "$owner_boot_id" != "-" ] && \
-       [ -r /proc/sys/kernel/random/boot_id ]; then
-        [ "$owner_boot_id" = "$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)" ] || return 1
-    fi
-    if [ -n "$owner_start_time" ] && [ "$owner_start_time" != "-" ] && \
-       [ -r "/proc/$current_pid/stat" ]; then
-        [ "$owner_start_time" = "$(awk '{print $22}' "/proc/$current_pid/stat" 2>/dev/null)" ] || return 1
-    fi
-}
-
-release_directory_lock() {
-    local lock_dir="$1"
-    if [ -f "$lock_dir/owner" ] && ! directory_lock_owned_by_current_process "$lock_dir"; then
-        return 0
-    fi
-    rm -f "$lock_dir/owner" 2>/dev/null || true
-    rmdir "$lock_dir" 2>/dev/null || true
-}
-
-# Dog 与 TrafficCop 会修改同一网卡的 TC 层级。cron 锁仍归各项目所有，
-# 但 TC 事务必须共用这一把锁，避免父类和端口子类被并发改成半完成状态。
-TC_SHARED_LOCK_DEPTH=0
-TC_UPDATE_MIGRATED_LEGACY_TBF=false
-TC_UPDATE_LEGACY_TBF_RATE=""
-
-begin_tc_update() {
-    if [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ]; then
-        TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH + 1))
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$TC_SHARED_LOCK_FILE")" || return 1
-    exec 9>"$TC_SHARED_LOCK_FILE" || return 1
-    if ! flock -w 15 9; then
-        exec 9>&-
-        return 1
-    fi
-    TC_SHARED_LOCK_DEPTH=1
-    TC_UPDATE_MIGRATED_LEGACY_TBF=false
-    TC_UPDATE_LEGACY_TBF_RATE=""
-}
-
-finish_tc_update() {
-    [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ] || return 0
-    TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH - 1))
-    if [ "$TC_SHARED_LOCK_DEPTH" -eq 0 ]; then
-        TC_UPDATE_MIGRATED_LEGACY_TBF=false
-        TC_UPDATE_LEGACY_TBF_RATE=""
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
-    fi
-}
-
-CONFIG_LOCK_DEPTH=0
-
-acquire_config_lock() {
-    if [ "$CONFIG_LOCK_DEPTH" -gt 0 ]; then
-        CONFIG_LOCK_DEPTH=$((CONFIG_LOCK_DEPTH + 1))
-        return 0
-    fi
-    acquire_directory_lock "$CONFIG_LOCK_DIR" || return 1
-    CONFIG_LOCK_DEPTH=1
-}
-
-release_config_lock() {
-    [ "$CONFIG_LOCK_DEPTH" -gt 0 ] || return 0
-    CONFIG_LOCK_DEPTH=$((CONFIG_LOCK_DEPTH - 1))
-    if [ "$CONFIG_LOCK_DEPTH" -eq 0 ]; then
-        release_directory_lock "$CONFIG_LOCK_DIR"
-    fi
-}
-
-acquire_reset_lock() {
-    acquire_directory_lock "$RESET_LOCK_DIR"
-}
-
-release_reset_lock() {
-    release_directory_lock "$RESET_LOCK_DIR"
-}
-
-RESET_LOCK_DEPTH=0
-
-begin_reset_update() {
-    if [ "$RESET_LOCK_DEPTH" -gt 0 ]; then
-        RESET_LOCK_DEPTH=$((RESET_LOCK_DEPTH + 1))
-        return 0
-    fi
-    acquire_reset_lock || return 1
-    RESET_LOCK_DEPTH=1
-}
-
-finish_reset_update() {
-    [ "$RESET_LOCK_DEPTH" -gt 0 ] || return 0
-    RESET_LOCK_DEPTH=$((RESET_LOCK_DEPTH - 1))
-    if [ "$RESET_LOCK_DEPTH" -eq 0 ]; then
-        release_reset_lock
-    fi
-}
-
-EXPIRY_LOCK_DEPTH=0
-
-begin_expiry_update() {
-    if [ "$EXPIRY_LOCK_DEPTH" -gt 0 ]; then
-        EXPIRY_LOCK_DEPTH=$((EXPIRY_LOCK_DEPTH + 1))
-        return 0
-    fi
-    mkdir -p "$(dirname "$EXPIRY_LOCK_FILE")" || return 1
-    exec 8>"$EXPIRY_LOCK_FILE" || return 1
-    if ! flock -w 15 8; then
-        exec 8>&-
-        return 1
-    fi
-    EXPIRY_LOCK_DEPTH=1
-}
-
-finish_expiry_update() {
-    [ "$EXPIRY_LOCK_DEPTH" -gt 0 ] || return 0
-    EXPIRY_LOCK_DEPTH=$((EXPIRY_LOCK_DEPTH - 1))
-    if [ "$EXPIRY_LOCK_DEPTH" -eq 0 ]; then
+dog_unlock() {
+    [ "$DOG_LOCK_DEPTH" -gt 0 ] || return 0
+    DOG_LOCK_DEPTH=$((DOG_LOCK_DEPTH - 1))
+    if [ "$DOG_LOCK_DEPTH" -eq 0 ]; then
         flock -u 8 2>/dev/null || true
         exec 8>&-
     fi
 }
 
-finish_full_maintenance_update() {
-    # 与导入/卸载的取得顺序严格相反。
-    release_config_lock
-    release_traffic_stats_lock
-    release_cron_update
-    finish_tc_update
-    finish_reset_update
-    finish_expiry_update
+# 在锁内执行一条命令，返回该命令的退出码。
+with_dog_lock() {
+    dog_lock || { echo -e "${RED}另一个 Dog 进程正在修改配置，请稍后再试${NC}" >&2; return 75; }
+    local rc=0
+    "$@" || rc=$?
+    dog_unlock
+    return "$rc"
 }
 
-update_config_file() {
-    local jq_filter="$1"
-    shift
-
-    acquire_config_lock || return 1
-    local temp_file
-    if ! temp_file=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX"); then
-        release_config_lock
-        return 1
+# 把标准输入原子写入目标文件：同目录临时文件 + fsync + rename。
+# 用法：producer | atomic_write <目标> [权限]
+atomic_write() {
+    local target="$1" mode="${2:-600}" dir tmp
+    dir=$(dirname "$target")
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "$dir/.${target##*/}.tmp.XXXXXX") || return 1
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"; return 1
     fi
-    local result=1 changed=false
-    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$temp_file"; then
-        if ! cmp -s "$temp_file" "$CONFIG_FILE"; then changed=true; fi
-        if mv "$temp_file" "$CONFIG_FILE"; then
-            result=0
-        else
-            rm -f "$temp_file"
-        fi
+    chmod "$mode" "$tmp" 2>/dev/null || true
+    sync "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+# 对 JSON 文件执行 jq 变换并原子替换；jq 失败或结果不是对象时保持原文件。
+# 用法：json_update <文件> <jq 过滤器> [jq 参数...]
+json_update() {
+    local file="$1" filter="$2" out
+    shift 2
+    out=$(jq "$@" "$filter" "$file") || return 1
+    jq -e 'type == "object"' <<< "$out" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$out" | atomic_write "$file" 600
+}
+
+# ── 通用工具 ──────────────────────────────────────────────────────
+
+beijing_date() {
+    TZ="$DOG_TZ" date "$@"
+}
+
+get_current_date() {
+    beijing_date +%Y-%m-%d
+}
+
+get_script_exec_path() {
+    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
+        echo "$INSTALLED_SCRIPT_PATH"
     else
-        rm -f "$temp_file"
+        echo "$SCRIPT_PATH"
     fi
-    release_config_lock
-    if [ "$result" -ne 0 ] || [ "$changed" = true ]; then dog_log_event config_update "$result"; fi
-    return "$result"
 }
 
-show_port_list() {
-    local active_ports=($(get_active_ports))
-    if [ ${#active_ports[@]} -eq 0 ]; then
-        echo "暂无监控端口"
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}错误：此脚本需要 root 权限运行${NC}" >&2
+        exit 1
+    fi
+}
+
+is_interactive() {
+    [ "$DOG_NONINTERACTIVE" != "true" ] && [ -t 0 ]
+}
+
+# 询问 y/N；非交互模式（--yes）直接同意。
+confirm() {
+    local prompt="$1" answer=""
+    [ "$DOG_NONINTERACTIVE" = "true" ] && return 0
+    read -r -p "$prompt [y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+pause() {
+    is_interactive || return 0
+    read -r -p "按回车继续..." _ || true
+}
+
+get_network_interfaces() {
+    ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -vx 'lo' || true
+}
+
+get_default_interface() {
+    local dev
+    dev=$(ip -o route show default 2>/dev/null |
+        awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    [ -n "$dev" ] || dev=$(ip -o -6 route show default 2>/dev/null |
+        awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    [ -n "$dev" ] || dev=$(get_network_interfaces | head -n1)
+    if [ -z "$dev" ]; then
+        # 不能猜网卡名：猜错会在错误的设备上重建 HTB。
+        echo "无法确定默认出口网卡，已中止 TC 相关操作" >&2
         return 1
     fi
-
-    echo "当前监控的端口:"
-    for i in "${!active_ports[@]}"; do
-        local port=${active_ports[$i]}
-        local status_label=$(get_port_status_label "$port")
-        echo "$((i+1)). 端口 $port $status_label"
-    done
-    return 0
-}
-
-parse_multi_choice_input() {
-    local input="$1"
-    local max_choice="$2"
-    local -n result_array=$3
-
-    IFS=',' read -ra CHOICES <<< "$input"
-    result_array=()
-
-    for choice in "${CHOICES[@]}"; do
-        choice=$(echo "$choice" | tr -d ' ')
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$max_choice" ]; then
-            if [[ " ${result_array[*]} " != *" $choice "* ]]; then
-                result_array+=("$choice")
-            fi
-        else
-            echo -e "${RED}无效选择: $choice${NC}"
-        fi
-    done
-}
-
-parse_comma_separated_input() {
-    local input="$1"
-    local -n result_array=$2
-
-    IFS=',' read -ra result_array <<< "$input"
-
-    for i in "${!result_array[@]}"; do
-        result_array[$i]=$(echo "${result_array[$i]}" | tr -d ' ')
-    done
-}
-
-# ── 监控单元（端口组）解析 ────────────────────────────────────────
-# 语法（与上游一致）：`;` 分隔独立监控项，`-` 是端口段，
-# `,` 是同一监控项的多个成员——同组共享统计、配额、限速与重置。
-# 一个监控项就是一个 key；成员在 key 内去重并按键值排序，
-# 因此 `443,80` 与 `80,443` 是同一个 key。
-
-is_port_group() {
-    [[ "$1" == *,* ]]
-}
-
-# 端口段与端口组走同一条 TC 限速路径：nft 侧按端口打 meta mark，tc 侧用一条 fw
-# 过滤器按 mark 归入同一个 class。单端口则走 u32/flower 精确匹配。
-# 组内成员既可以是单端口也可以是端口段，靠 port_selectors 逐条展开。
-uses_mark_based_tc_limit() {
-    is_port_range "$1" || is_port_group "$1"
-}
-
-validate_port_spec() {
-    local spec="$1"
-    if is_port_range "$spec"; then
-        local start_port end_port
-        IFS='-' read -r start_port end_port <<< "$spec"
-        if ! [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误：无效端口段 $spec${NC}" >&2
-            return 1
-        fi
-        if [ "$start_port" -gt "$end_port" ]; then
-            echo -e "${RED}错误：端口段 $spec 起始端口大于结束端口${NC}" >&2
-            return 1
-        fi
-        if [ "$start_port" -lt 1 ] || [ "$end_port" -gt 65535 ]; then
-            echo -e "${RED}错误：端口段 $spec 越界，必须在1-65535范围内${NC}" >&2
-            return 1
-        fi
-    elif [[ "$spec" =~ ^[0-9]+$ ]]; then
-        if [ "$spec" -lt 1 ] || [ "$spec" -gt 65535 ]; then
-            echo -e "${RED}错误：端口号 $spec 无效，必须是1-65535之间的数字${NC}" >&2
-            return 1
-        fi
-    else
-        echo -e "${RED}错误：无效的端口格式 $spec${NC}" >&2
-        return 1
-    fi
-    return 0
-}
-
-normalize_unit_key() {
-    local input="$1"
-    input=$(printf '%s' "$input" | tr -d ' ')
-    [[ "$input" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || {
-        echo "错误：监控项包含空成员或无效分隔符" >&2
-        return 1
-    }
-
-    local members=()
-    IFS=',' read -ra members <<< "$input"
-    local -A seen=()
-    local clean=()
-    local m start_port end_port
-
-    for m in "${members[@]}"; do
-        if [ -z "$m" ]; then
-            echo -e "${RED}错误：监控项中存在空的端口成员${NC}" >&2
-            return 1
-        fi
-        validate_port_spec "$m" || return 1
-        # 去掉前导零，避免 080 与 80 被当成两个不同单元
-        if is_port_range "$m"; then
-            IFS='-' read -r start_port end_port <<< "$m"
-            m="$((10#$start_port))-$((10#$end_port))"
-        else
-            m=$((10#$m))
-        fi
-        if [ -z "${seen[$m]:-}" ]; then
-            seen[$m]=1
-            clean+=("$m")
-        fi
-    done
-    unit_intervals_are_disjoint "$(IFS=','; printf '%s' "${clean[*]}")" || {
-        echo "错误：同一监控项的端口范围重叠" >&2
-        return 1
-    }
-
-    if [ "${#clean[@]}" -eq 0 ]; then
-        echo -e "${RED}错误：空监控项${NC}" >&2
-        return 1
-    fi
-    if [ "${#clean[@]}" -eq 1 ]; then
-        printf '%s\n' "${clean[0]}"
-        return 0
-    fi
-    # 按键值排序，让成员顺序不影响 key 的取值
-    printf '%s\n' "${clean[@]}" | sort -t- -k1,1n | paste -sd, -
-}
-
-# 把监控项展开成 nft 规则要逐条匹配的端口/端口段列表。
-# 刻意不用 `read -ra`：read 是 shell 内建，测试常把 read 整体 stub 成空操作，
-# 那样这里会静默拿到空数组，把合法端口当成空项丢掉。改用 IFS 分词。
-port_selectors() {
-    local key="$1"
-    local m
-    local IFS=','
-    for m in $key; do
-        [ -n "$m" ] && printf '%s\n' "$m"
-    done
-}
-
-# 把监控项展开成区间列表（每行 "起始 结束"），供重叠判断使用。
-# 同上，用参数展开代替 read，避免被 stub 掉后静默产出空结果。
-expand_unit_intervals() {
-    local key="$1"
-    local m
-    local start_port
-    local end_port
-    local IFS=','
-    for m in $key; do
-        [ -n "$m" ] || continue
-        if is_port_range "$m"; then
-            start_port="${m%%-*}"
-            end_port="${m##*-}"
-            printf '%s %s\n' "$start_port" "$end_port"
-        else
-            printf '%s %s\n' "$m" "$m"
-        fi
-    done
-}
-
-unit_intervals_are_disjoint() {
-    [[ "$1" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || return 1
-    expand_unit_intervals "$1" | sort -n -k1,1 -k2,2 |
-        awk 'NR > 1 && $1 <= previous { bad=1 } { previous=$2 } END { exit bad ? 1 : 0 }'
-}
-
-parse_monitor_units() {
-    local input="$1"
-    local -n _pmo_units=$2
-
-    _pmo_units=()
-
-    # 用分号分隔；mapfile -d 会保留末尾空字段，便于拦掉 "80;" 这类输入
-    local raw_units=()
-    mapfile -d ';' -t raw_units <<< "$input"
-    local i
-    for ((i = 0; i < ${#raw_units[@]}; i++)); do
-        raw_units[$i]="${raw_units[$i]%$'\n'}"
-    done
-
-    # 注意：这里的局部数组不能叫 keys 之类的常见名。nameref 是按名字动态解析的，
-    # 一旦与调用方传入的变量名同名，赋值会落到这个局部变量上，调用方拿不到结果。
-    local unit_keys=()
-    local ru key
-    for ru in "${raw_units[@]}"; do
-        if [ -z "$(printf '%s' "$ru" | tr -d ' ')" ]; then
-            echo -e "${RED}错误：存在空的监控项${NC}" >&2
-            return 1
-        fi
-        key=$(normalize_unit_key "$ru") || return 1
-        unit_keys+=("$key")
-    done
-
-    if [ "${#unit_keys[@]}" -eq 0 ]; then
-        echo -e "${RED}错误：没有有效的监控项${NC}" >&2
-        return 1
-    fi
-
-    local -A unit_seen=()
-    local k
-    for k in "${unit_keys[@]}"; do
-        if [ -n "${unit_seen[$k]:-}" ]; then
-            echo -e "${RED}错误：监控项 $k 重复${NC}" >&2
-            return 1
-        fi
-        unit_seen[$k]=1
-    done
-
-    _pmo_units=("${unit_keys[@]}")
-    return 0
-}
-
-parse_port_range_input() {
-    local input="$1"
-    local -n result_array=$2
-
-    IFS=',' read -ra PARTS <<< "$input"
-    result_array=()
-
-    for part in "${PARTS[@]}"; do
-        part=$(echo "$part" | tr -d ' ')
-
-        if is_port_range "$part"; then
-            # 端口段：100-200
-            local start_port=$(echo "$part" | cut -d'-' -f1)
-            local end_port=$(echo "$part" | cut -d'-' -f2)
-
-            if [ "$start_port" -gt "$end_port" ]; then
-                echo -e "${RED}错误：端口段 $part 起始端口大于结束端口${NC}"
-                return 1
-            fi
-
-            if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65535 ] || [ "$end_port" -lt 1 ] || [ "$end_port" -gt 65535 ]; then
-                echo -e "${RED}错误：端口段 $part 包含无效端口，必须在1-65535范围内${NC}"
-                return 1
-            fi
-
-            result_array+=("$part")
-
-        elif [[ "$part" =~ ^[0-9]+$ ]]; then
-            if [ "$part" -ge 1 ] && [ "$part" -le 65535 ]; then
-                result_array+=("$part")
-            else
-                echo -e "${RED}错误：端口号 $part 无效，必须是1-65535之间的数字${NC}"
-                return 1
-            fi
-        else
-            echo -e "${RED}错误：无效的端口格式 $part${NC}"
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-expand_single_value_to_array() {
-    local -n source_array=$1
-    local target_size=$2
-
-    if [ ${#source_array[@]} -eq 1 ]; then
-        local single_value="${source_array[0]}"
-        source_array=()
-        for ((i=0; i<target_size; i++)); do
-            source_array+=("$single_value")
-        done
-    fi
-}
-
-
-get_beijing_month_year() {
-    local current_day=$(TZ='Asia/Shanghai' date +%d | sed 's/^0//')
-    local current_month=$(TZ='Asia/Shanghai' date +%m | sed 's/^0//')
-    local current_year=$(TZ='Asia/Shanghai' date +%Y)
-    echo "$current_day $current_month $current_year"
-}
-
-get_billing_rule_multiplier() {
-    local billing_mode="${1:-single}"
-    if [ "$billing_mode" = "double" ]; then
-        echo 2
-    else
-        echo 1
-    fi
-}
-
-get_counter_rule_multiplier_from_count() {
-    local rule_count="${1:-0}"
-    local fallback_multiplier="${2:-1}"
-    [[ "$fallback_multiplier" =~ ^[0-9]+$ ]] || fallback_multiplier=1
-    [ "$fallback_multiplier" -ge 1 ] || fallback_multiplier=1
-    if [[ "$rule_count" =~ ^[0-9]+$ ]] && [ "$rule_count" -ge 4 ] && [ $((rule_count % 4)) -eq 0 ]; then
-        echo $((rule_count / 4))
-    else
-        # 部分规则损坏时无法从数量推断历史倍率，保留当前模式倍率可避免修复时再次放大 counter。
-        echo "$fallback_multiplier"
-    fi
-}
-
-scale_counter_for_rule_multiplier() {
-    local counter_bytes="${1:-0}"
-    local source_multiplier="${2:-1}"
-    local target_multiplier="${3:-1}"
-    [[ "$counter_bytes" =~ ^[0-9]+$ ]] || counter_bytes=0
-    [[ "$source_multiplier" =~ ^[0-9]+$ ]] || source_multiplier=1
-    [[ "$target_multiplier" =~ ^[0-9]+$ ]] || target_multiplier=1
-    [ "$source_multiplier" -ge 1 ] || source_multiplier=1
-    [ "$target_multiplier" -ge 1 ] || target_multiplier=1
-    echo $((counter_bytes * target_multiplier / source_multiplier))
-}
-
-# 监控项包含多少个端口成员（单端口与端口段都算 1 个）
-count_unit_members() {
-    local key="$1"
-    local n=0 m
-    local members=()
-    IFS=',' read -ra members <<< "$key"
-    for m in "${members[@]}"; do
-        [ -n "$m" ] && n=$((n + 1))
-    done
-    printf '%s\n' "$n"
-}
-
-get_expected_counter_rule_count() {
-    local billing_mode="${1:-single}"
-    local port="${2:-}"
-    local member_count=1
-    [ -n "$port" ] && member_count=$(count_unit_members "$port")
-    local multiplier
-    multiplier=$(get_billing_rule_multiplier "$billing_mode")
-    [[ "$member_count" =~ ^[1-9][0-9]*$ ]] || member_count=1
-    # 端口组的每个成员各自生成一组规则，但它们共用同一个 counter，
-    # 所以期望条数要按成员数放大。
-    echo $((4 * multiplier * member_count))
-}
-
-get_expected_quota_rule_count() {
-    local billing_mode="${1:-single}"
-    local port="${2:-}"
-    local member_count=1
-    [ -n "$port" ] && member_count=$(count_unit_members "$port")
-    local multiplier
-    multiplier=$(get_billing_rule_multiplier "$billing_mode")
-    [[ "$member_count" =~ ^[1-9][0-9]*$ ]] || member_count=1
-    echo $((8 * multiplier * member_count))
-}
-
-get_nftables_counter_data() {
-    local port="$1"
-    local table_name family prefix input_output output_output input_bytes output_bytes
-
-    table_name=$(jq -er '.nftables.table_name | select(type == "string" and length > 0)' "$CONFIG_FILE" 2>/dev/null) || return 1
-    family=$(jq -er '.nftables.family | select(type == "string" and length > 0)' "$CONFIG_FILE" 2>/dev/null) || return 1
-    prefix=$(get_port_counter_prefix "$port") || return 1
-    input_output=$(nft list counter "$family" "$table_name" "${prefix}_in" 2>/dev/null) || return 1
-    output_output=$(nft list counter "$family" "$table_name" "${prefix}_out" 2>/dev/null) || return 1
-    input_bytes=$(printf '%s\n' "$input_output" |
-        sed -n 's/.*[[:space:]]bytes \([0-9][0-9]*\).*/\1/p' | head -n1)
-    output_bytes=$(printf '%s\n' "$output_output" |
-        sed -n 's/.*[[:space:]]bytes \([0-9][0-9]*\).*/\1/p' | head -n1)
-    [[ "$input_bytes" =~ ^[0-9]+$ ]] || return 1
-    [[ "$output_bytes" =~ ^[0-9]+$ ]] || return 1
-    printf '%s %s\n' "$input_bytes" "$output_bytes"
-}
-
-NFT_COUNTER_INPUT=""
-NFT_COUNTER_OUTPUT=""
-
-read_nftables_counter_data() {
-    local port="$1"
-    local counter_data input_bytes output_bytes extra
-
-    NFT_COUNTER_INPUT=""
-    NFT_COUNTER_OUTPUT=""
-    counter_data=$(get_nftables_counter_data "$port") || return 1
-    read -r input_bytes output_bytes extra <<< "$counter_data"
-    [[ "$input_bytes" =~ ^[0-9]+$ ]] || return 1
-    [[ "$output_bytes" =~ ^[0-9]+$ ]] || return 1
-    [ -z "${extra:-}" ] || return 1
-    NFT_COUNTER_INPUT="$input_bytes"
-    NFT_COUNTER_OUTPUT="$output_bytes"
-}
-
-get_nftables_quota_used() {
-    local port="$1"
-    local table_name
-    local family
-    local quota_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    quota_name=$(get_port_quota_name "$port")
-
-    local quota_used
-    quota_used=$(nft -j list quota "$family" "$table_name" "$quota_name" 2>/dev/null |
-        jq -r '.nftables[] | select(.quota != null) | .quota.used // 0' 2>/dev/null |
-        head -n1)
-    if [[ "$quota_used" =~ ^[0-9]+$ ]]; then
-        echo "$quota_used"
-        return 0
-    fi
-
-    local quota_output
-    quota_output=$(nft list quota "$family" "$table_name" "$quota_name" 2>/dev/null) || return 1
-    quota_used=$(printf '%s\n' "$quota_output" |
-        sed -n 's/.*used \([0-9][0-9]*\) bytes.*/\1/p' |
-        head -n1)
-    if [[ "$quota_used" =~ ^[0-9]+$ ]]; then
-        echo "$quota_used"
-        return 0
-    fi
-    # 文本输出省略 used 字段时表示尚未产生流量。
-    echo 0
-}
-
-get_nftables_quota_limit_bytes() {
-    local port="$1"
-    local table_name
-    local family
-    local quota_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    quota_name=$(get_port_quota_name "$port")
-
-    local quota_bytes
-    quota_bytes=$(nft -j list quota "$family" "$table_name" "$quota_name" 2>/dev/null |
-        jq -r '.nftables[] | select(.quota != null) | .quota.bytes // empty' 2>/dev/null |
-        head -n1)
-    [[ "$quota_bytes" =~ ^[0-9]+$ ]] || return 1
-    echo "$quota_bytes"
-}
-
-nftables_quota_limit_matches() {
-    local port="$1"
-    local quota_limit="$2"
-    local expected_bytes
-    local actual_bytes
-    expected_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-    [[ "$expected_bytes" =~ ^[0-9]+$ ]] && [ "$expected_bytes" -gt 0 ] || return 1
-    actual_bytes=$(get_nftables_quota_limit_bytes "$port") || return 1
-    [ "$actual_bytes" -eq "$expected_bytes" ]
-}
-
-get_port_runtime_usage_snapshot() {
-    local port="$1"
-    local table_name
-    local family
-    local prefix
-    local snapshot
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    prefix=$(get_port_counter_prefix "$port")
-
-    snapshot=$(nft -j list table "$family" "$table_name" 2>/dev/null |
-        jq -r \
-            --arg input "${prefix}_in" \
-            --arg output "${prefix}_out" \
-            --arg quota "${prefix}_quota" '
-            ([.nftables[] | .counter? |
-                select(type == "object" and .name == $input) | .bytes // 0][0] // -1) as $in |
-            ([.nftables[] | .counter? |
-                select(type == "object" and .name == $output) | .bytes // 0][0] // -1) as $out |
-            ([.nftables[] | .quota? |
-                select(type == "object" and .name == $quota) | .used // 0][0] // -1) as $used |
-            "\($in) \($out) \($used)"
-        ') || return 1
-    [[ "$snapshot" =~ ^[0-9]+\ [0-9]+\ -?[0-9]+$ ]] || return 1
-    echo "$snapshot"
-}
-
-port_counter_quota_usage_consistent() {
-    local port="$1"
-    [ -d "$RESET_LOCK_DIR" ] && return 0
-    [ "$(get_quota_enabled "$port")" = "true" ] || return 0
-    local quota_limit
-    quota_limit=$(get_quota_limit "$port")
-    [ "$quota_limit" != "unlimited" ] || return 0
-
-    local first_input first_output second_input second_output
-    local quota_used
-    read_nftables_counter_data "$port" || return 1
-    first_input="$NFT_COUNTER_INPUT"
-    first_output="$NFT_COUNTER_OUTPUT"
-    quota_used=$(get_nftables_quota_used "$port") || return 1
-    read_nftables_counter_data "$port" || return 1
-    second_input="$NFT_COUNTER_INPUT"
-    second_output="$NFT_COUNTER_OUTPUT"
-    local first_total=$((first_input + first_output))
-    local second_total=$((second_input + second_output))
-    local lower_total="$first_total"
-    local upper_total="$second_total"
-    if [ "$lower_total" -gt "$upper_total" ]; then
-        lower_total="$second_total"
-        upper_total="$first_total"
-    fi
-
-    # quota 在两次 counter 读取之间采样；1MiB 仅用于容纳单个大包/GSO 与命令读取抖动。
-    local tolerance=$((1024 * 1024))
-    [ $((quota_used + tolerance)) -ge "$lower_total" ] || return 1
-
-    local limit_bytes
-    limit_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-    if [[ "$limit_bytes" =~ ^[0-9]+$ ]] && [ "$quota_used" -lt "$limit_bytes" ]; then
-        [ "$quota_used" -le $((upper_total + tolerance)) ] || return 1
-    fi
-}
-
-port_counter_objects_exist() {
-    local port="$1"
-    local table_name
-    local family
-    local prefix
-    table_name=$(jq -r '.nftables.table_name // "port_traffic_monitor"' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE")
-    prefix=$(get_port_counter_prefix "$port")
-    nft list counter "$family" "$table_name" "${prefix}_in" >/dev/null 2>&1 &&
-        nft list counter "$family" "$table_name" "${prefix}_out" >/dev/null 2>&1
-}
-
-runtime_counter_objects_complete() {
-    local active_ports=()
-    local ports_output
-    ports_output=$(get_active_ports 2>/dev/null) || return 1
-    if [ -n "$ports_output" ]; then
-        mapfile -t active_ports <<< "$ports_output"
-    fi
-    local port
-    for port in "${active_ports[@]}"; do
-        port_counter_objects_exist "$port" || return 1
-
-        # 对象还在不等于计数还在：规则被单独删掉时 counter 对象会残留，
-        # 流量从此不再累加，推送值冻结在旧数（或读到 0），而对象检查看不出来。
-        # 这里按预期条数复核引用该 counter 的规则，与 repair_port_traffic_rules 用同一判据。
-        local billing_mode expected_rule_count
-        billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-        expected_rule_count=$(get_expected_counter_rule_count "$billing_mode" "$port")
-        [ "$(count_counter_rules "$port" "in")" -eq "$expected_rule_count" ] || return 1
-        [ "$(count_counter_rules "$port" "out")" -eq "$expected_rule_count" ] || return 1
-    done
-}
-
-write_traffic_backup_metadata() {
-    local data_file="$1"
-    [ -f "$data_file" ] || return 1
-
-    local current_model
-    current_model=$(jq -r '.global.traffic_accounting_model // ""' "$CONFIG_FILE" 2>/dev/null || true)
-    [ "$current_model" = "$TRAFFIC_ACCOUNTING_MODEL" ] || return 0
-
-    local metadata_temp
-    metadata_temp=$(mktemp "$CONFIG_DIR/.traffic_data.metadata.XXXXXX") || return 1
-    if ! jq \
-        --arg model "$TRAFFIC_ACCOUNTING_MODEL" \
-        --slurpfile config "$CONFIG_FILE" \
-        '
-        ._meta = {
-            schema_version: 2,
-            traffic_accounting_model: $model,
-            port_multipliers: (
-                ($config[0].ports // {}) |
-                with_entries(
-                    .value = if (.value.billing_mode // "double") == "double" then
-                        {input: 2, output: 2}
-                    else
-                        {input: 1, output: 1}
-                    end
-                )
-            )
-        }
-        ' "$data_file" > "$metadata_temp" || ! mv "$metadata_temp" "$data_file"; then
-        rm -f "$metadata_temp"
-        return 1
-    fi
-}
-
-get_traffic_backup_rule_multiplier() {
-    local port="$1"
-    local direction="$2"
-    local target_multiplier="$3"
-    [ -f "$TRAFFIC_DATA_FILE" ] || return 1
-
-    local backup_multiplier
-    backup_multiplier=$(jq -r \
-        --arg port "$port" \
-        --arg direction "$direction" \
-        --arg model "$TRAFFIC_ACCOUNTING_MODEL" \
-        --argjson target "$target_multiplier" \
-        '
-        if ((._meta.port_multipliers[$port][$direction] // 0) | type) == "number" and
-           (._meta.port_multipliers[$port][$direction] // 0) >= 1 then
-            ._meta.port_multipliers[$port][$direction]
-        elif (._meta.traffic_accounting_model // "") == $model then
-            $target
-        else
-            empty
-        end
-        ' "$TRAFFIC_DATA_FILE" 2>/dev/null || true)
-    [[ "$backup_multiplier" =~ ^[0-9]+$ ]] && [ "$backup_multiplier" -ge 1 ] || return 1
-    echo "$backup_multiplier"
-}
-
-resolve_legacy_counter_multiplier() {
-    local port="$1"
-    local direction="$2"
-    local rule_count="$3"
-    local target_multiplier="$4"
-    local counter_bytes="$5"
-
-    if [[ "$rule_count" =~ ^[0-9]+$ ]] && [ "$rule_count" -ge 4 ] && [ $((rule_count % 4)) -eq 0 ]; then
-        echo $((rule_count / 4))
-        return 0
-    fi
-    if [[ "$rule_count" =~ ^[0-9]+$ ]] && [ "$rule_count" -gt 0 ]; then
-        echo "$target_multiplier"
-        return 0
-    fi
-    if get_traffic_backup_rule_multiplier "$port" "$direction" "$target_multiplier"; then
-        return 0
-    fi
-    if [[ "$counter_bytes" =~ ^[0-9]+$ ]] && [ "$counter_bytes" -eq 0 ]; then
-        echo "$target_multiplier"
-        return 0
-    fi
-    return 1
-}
-
-
-
-save_traffic_data_locked() {
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-
-    if [ ${#active_ports[@]} -eq 0 ]; then
-        rm -f "$TRAFFIC_DATA_FILE"
-        return 0
-    fi
-
-    local port
-    for port in "${active_ports[@]}"; do
-        if ! port_counter_objects_exist "$port"; then
-            return 1
-        fi
-    done
-
-    mkdir -p "$CONFIG_DIR"
-    local entries_file
-    local temp_file
-    entries_file=$(mktemp "$CONFIG_DIR/.traffic_data.entries.XXXXXX") || return 1
-    temp_file=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX") || {
-        rm -f "$entries_file"
-        return 1
-    }
-    local backup_time
-    backup_time=$(get_beijing_time -Iseconds)
-
-    for port in "${active_ports[@]}"; do
-        if ! read_nftables_counter_data "$port"; then
-            rm -f "$entries_file" "$temp_file"
-            return 1
-        fi
-        local current_input="$NFT_COUNTER_INPUT"
-        local current_output="$NFT_COUNTER_OUTPUT"
-        jq -cn \
-            --arg port "$port" \
-            --arg time "$backup_time" \
-            --argjson input "$current_input" \
-            --argjson output "$current_output" \
-            '{key:$port,value:{input:$input,output:$output,backup_time:$time}}' >> "$entries_file" || {
-            rm -f "$entries_file" "$temp_file"
-            return 1
-        }
-    done
-
-    if ! jq -s 'from_entries' "$entries_file" > "$temp_file" ||
-       ! write_traffic_backup_metadata "$temp_file" ||
-       ! mv "$temp_file" "$TRAFFIC_DATA_FILE"; then
-        rm -f "$entries_file" "$temp_file"
-        return 1
-    fi
-    chmod 600 "$TRAFFIC_DATA_FILE" 2>/dev/null || true
-    rm -f "$entries_file"
-}
-
-save_traffic_data() {
-    if directory_lock_owned_by_current_process "$TRAFFIC_STATS_LOCK_DIR"; then
-        save_traffic_data_locked
-        return $?
-    fi
-    acquire_traffic_stats_lock || return 1
-    local result=0
-    save_traffic_data_locked || result=$?
-    release_traffic_stats_lock
-    return "$result"
-}
-
-setup_exit_hooks() {
-    # 进程退出时自动保存数据，避免重启丢失
-    trap 'save_traffic_data_on_exit' EXIT
-    trap 'save_traffic_data_on_exit; exit 1' INT TERM
-}
-
-save_traffic_data_on_exit() {
-    save_traffic_data >/dev/null 2>&1
-}
-
-restore_monitoring_if_needed() {
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-
-    if [ ${#active_ports[@]} -eq 0 ]; then
-        return 0
-    fi
-
-    local need_restore=false
-
-    local port
-    for port in "${active_ports[@]}"; do
-        if ! port_runtime_rules_complete "$port"; then
-            need_restore=true
-            break
-        fi
-    done
-
-    if [ "$need_restore" = "true" ]; then
-        restore_runtime_state
-    fi
-}
-
-restore_traffic_data_from_backup() {
-    if [ ! -f "$TRAFFIC_DATA_FILE" ]; then
-        return 0
-    fi
-
-    if ! jq -e 'type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
-        return 1
-    fi
-
-    local backup_ports=()
-    mapfile -t backup_ports < <(jq -r 'keys[]' "$TRAFFIC_DATA_FILE" 2>/dev/null | tr -d '\r' || true)
-    local failed=false
-
-    local port
-    for port in "${backup_ports[@]}"; do
-        if ! jq -e --arg port "$port" '.ports[$port] != null' "$CONFIG_FILE" >/dev/null 2>&1; then
-            continue
-        fi
-        local backup_input
-        local backup_output
-        backup_input=$(jq -r --arg port "$port" '.[$port].input // 0' "$TRAFFIC_DATA_FILE" 2>/dev/null || echo "0")
-        backup_output=$(jq -r --arg port "$port" '.[$port].output // 0' "$TRAFFIC_DATA_FILE" 2>/dev/null || echo "0")
-        [[ "$backup_input" =~ ^[0-9]+$ ]] || backup_input=0
-        [[ "$backup_output" =~ ^[0-9]+$ ]] || backup_output=0
-
-        if ! restore_counter_value "$port" "$backup_input" "$backup_output"; then
-            failed=true
-        fi
-    done
-
-    [ "$failed" = "false" ]
-}
-
-restore_counter_value() {
-    local port=$1
-    local target_input=$2
-    local target_output=$3
-    local table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-
-    [[ "$target_input" =~ ^[0-9]+$ ]] || return 1
-    [[ "$target_output" =~ ^[0-9]+$ ]] || return 1
-
-    local prefix
-    prefix=$(get_port_counter_prefix "$port")
-    nft add counter "$family" "$table_name" "${prefix}_in" { packets 0 bytes "$target_input" } 2>/dev/null || true
-    nft add counter "$family" "$table_name" "${prefix}_out" { packets 0 bytes "$target_output" } 2>/dev/null || true
-
-    read_nftables_counter_data "$port" || return 1
-    [ "$NFT_COUNTER_INPUT" = "$target_input" ] && [ "$NFT_COUNTER_OUTPUT" = "$target_output" ]
-}
-
-restore_all_monitoring_rules() {
-    restore_runtime_state
-}
-
-restore_port_counters_from_backup() {
-    local port="$1"
-    acquire_traffic_stats_lock || return 1
-
-    # 读不到现有计数不等于出错：规则可能从未建立过（全新装机、nft 被外部清空、
-    # 只恢复了配置而运行态没有）。此时以 0 为基准，再让下面的灾备值和
-    # rebuild_port_counter_objects 去重建规则。
-    # 绝不能因为读不到就直接 return 1：那会让 restore_runtime_state 失败、
-    # 连带 init_config 失败，最后连菜单都进不去，而且没有任何命令能修回来。
-    #
-    # 数据安全：规则存在时本函数行为与以前完全一致；灾备值只用于“取较大值”，
-    # 永远不会用更小的数覆盖当前累计。
-    local target_input=0
-    local target_output=0
-    if read_nftables_counter_data "$port"; then
-        target_input="$NFT_COUNTER_INPUT"
-        target_output="$NFT_COUNTER_OUTPUT"
-    fi
-
-    if [ -f "$TRAFFIC_DATA_FILE" ] && jq -e --arg port "$port" '.[$port] | type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
-        local backup_input
-        local backup_output
-        backup_input=$(jq -r --arg port "$port" '.[$port].input // 0' "$TRAFFIC_DATA_FILE")
-        backup_output=$(jq -r --arg port "$port" '.[$port].output // 0' "$TRAFFIC_DATA_FILE")
-        [[ "$backup_input" =~ ^[0-9]+$ ]] || backup_input=0
-        [[ "$backup_output" =~ ^[0-9]+$ ]] || backup_output=0
-        [ "$backup_input" -gt "$target_input" ] && target_input=$backup_input
-        [ "$backup_output" -gt "$target_output" ] && target_output=$backup_output
-    fi
-
-    local result=0
-    rebuild_port_counter_objects \
-        "$port" "$target_input" "$target_output" rebuild || result=$?
-    release_traffic_stats_lock
-    return "$result"
-}
-
-port_runtime_rules_complete() {
-    local port="$1"
-    port_counter_objects_exist "$port" || return 1
-
-    local billing_mode
-    billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE")
-    local expected_counter_count
-    expected_counter_count=$(get_expected_counter_rule_count "$billing_mode" "$port")
-    [ "$(count_counter_rules "$port" in)" -eq "$expected_counter_count" ] || return 1
-    [ "$(count_counter_rules "$port" out)" -eq "$expected_counter_count" ] || return 1
-
-    local expected_quota_count=0
-    local quota_enabled
-    local monthly_limit
-    quota_enabled=$(jq -r --arg port "$port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE")
-    monthly_limit=$(jq -r --arg port "$port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE")
-    if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ]; then
-        expected_quota_count=$(get_expected_quota_rule_count "$billing_mode" "$port")
-    fi
-    [ "$(count_quota_rules "$port")" -eq "$expected_quota_count" ] || return 1
-    if [ "$expected_quota_count" -gt 0 ]; then
-        nftables_quota_limit_matches "$port" "$monthly_limit" || return 1
-    else
-        nftables_quota_is_absent "$port" || return 1
-    fi
-    port_expiry_rules_complete "$port"
-}
-
-restore_runtime_state() {
-    local include_tc="${1:-true}"
-    case "$include_tc" in
-        true|false) ;;
-        *) return 2 ;;
-    esac
-    validate_config_file "$CONFIG_FILE" >/dev/null || return 1
-    init_nftables || return 1
-    local convert_legacy_multiplier=false
-    if [ "$(jq -r '.global.traffic_accounting_model // ""' "$CONFIG_FILE" 2>/dev/null || true)" != "$TRAFFIC_ACCOUNTING_MODEL" ]; then
-        convert_legacy_multiplier=true
-    fi
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local failed=false
-    local port
-    local tc_ports=()
-    local tc_limits=()
-
-    if ! reconcile_orphaned_runtime_objects; then
-        log_notification "orphaned nftables runtime objects could not be reconciled"
-        failed=true
-    fi
-
-    for port in "${active_ports[@]}"; do
-        if ! port_counter_objects_exist "$port"; then
-            if ! restore_port_counters_from_backup "$port"; then
-                failed=true
-                continue
-            fi
-        fi
-
-        if ! repair_port_traffic_rules "$port" false "$convert_legacy_multiplier" >/dev/null 2>&1 ||
-           ! repair_port_quota_rules "$port" >/dev/null 2>&1 ||
-           ! sync_port_expiry_state "$port" >/dev/null 2>&1; then
-            failed=true
-            continue
-        fi
-
-        local limit_enabled
-        local rate_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        if [ "$include_tc" = "true" ] &&
-           [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
-            local tc_limit
-            tc_limit=$(convert_bandwidth_to_tc "$rate_limit")
-            if [ -n "$tc_limit" ]; then
-                tc_ports+=("$port")
-                tc_limits+=("$tc_limit")
-            fi
-        fi
-    done
-
-    if [ ${#tc_ports[@]} -gt 0 ]; then
-        if begin_tc_update; then
-            local restore_interface
-            restore_interface=$(get_default_interface 2>/dev/null || true)
-            # 先在完整旧层级仍可验证时认领/规范化，再删除端口对象。否则从
-            # v1.5.2 直接升级时会先销毁归属证据，导致后续安全检查拒绝恢复。
-            if [ -z "$restore_interface" ] ||
-               ! ensure_owned_tc_hierarchy_locked "$restore_interface"; then
-                failed=true
-            else
-                local tc_index
-                for tc_index in "${!tc_ports[@]}"; do
-                    remove_tc_limit_locked "${tc_ports[$tc_index]}" >/dev/null 2>&1 || true
-                    apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}" >/dev/null 2>&1 || failed=true
-                done
-            fi
-            if [ "$failed" = "true" ] && [ "$TC_UPDATE_MIGRATED_LEGACY_TBF" = "true" ]; then
-                local rollback_interface
-                rollback_interface=$(get_default_interface 2>/dev/null || true)
-                if [ -n "$rollback_interface" ]; then
-                    rollback_legacy_trafficcop_tbf "$rollback_interface" >/dev/null 2>&1 || true
-                fi
-            fi
-            finish_tc_update
-        else
-            log_notification "无法取得共享TC锁，已停止恢复端口限速"
-            failed=true
-        fi
-    fi
-    if [ "$failed" = true ]; then dog_log_event runtime_restore 1; else dog_log_event runtime_restore 0; fi
-    [ "$failed" = "false" ]
-}
-
-calculate_total_traffic() {
-    local input_bytes=$1
-    local output_bytes=$2
-    # 计费倍率已经由 nftables 规则体现：双向每个方向 ×2，单向每个方向 ×1。
-    echo $((input_bytes + output_bytes))
-}
-
-extract_hour_minute_from_iso() {
-    local time_value="$1"
-    if [[ "$time_value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T([0-9]{2}):([0-9]{2}) ]]; then
-        echo "$((10#${BASH_REMATCH[1]})) $((10#${BASH_REMATCH[2]}))"
-        return 0
-    fi
-    return 1
-}
-
-should_carry_cross_day_snapshot_delta() {
-    local state_date="$1"
-    local state_time="$2"
-    local snapshot_date="$3"
-    local snapshot_time="$4"
-
-    is_valid_date "$state_date" || return 1
-    [ "$(add_days_to_date "$snapshot_date" -1 2>/dev/null || true)" = "$state_date" ] || return 1
-    [[ "$state_time" == "$state_date"T* ]] || return 1
-    [[ "$snapshot_time" == "$snapshot_date"T* ]] || return 1
-
-    local last_hm=()
-    local current_hm=()
-    read -r -a last_hm < <(extract_hour_minute_from_iso "$state_time") || return 1
-    read -r -a current_hm < <(extract_hour_minute_from_iso "$snapshot_time") || return 1
-
-    [ "${last_hm[0]}" -eq 23 ] || return 1
-    [ "${last_hm[1]}" -eq 59 ] || return 1
-    [ "${current_hm[0]}" -eq 0 ] || return 1
-    [ "${current_hm[1]}" -eq 0 ] || return 1
-}
-
-TRAFFIC_STATS_LOCK_DEPTH=0
-
-acquire_traffic_stats_lock() {
-    if [ "$TRAFFIC_STATS_LOCK_DEPTH" -gt 0 ]; then
-        TRAFFIC_STATS_LOCK_DEPTH=$((TRAFFIC_STATS_LOCK_DEPTH + 1))
-        return 0
-    fi
-    acquire_directory_lock "$TRAFFIC_STATS_LOCK_DIR" || return 1
-    TRAFFIC_STATS_LOCK_DEPTH=1
-}
-
-release_traffic_stats_lock() {
-    [ "$TRAFFIC_STATS_LOCK_DEPTH" -gt 0 ] || return 0
-    TRAFFIC_STATS_LOCK_DEPTH=$((TRAFFIC_STATS_LOCK_DEPTH - 1))
-    if [ "$TRAFFIC_STATS_LOCK_DEPTH" -eq 0 ]; then
-        release_directory_lock "$TRAFFIC_STATS_LOCK_DIR"
-    fi
-}
-
-ensure_traffic_stats_file() {
-    mkdir -p "$CONFIG_DIR"
-    if [ ! -f "$TRAFFIC_STATS_FILE" ]; then
-        printf '{"last_snapshot":{},"daily":{}}\n' > "$TRAFFIC_STATS_FILE"
-        return 0
-    fi
-    if ! jq empty "$TRAFFIC_STATS_FILE" >/dev/null 2>&1; then
-        local corrupt_file="${TRAFFIC_STATS_FILE}.corrupt.$(date +%s).${BASHPID:-$$}"
-        mv "$TRAFFIC_STATS_FILE" "$corrupt_file" || return 1
-        chmod 600 "$corrupt_file" 2>/dev/null || true
-        return 1
-    fi
-
-    if ! jq 'has("last_snapshot") and has("daily")' "$TRAFFIC_STATS_FILE" 2>/dev/null | grep -q true; then
-        local temp_file
-        temp_file=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX")
-        if jq '
-            .last_snapshot = (.last_snapshot // {}) |
-            .daily = (.daily // {})
-        ' "$TRAFFIC_STATS_FILE" > "$temp_file"; then
-            mv "$temp_file" "$TRAFFIC_STATS_FILE"
-        else
-            rm -f "$temp_file"
-            return 1
-        fi
-    fi
-}
-
-record_traffic_snapshot() {
-    [ -f "$CONFIG_FILE" ] || return 0
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    [ ${#active_ports[@]} -gt 0 ] || return 0
-
-    local port
-    for port in "${active_ports[@]}"; do
-        port_counter_objects_exist "$port" || return 1
-    done
-
-    acquire_traffic_stats_lock || return 1
-    if ! ensure_traffic_stats_file; then
-        release_traffic_stats_lock
-        return 1
-    fi
-
-    local snapshot_date
-    snapshot_date=$(get_current_date)
-    local snapshot_time
-    snapshot_time=$(get_beijing_time -Iseconds)
-    local retention_days
-    retention_days=$(jq -r --argjson fallback "$DEFAULT_TRAFFIC_RETENTION_DAYS" \
-        '.global.data_retention_days // $fallback' "$CONFIG_FILE" 2>/dev/null || echo "$DEFAULT_TRAFFIC_RETENTION_DAYS")
-    if ! [[ "$retention_days" =~ ^[0-9]+$ ]] || [ "$retention_days" -lt 1 ] || [ "$retention_days" -gt 3650 ]; then
-        retention_days=$DEFAULT_TRAFFIC_RETENTION_DAYS
-    fi
-    local retention_cutoff
-    retention_cutoff=$(add_days_to_date "$snapshot_date" "-$retention_days")
-
-    local updates_file
-    local stats_temp
-    local backup_temp
-    local states_file
-    updates_file=$(mktemp "$CONFIG_DIR/.traffic_snapshot.updates.XXXXXX") || {
-        release_traffic_stats_lock
-        return 1
-    }
-    stats_temp=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX") || {
-        rm -f "$updates_file"
-        release_traffic_stats_lock
-        return 1
-    }
-    backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX") || {
-        rm -f "$updates_file" "$stats_temp"
-        release_traffic_stats_lock
-        return 1
-    }
-    states_file=$(mktemp "$CONFIG_DIR/.traffic_snapshot.states.XXXXXX") || {
-        rm -f "$updates_file" "$stats_temp" "$backup_temp"
-        release_traffic_stats_lock
-        return 1
-    }
-
-    # 一次读取全部端口的历史状态，避免端口数和历史天数增大时反复解析同一个 JSON。
-    local ports_json
-    ports_json=$(printf '%s\n' "${active_ports[@]}" |
-        jq -Rsc 'split("\n") | map(select(length > 0))') || {
-        rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-        release_traffic_stats_lock
-        return 1
-    }
-    if ! jq -r --arg date "$snapshot_date" --argjson ports "$ports_json" '
-        . as $root |
-        $ports[] as $port |
-        ($root.state[$port] // {}) as $s |
-        ($s.date // "") as $state_date |
-        [
-            $state_date,
-            ($s.time // $root.last_snapshot[$port].time // ""),
-            ($s.input_base // 0),
-            ($s.output_base // 0),
-            ($s.input_offset // 0),
-            ($s.output_offset // 0),
-            ($s.last_input // 0),
-            ($s.last_output // 0),
-            ($root.daily[$port][$date].input // 0),
-            ($root.daily[$port][$date].output // 0),
-            ($root.daily[$port][$state_date].input // 0),
-            ($root.daily[$port][$state_date].output // 0)
-        ] | map(tostring) | join("|")
-    ' "$TRAFFIC_STATS_FILE" > "$states_file"; then
-        rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-        release_traffic_stats_lock
-        return 1
-    fi
-
-    exec 3< "$states_file"
-    for port in "${active_ports[@]}"; do
-        if ! read_nftables_counter_data "$port"; then
-            exec 3<&-
-            rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-            release_traffic_stats_lock
-            return 1
-        fi
-        local current_input="$NFT_COUNTER_INPUT"
-        local current_output="$NFT_COUNTER_OUTPUT"
-
-        local snapshot_state
-        if ! IFS= read -r snapshot_state <&3; then
-            exec 3<&-
-            rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-            release_traffic_stats_lock
-            return 1
-        fi
-        local state_date state_time input_base output_base input_offset output_offset
-        local last_input last_output existing_input existing_output previous_input previous_output
-        IFS='|' read -r state_date state_time input_base output_base input_offset output_offset \
-            last_input last_output existing_input existing_output previous_input previous_output <<< "$snapshot_state"
-        local has_state=false
-        if [ "$state_date" = "$snapshot_date" ]; then
-            has_state=true
-        fi
-
-        for value_name in input_base output_base input_offset output_offset last_input last_output \
-            existing_input existing_output previous_input previous_output current_input current_output; do
-            local value="${!value_name}"
-            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-                printf -v "$value_name" '%s' 0
-            fi
-        done
-
-        local rollover_date=""
-        local rollover_input=0
-        local rollover_output=0
-
-        if [ "$has_state" != "true" ]; then
-            local cross_day_input=0
-            local cross_day_output=0
-            if is_valid_date "$state_date" && [ "$state_date" != "$snapshot_date" ] &&
-               date_le "$state_date" "$snapshot_date"; then
-                if [ "$current_input" -ge "$last_input" ]; then
-                    cross_day_input=$((current_input - last_input))
-                fi
-                if [ "$current_output" -ge "$last_output" ]; then
-                    cross_day_output=$((current_output - last_output))
-                fi
-            fi
-            if should_carry_cross_day_snapshot_delta "$state_date" "$state_time" "$snapshot_date" "$snapshot_time"; then
-                if [ "$cross_day_input" -gt 0 ] || [ "$cross_day_output" -gt 0 ]; then
-                    rollover_date="$state_date"
-                    rollover_input=$((previous_input + cross_day_input))
-                    rollover_output=$((previous_output + cross_day_output))
-                fi
-            elif [ "$cross_day_input" -gt 0 ] || [ "$cross_day_output" -gt 0 ]; then
-                # 无法精确拆分跨日区间时归入当前日，保留总量且避免污染已结束的账期。
-                existing_input=$((existing_input + cross_day_input))
-                existing_output=$((existing_output + cross_day_output))
-            fi
-            input_base="$current_input"
-            output_base="$current_output"
-            input_offset="$existing_input"
-            output_offset="$existing_output"
-            last_input="$current_input"
-            last_output="$current_output"
-        elif [ "$current_input" -lt "$last_input" ]; then
-            input_offset="$existing_input"
-            input_base=0
-        fi
-        if [ "$has_state" = "true" ] && [ "$current_output" -lt "$last_output" ]; then
-            output_offset="$existing_output"
-            output_base=0
-        fi
-
-        local total_input
-        if [ "$current_input" -ge "$input_base" ]; then
-            total_input=$((input_offset + current_input - input_base))
-        else
-            total_input=$((input_offset + current_input))
-        fi
-
-        local total_output
-        if [ "$current_output" -ge "$output_base" ]; then
-            total_output=$((output_offset + current_output - output_base))
-        else
-            total_output=$((output_offset + current_output))
-        fi
-
-        if ! printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$port" "$snapshot_date" "$snapshot_time" "$rollover_date" \
-            "$current_input" "$current_output" "$input_base" "$output_base" \
-            "$input_offset" "$output_offset" "$total_input" "$total_output" \
-            "$rollover_input" "$rollover_output" >> "$updates_file"; then
-            exec 3<&-
-            rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-            release_traffic_stats_lock
-            return 1
-        fi
-    done
-    exec 3<&-
-    rm -f "$states_file"
-
-    local updates_json
-    updates_json=$(mktemp "$CONFIG_DIR/.traffic_snapshot.json.XXXXXX") || {
-        rm -f "$updates_file" "$stats_temp" "$backup_temp"
-        release_traffic_stats_lock
-        return 1
-    }
-    if ! jq -Rn '
-        inputs |
-        split("|") as $v |
-        {
-            port:$v[0], date:$v[1], time:$v[2], rollover_date:$v[3],
-            cin:($v[4] | tonumber), cout:($v[5] | tonumber),
-            ibase:($v[6] | tonumber), obase:($v[7] | tonumber),
-            ioffset:($v[8] | tonumber), ooffset:($v[9] | tonumber),
-            tin:($v[10] | tonumber), tout:($v[11] | tonumber),
-            rin:($v[12] | tonumber), rout:($v[13] | tonumber)
-        }
-    ' "$updates_file" > "$updates_json"; then
-        rm -f "$updates_file" "$updates_json" "$stats_temp" "$backup_temp"
-        release_traffic_stats_lock
-        return 1
-    fi
-    mv "$updates_json" "$updates_file"
-
-    if ! jq --slurpfile updates "$updates_file" --arg cutoff "$retention_cutoff" '
-        .last_snapshot = (.last_snapshot // {}) |
-        .state = (.state // {}) |
-        .daily = (.daily // {}) |
-        reduce $updates[] as $u (.;
-            .daily[$u.port] = (.daily[$u.port] // {}) |
-            if $u.rollover_date != "" then
-                .daily[$u.port][$u.rollover_date] = ((.daily[$u.port][$u.rollover_date] // {}) + {
-                    input:$u.rin, output:$u.rout, time:$u.time, closed_by_next_day_snapshot:true
-                })
-            else . end |
-            .daily[$u.port][$u.date] = {input:$u.tin, output:$u.tout, time:$u.time} |
-            .state[$u.port] = {
-                date:$u.date, input_base:$u.ibase, output_base:$u.obase,
-                input_offset:$u.ioffset, output_offset:$u.ooffset,
-                last_input:$u.cin, last_output:$u.cout, time:$u.time
-            } |
-            .last_snapshot[$u.port] = {input:$u.cin, output:$u.cout, date:$u.date, time:$u.time}
-        ) |
-        .daily |= with_entries(.value |= with_entries(select(.key >= $cutoff)))
-    ' "$TRAFFIC_STATS_FILE" > "$stats_temp" ||
-       ! jq -s 'map({key:.port,value:{input:.cin,output:.cout,backup_time:.time}}) | from_entries' \
-            "$updates_file" > "$backup_temp" ||
-       ! write_traffic_backup_metadata "$backup_temp"; then
-        rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-        release_traffic_stats_lock
-        return 1
-    fi
-
-    if ! mv "$backup_temp" "$TRAFFIC_DATA_FILE" || ! mv "$stats_temp" "$TRAFFIC_STATS_FILE"; then
-        rm -f "$updates_file" "$stats_temp" "$backup_temp" "$states_file"
-        release_traffic_stats_lock
-        return 1
-    fi
-    chmod 600 "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE" 2>/dev/null || true
-    rm -f "$updates_file"
-
-    release_traffic_stats_lock
-}
-
-update_traffic_snapshot_baseline_locked() {
-    local port="$1"
-    local mode="${2:-preserve_today}"
-    local input_adjustment="${3:-0}"
-    local output_adjustment="${4:-0}"
-    [ -f "$CONFIG_FILE" ] || return 0
-    ensure_traffic_stats_file || return 1
-    [[ "$input_adjustment" =~ ^[0-9]+$ ]] || return 1
-    [[ "$output_adjustment" =~ ^[0-9]+$ ]] || return 1
-
-    read_nftables_counter_data "$port" || return 1
-    local current_input="$NFT_COUNTER_INPUT"
-    local current_output="$NFT_COUNTER_OUTPUT"
-    local snapshot_date
-    snapshot_date=$(get_current_date)
-    local snapshot_time
-    snapshot_time=$(get_beijing_time -Iseconds)
-    local existing_input
-    existing_input=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
-    local existing_output
-    existing_output=$(jq -r --arg port "$port" --arg date "$snapshot_date" '.daily[$port][$date].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
-    [[ "$existing_input" =~ ^[0-9]+$ ]] || existing_input=0
-    [[ "$existing_output" =~ ^[0-9]+$ ]] || existing_output=0
-    if [ "$mode" = "reset_today" ]; then
-        existing_input=0
-        existing_output=0
-    else
-        existing_input=$((existing_input + input_adjustment))
-        existing_output=$((existing_output + output_adjustment))
-    fi
-
-    local stats_temp
-    local backup_temp
-    stats_temp=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX") || return 1
-    backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX") || {
-        rm -f "$stats_temp"
-        return 1
-    }
-
-    if jq \
-        --arg port "$port" \
-        --arg date "$snapshot_date" \
-        --arg time "$snapshot_time" \
-        --argjson cin "$current_input" \
-        --argjson cout "$current_output" \
-        --argjson ein "$existing_input" \
-        --argjson eout "$existing_output" \
-        '
-        .last_snapshot = (.last_snapshot // {}) |
-        .state = (.state // {}) |
-        .daily = (.daily // {}) |
-        .daily[$port] = (.daily[$port] // {}) |
-        .daily[$port][$date] = {
-            "input": $ein,
-            "output": $eout,
-            "time": $time
-        } |
-        .state[$port] = {
-            "date": $date,
-            "input_base": $cin,
-            "output_base": $cout,
-            "input_offset": $ein,
-            "output_offset": $eout,
-            "last_input": $cin,
-            "last_output": $cout,
-            "time": $time
-        } |
-        .last_snapshot[$port] = {
-            "input": $cin,
-            "output": $cout,
-            "date": $date,
-            "time": $time
-        }
-        ' "$TRAFFIC_STATS_FILE" > "$stats_temp"; then
-        :
-    else
-        rm -f "$stats_temp" "$backup_temp"
-        return 1
-    fi
-
-    if [ -f "$TRAFFIC_DATA_FILE" ] &&
-       jq -e 'type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
-        if ! jq \
-            --arg port "$port" \
-            --arg time "$snapshot_time" \
-            --argjson input "$current_input" \
-            --argjson output "$current_output" \
-            '.[$port] = {input:$input, output:$output, backup_time:$time}' \
-            "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
-            rm -f "$stats_temp" "$backup_temp"
-            return 1
-        fi
-    elif ! jq -n \
-        --arg port "$port" \
-        --arg time "$snapshot_time" \
-        --argjson input "$current_input" \
-        --argjson output "$current_output" \
-        '{($port): {input:$input, output:$output, backup_time:$time}}' > "$backup_temp"; then
-        rm -f "$stats_temp" "$backup_temp"
-        return 1
-    fi
-
-    if ! write_traffic_backup_metadata "$backup_temp"; then
-        rm -f "$stats_temp" "$backup_temp"
-        return 1
-    fi
-
-    # 先刷新灾备计数，避免规则意外丢失时把重置前的旧值恢复回来。
-    if ! mv "$backup_temp" "$TRAFFIC_DATA_FILE"; then
-        rm -f "$stats_temp" "$backup_temp"
-        return 1
-    fi
-    if ! mv "$stats_temp" "$TRAFFIC_STATS_FILE"; then
-        rm -f "$stats_temp"
-        return 1
-    fi
-    chmod 600 "$TRAFFIC_STATS_FILE" "$TRAFFIC_DATA_FILE" 2>/dev/null || true
-}
-
-update_traffic_snapshot_baseline() {
-    local port="$1"
-    local mode="${2:-preserve_today}"
-    local input_adjustment="${3:-0}"
-    local output_adjustment="${4:-0}"
-    acquire_traffic_stats_lock || return 1
-    local result=0
-    update_traffic_snapshot_baseline_locked \
-        "$port" "$mode" "$input_adjustment" "$output_adjustment" || result=$?
-    release_traffic_stats_lock
-    return "$result"
-}
-
-scale_current_day_traffic_stats() {
-    local port="$1"
-    local input_source="${2:-1}"
-    local input_target="${3:-1}"
-    local output_source="${4:-1}"
-    local output_target="${5:-1}"
-
-    [ -f "$TRAFFIC_STATS_FILE" ] || return 0
-    if [ "$input_source" -eq "$input_target" ] && [ "$output_source" -eq "$output_target" ]; then
-        return 0
-    fi
-
-    acquire_traffic_stats_lock || return 1
-    if ! ensure_traffic_stats_file; then
-        release_traffic_stats_lock
-        return 1
-    fi
-
-    local snapshot_date
-    snapshot_date=$(get_current_date)
-    local temp_file
-    temp_file=$(mktemp)
-    if jq \
-        --arg port "$port" \
-        --arg date "$snapshot_date" \
-        --argjson input_source "$input_source" \
-        --argjson input_target "$input_target" \
-        --argjson output_source "$output_source" \
-        --argjson output_target "$output_target" \
-        '
-        if .daily[$port][$date] != null then
-            .daily[$port][$date].input = (((.daily[$port][$date].input // 0) * $input_target / $input_source) | floor) |
-            .daily[$port][$date].output = (((.daily[$port][$date].output // 0) * $output_target / $output_source) | floor)
-        else
-            .
-        end
-        ' "$TRAFFIC_STATS_FILE" > "$temp_file"; then
-        mv "$temp_file" "$TRAFFIC_STATS_FILE"
-    else
-        rm -f "$temp_file"
-        release_traffic_stats_lock
-        return 1
-    fi
-    release_traffic_stats_lock
-}
-
-remove_port_traffic_state() {
-    local port="$1"
-
-    if [ -f "$TRAFFIC_STATS_FILE" ] && jq empty "$TRAFFIC_STATS_FILE" >/dev/null 2>&1; then
-        acquire_traffic_stats_lock || return 1
-        local stats_temp
-        stats_temp=$(mktemp "$CONFIG_DIR/.traffic_stats.json.tmp.XXXXXX")
-        if jq --arg port "$port" '
-            del(.last_snapshot[$port]) |
-            del(.state[$port]) |
-            del(.daily[$port])
-        ' "$TRAFFIC_STATS_FILE" > "$stats_temp"; then
-            mv "$stats_temp" "$TRAFFIC_STATS_FILE"
-        else
-            rm -f "$stats_temp"
-            release_traffic_stats_lock
-            return 1
-        fi
-        release_traffic_stats_lock
-    fi
-
-    if [ -f "$TRAFFIC_DATA_FILE" ] && jq empty "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
-        local backup_temp
-        backup_temp=$(mktemp "$CONFIG_DIR/.traffic_data.json.tmp.XXXXXX")
-        if jq --arg port "$port" 'del(.[$port]) | del(._meta.port_multipliers[$port])' \
-            "$TRAFFIC_DATA_FILE" > "$backup_temp"; then
-            if [ "$(jq '[keys[] | select(. != "_meta")] | length' "$backup_temp" 2>/dev/null || echo 0)" -gt 0 ]; then
-                mv "$backup_temp" "$TRAFFIC_DATA_FILE"
-            else
-                rm -f "$backup_temp" "$TRAFFIC_DATA_FILE"
-            fi
-        else
-            rm -f "$backup_temp"
-            return 1
-        fi
-    fi
-}
-
-get_port_cycle_start_date() {
-    local port="$1"
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-
-    if [ "$policy_type" != "monthly" ]; then
-        local start_date
-        start_date=$(jq -r ".ports.\"$port\".quota.reset_policy.last_reset_date // .ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
-        if ! is_valid_date "$start_date"; then
-            start_date=$(get_port_created_date "$port")
-        fi
-        echo "$start_date"
-        return
-    fi
-
-    local reset_day_raw
-    reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // null" "$CONFIG_FILE" 2>/dev/null)
-    local reset_day=1
-    if [[ "$reset_day_raw" =~ ^[0-9]+$ ]] && [ "$reset_day_raw" -ge 1 ] && [ "$reset_day_raw" -le 31 ]; then
-        reset_day="$reset_day_raw"
-    fi
-
-    local time_info=($(get_beijing_month_year))
-    local current_day="${time_info[0]}"
-    local current_month="${time_info[1]}"
-    local current_year="${time_info[2]}"
-    local start_year
-    local start_month
-
-    local current_reset_day
-    current_reset_day=$(clamp_day_to_month "$current_year" "$current_month" "$reset_day")
-    if [ "$current_day" -ge "$current_reset_day" ]; then
-        start_year="$current_year"
-        start_month="$current_month"
-    else
-        local prev=($(normalize_year_month "$current_year" "$((current_month - 1))"))
-        start_year="${prev[0]}"
-        start_month="${prev[1]}"
-    fi
-
-    local start_day
-    start_day=$(clamp_day_to_month "$start_year" "$start_month" "$reset_day")
-    format_date "$start_year" "$start_month" "$start_day"
-}
-
-sum_port_traffic_by_dates() {
-    local port="$1"
-    local start_date="$2"
-    local end_date="$3"
-    local input_total=0
-    local output_total=0
-
-    if ! is_valid_date "$start_date" || ! is_valid_date "$end_date" || date_lt "$end_date" "$start_date"; then
-        echo "0 0"
-        return
-    fi
-
-    if [ ! -f "$TRAFFIC_STATS_FILE" ]; then
-        echo "0 0"
-        return
-    fi
-
-    local cursor="$start_date"
-    while true; do
-        local day_input
-        day_input=$(jq -r --arg port "$port" --arg date "$cursor" '.daily[$port][$date].input // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
-        local day_output
-        day_output=$(jq -r --arg port "$port" --arg date "$cursor" '.daily[$port][$date].output // 0' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo 0)
-        [[ "$day_input" =~ ^[0-9]+$ ]] || day_input=0
-        [[ "$day_output" =~ ^[0-9]+$ ]] || day_output=0
-        input_total=$((input_total + day_input))
-        output_total=$((output_total + day_output))
-
-        [ "$cursor" = "$end_date" ] && break
-        cursor=$(add_days_to_date "$cursor" 1)
-    done
-
-    echo "$input_total $output_total"
-}
-
-get_port_cycle_traffic() {
-    local port="$1"
-    local start_date
-    start_date=$(get_port_cycle_start_date "$port")
-    local end_date
-    end_date=$(get_current_date)
-    sum_port_traffic_by_dates "$port" "$start_date" "$end_date"
-}
-
-clear_port_traffic_stats_by_dates() {
-    local port="$1"
-    local start_date="$2"
-    local end_date="$3"
-
-    if ! is_valid_date "$start_date" || ! is_valid_date "$end_date" || date_lt "$end_date" "$start_date"; then
-        return 0
-    fi
-
-    acquire_traffic_stats_lock || return 1
-    if ! ensure_traffic_stats_file; then
-        release_traffic_stats_lock
-        return 1
-    fi
-
-    local reset_time
-    reset_time=$(get_beijing_time -Iseconds)
-    local cursor="$start_date"
-    while true; do
-        local temp_file
-        temp_file=$(mktemp)
-        if jq \
-            --arg port "$port" \
-            --arg date "$cursor" \
-            --arg time "$reset_time" \
-            '
-            .daily = (.daily // {}) |
-            .daily[$port] = (.daily[$port] // {}) |
-            .daily[$port][$date] = {
-                "input": 0,
-                "output": 0,
-                "reset_time": $time
-            }
-            ' "$TRAFFIC_STATS_FILE" > "$temp_file"; then
-            mv "$temp_file" "$TRAFFIC_STATS_FILE"
-        else
-            rm -f "$temp_file"
-            release_traffic_stats_lock
-            return 1
-        fi
-
-        [ "$cursor" = "$end_date" ] && break
-        cursor=$(add_days_to_date "$cursor" 1)
-    done
-
-    release_traffic_stats_lock
-}
-
-clear_current_cycle_traffic_stats() {
-    local port="$1"
-    local start_date
-    start_date=$(get_port_cycle_start_date "$port")
-    local end_date
-    end_date=$(get_current_date)
-    clear_port_traffic_stats_by_dates "$port" "$start_date" "$end_date"
-}
-
-get_port_counter_prefix() {
-    local port="$1"
-    if is_port_group "$port"; then
-        # 端口组用明文 g 前缀：端口段 80-443 会得到 port_80_443，
-        # 端口组 80,443 若沿用同一规则会与它撞名。
-        local group_safe
-        group_safe=$(printf '%s' "$port" | tr ',-' '__')
-        echo "port_g${group_safe}"
-    elif is_port_range "$port"; then
-        local port_safe
-        port_safe=$(echo "$port" | tr '-' '_')
-        echo "port_${port_safe}"
-    else
-        echo "port_${port}"
-    fi
-}
-
-count_counter_rules() {
-    local port="$1"
-    local direction="$2"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local counter_name
-    counter_name="$(get_port_counter_prefix "$port")_${direction}"
-
-    nft -a list table "$family" "$table_name" 2>/dev/null | \
-        grep -F "counter name \"$counter_name\"" | wc -l | awk '{print $1}' || true
-}
-
-get_port_quota_name() {
-    local port="$1"
-    if is_port_group "$port"; then
-        local group_safe
-        group_safe=$(printf '%s' "$port" | tr ',-' '__')
-        echo "port_g${group_safe}_quota"
-    elif is_port_range "$port"; then
-        local port_safe
-        port_safe=$(echo "$port" | tr '-' '_')
-        echo "port_${port_safe}_quota"
-    else
-        echo "port_${port}_quota"
-    fi
-}
-
-count_quota_rules() {
-    local port="$1"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local quota_name
-    quota_name=$(get_port_quota_name "$port")
-
-    nft -a list table "$family" "$table_name" 2>/dev/null | \
-        grep -F "quota name \"$quota_name\"" | wc -l | awk '{print $1}' || true
-}
-
-get_port_expiry_comment() {
-    local port_safe
-    if is_port_group "$1"; then
-        port_safe="g$(printf '%s' "$1" | tr ',-' '__')"
-    else
-        port_safe=$(echo "$1" | tr '-' '_')
-    fi
-    echo "ptd_expiry_${port_safe}"
-}
-
-get_port_expiry_date() {
-    local port="$1"
-    jq -r --arg port "$port" '.ports[$port].expiry_date // empty' "$CONFIG_FILE" 2>/dev/null
-}
-
-port_has_expiry_date() {
-    local expiry_date
-    expiry_date=$(get_port_expiry_date "$1") || return 2
-    [ -n "$expiry_date" ] && is_valid_date "$expiry_date"
-}
-
-port_is_expired() {
-    local expiry_date
-    expiry_date=$(get_port_expiry_date "$1") || return 2
-    [ -n "$expiry_date" ] && is_valid_date "$expiry_date" && date_le "$expiry_date" "$(get_current_date)"
-}
-
-count_port_expiry_rules() {
-    local port="$1"
-    local table_name
-    local family
-    local comment
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_expiry_comment "$port")
-
-    local table_state=0
-    nft_table_exists "$family" "$table_name" || table_state=$?
-    case "$table_state" in
-        0) ;;
-        1) echo 0; return 0 ;;
-        *) return 1 ;;
-    esac
-
-    local table_json
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 1
-    printf '%s\n' "$table_json" |
-        jq -er --arg comment "$comment" '[.nftables[] | .rule? | select(.comment == $comment)] | length' 2>/dev/null
-}
-
-port_expiry_rule_layout_complete() {
-    local port="$1"
-    local table_name
-    local family
-    local comment
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_expiry_comment "$port")
-
-    # 端口组的每个成员都要各自具备完整的 8 条签名规则，总条数按成员数放大。
-    local member_count
-    member_count=$(count_unit_members "$port")
-    local expected_total=$((8 * member_count))
-
-    local rules_json
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-expiry-check.XXXXXX") || return 1
-    if ! nft -j list table "$family" "$table_name" > "$rules_json" 2>/dev/null; then
-        rm -f "$rules_json"
-        return 1
-    fi
-
-    local member_start member_end
-    local all_ok=true
-    while read -r member_start member_end; do
-        [ -n "$member_start" ] || continue
-        if ! jq -e --arg comment "$comment" \
-            --argjson start "$member_start" --argjson range_end "$member_end" \
-            --argjson expected_total "$expected_total" '
-            def port_match($right):
-                if $start == $range_end then $right == $start
-                else ($right.range? == [$start, $range_end]) end;
-            def is_exact_rule($rule; $protocol; $field):
-                ($rule.expr | type) == "array" and
-                ($rule.expr | length) == 2 and
-                ($rule.expr[0].match?.op? // "==") == "==" and
-                $rule.expr[0].match?.left?.payload?.protocol? == $protocol and
-                $rule.expr[0].match?.left?.payload?.field? == $field and
-                port_match($rule.expr[0].match.right) and
-                ($rule.expr[1] | has("drop"));
-            def signature_count($rules; $chain; $protocol; $field):
-                [$rules[] | select(.chain == $chain) |
-                    select(is_exact_rule(.; $protocol; $field))] | length;
-            [.nftables[] | .rule? | select(.comment == $comment)] as $rules |
-            ($rules | length) == $expected_total and
-            signature_count($rules; "expiry_input"; "tcp"; "dport") == 1 and
-            signature_count($rules; "expiry_input"; "udp"; "dport") == 1 and
-            signature_count($rules; "expiry_output"; "tcp"; "sport") == 1 and
-            signature_count($rules; "expiry_output"; "udp"; "sport") == 1 and
-            signature_count($rules; "expiry_forward"; "tcp"; "dport") == 1 and
-            signature_count($rules; "expiry_forward"; "udp"; "dport") == 1 and
-            signature_count($rules; "expiry_forward"; "tcp"; "sport") == 1 and
-            signature_count($rules; "expiry_forward"; "udp"; "sport") == 1
-        ' "$rules_json" >/dev/null; then
-            all_ok=false
-            break
-        fi
-    done < <(expand_unit_intervals "$port")
-    rm -f "$rules_json"
-
-    [ "$all_ok" = "true" ]
-}
-
-remove_port_expiry_rules_locked() {
-    local port="$1"
-    local table_name
-    local family
-    local comment
-    local rules_json
-    local cleanup_batch
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_expiry_comment "$port")
-
-    local table_state=0
-    nft_table_exists "$family" "$table_name" || table_state=$?
-    case "$table_state" in
-        0) ;;
-        1) return 0 ;;
-        *) return 1 ;;
-    esac
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-expiry-rules.XXXXXX") || return 1
-    cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-expiry-cleanup.XXXXXX") || {
-        rm -f "$rules_json"
-        return 1
-    }
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
-            .nftables[] | .rule? |
-            select(.comment == $comment and .handle != null) |
-            "delete rule \($family) \($table) \(.chain) handle \(.handle)"
-        ' "$rules_json" > "$cleanup_batch"; then
-        rm -f "$rules_json" "$cleanup_batch"
-        return 1
-    fi
-    rm -f "$rules_json"
-    local expiry_changed=false
-    if [ -s "$cleanup_batch" ]; then
-        expiry_changed=true
-        if ! nft -c -f "$cleanup_batch" >/dev/null 2>&1 ||
-           ! nft -f "$cleanup_batch" >/dev/null 2>&1; then
-            rm -f "$cleanup_batch"
-            return 1
-        fi
-    fi
-    rm -f "$cleanup_batch"
-    local remaining_count
-    remaining_count=$(count_port_expiry_rules "$port") || return 1
-    [ "$remaining_count" -eq 0 ] || return 1
-    if [ "$expiry_changed" = true ]; then dog_log_event expiry_clear 0 "port=$port"; fi
-    return 0
-}
-
-remove_port_expiry_rules() {
-    begin_expiry_update || return 1
-    local result=0
-    remove_port_expiry_rules_locked "$@" || result=$?
-    finish_expiry_update
-    if [ "$result" -ne 0 ]; then dog_log_event expiry_clear "$result" "port=${1:-}"; fi
-    return "$result"
-}
-
-write_port_expiry_rule_commands() {
-    local family="$1"
-    local table_name="$2"
-    local port="$3"
-    local comment="$4"
-    local protocol
-    local selector
-
-    # 端口组的每个成员各自一组到期规则，都带同一个 comment，便于整体识别与清理。
-    while IFS= read -r selector; do
-        [ -n "$selector" ] || continue
-        for protocol in tcp udp; do
-            printf 'add rule %s %s expiry_input %s dport %s drop comment "%s"\n' \
-                "$family" "$table_name" "$protocol" "$selector" "$comment"
-            printf 'add rule %s %s expiry_output %s sport %s drop comment "%s"\n' \
-                "$family" "$table_name" "$protocol" "$selector" "$comment"
-            printf 'add rule %s %s expiry_forward %s dport %s drop comment "%s"\n' \
-                "$family" "$table_name" "$protocol" "$selector" "$comment"
-            printf 'add rule %s %s expiry_forward %s sport %s drop comment "%s"\n' \
-                "$family" "$table_name" "$protocol" "$selector" "$comment"
-        done
-    done < <(port_selectors "$port")
-}
-
-apply_port_expiry_rules_locked() {
-    local port="$1"
-    local table_name
-    local family
-    local comment
-    local rules_json
-    local rebuild_batch
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_expiry_comment "$port")
-
-    init_nftables || return 1
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-expiry-rules.XXXXXX") || return 1
-    rebuild_batch=$(mktemp "$CONFIG_DIR/.nft-expiry-rebuild.XXXXXX") || {
-        rm -f "$rules_json"
-        return 1
-    }
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r --arg family "$family" --arg table "$table_name" --arg comment "$comment" '
-            .nftables[] | .rule? |
-            select(.comment == $comment and .handle != null) |
-            "delete rule \($family) \($table) \(.chain) handle \(.handle)"
-        ' "$rules_json" > "$rebuild_batch"; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-    rm -f "$rules_json"
-    write_port_expiry_rule_commands "$family" "$table_name" "$port" "$comment" >> "$rebuild_batch"
-    if ! nft -c -f "$rebuild_batch" >/dev/null 2>&1 ||
-       ! nft -f "$rebuild_batch" >/dev/null 2>&1; then
-        rm -f "$rebuild_batch"
-        return 1
-    fi
-    rm -f "$rebuild_batch"
-    port_expiry_rule_layout_complete "$port"
-}
-
-apply_port_expiry_rules() {
-    begin_expiry_update || return 1
-    local result=0
-    apply_port_expiry_rules_locked "$@" || result=$?
-    finish_expiry_update
-    dog_log_event expiry_apply "$result" "port=${1:-}"
-    return "$result"
-}
-
-sync_port_expiry_state_locked() {
-    local port="$1"
-    local expiry_date
-    local current_count
-    expiry_date=$(get_port_expiry_date "$port") || return 1
-    current_count=$(count_port_expiry_rules "$port") || return 1
-    [[ "$current_count" =~ ^[0-9]+$ ]] || return 1
-
-    if [ -z "$expiry_date" ]; then
-        if [ "$current_count" -gt 0 ]; then
-            remove_port_expiry_rules_locked "$port" || return 1
-            log_notification "端口 $port 服务到期封锁已解除"
-        fi
-        return 0
-    fi
-    is_valid_date "$expiry_date" || return 1
-
-    if date_le "$expiry_date" "$(get_current_date)"; then
-        if ! port_expiry_rule_layout_complete "$port"; then
-            apply_port_expiry_rules_locked "$port" || return 1
-            log_notification "端口 $port 已到服务到期日 $expiry_date，TCP/UDP 已封锁"
-        fi
-    elif [ "$current_count" -gt 0 ]; then
-        remove_port_expiry_rules_locked "$port" || return 1
-        log_notification "端口 $port 到期日已延后或取消，服务到期封锁已解除"
-    fi
-}
-
-sync_port_expiry_state() {
-    begin_expiry_update || return 1
-    local result=0
-    sync_port_expiry_state_locked "$@" || result=$?
-    finish_expiry_update
-    return "$result"
-}
-
-port_expiry_rules_complete() {
-    local port="$1"
-    local expiry_status=0
-    port_is_expired "$port" || expiry_status=$?
-    if [ "$expiry_status" -eq 0 ]; then
-        port_expiry_rule_layout_complete "$port"
-    elif [ "$expiry_status" -gt 1 ]; then
-        return 1
-    else
-        local current_count
-        current_count=$(count_port_expiry_rules "$port") || return 1
-        [ "$current_count" -eq 0 ]
-    fi
-}
-
-get_active_runtime_prefixes_json() {
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local port
-    {
-        for port in "${active_ports[@]}"; do
-            get_port_counter_prefix "$port"
-        done
-    } | jq -Rsc 'split("\n") | map(select(length > 0)) | unique'
-}
-
-get_expected_expiry_comments_json() {
-    local active_ports=()
-    local ports_output
-    ports_output=$(get_active_ports 2>/dev/null) || return 1
-    if [ -n "$ports_output" ]; then
-        mapfile -t active_ports <<< "$ports_output"
-    fi
-    local port
-    local expiry_status
-    {
-        for port in "${active_ports[@]}"; do
-            expiry_status=0
-            port_is_expired "$port" || expiry_status=$?
-            if [ "$expiry_status" -eq 0 ]; then
-                get_port_expiry_comment "$port"
-            elif [ "$expiry_status" -gt 1 ]; then
-                return 1
-            fi
-        done
-    } | jq -Rsc 'split("\n") | map(select(length > 0)) | unique'
-}
-
-# 只匹配 Dog 的固定 comment 格式，不触碰同表中的外部规则。
-list_orphaned_expiry_rules() {
-    local table_name
-    local family
-    local table_json
-    local allowed_comments
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
-    allowed_comments=$(get_expected_expiry_comments_json) || return 1
-
-    printf '%s\n' "$table_json" | jq -r --argjson allowed "$allowed_comments" '
-        .nftables[] | .rule? |
-        select(.handle != null) |
-        select((.comment? | type) == "string") |
-        select(.comment | test("^ptd_expiry_[0-9]+(_[0-9]+)?$")) |
-        .comment as $comment |
-        select(($allowed | index($comment)) == null) |
-        "\(.chain)|\(.handle)|\(.comment)"
-    ' || return 1
-}
-
-reconcile_orphaned_expiry_rules_locked() {
-    local table_name
-    local family
-    local table_json
-    local allowed_comments
-    local cleanup_batch
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
-    allowed_comments=$(get_expected_expiry_comments_json) || return 1
-    cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-expiry-orphans.XXXXXX") || return 1
-
-    if ! printf '%s\n' "$table_json" | jq -r \
-        --arg family "$family" --arg table "$table_name" --argjson allowed "$allowed_comments" '
-        .nftables[] | .rule? |
-        select(.handle != null) |
-        select((.comment? | type) == "string") |
-        select(.comment | test("^ptd_expiry_[0-9]+(_[0-9]+)?$")) |
-        .comment as $comment |
-        select(($allowed | index($comment)) == null) |
-        "delete rule \($family) \($table) \(.chain) handle \(.handle)"
-    ' > "$cleanup_batch"; then
-        rm -f "$cleanup_batch"
-        return 1
-    fi
-
-    if [ -s "$cleanup_batch" ]; then
-        if ! nft -c -f "$cleanup_batch" >/dev/null 2>&1 ||
-           ! nft -f "$cleanup_batch" >/dev/null 2>&1; then
-            rm -f "$cleanup_batch"
-            return 1
-        fi
-    fi
-    rm -f "$cleanup_batch"
-    [ -z "$(list_orphaned_expiry_rules)" ]
-}
-
-reconcile_orphaned_expiry_rules() {
-    begin_expiry_update || return 1
-    local result=0
-    reconcile_orphaned_expiry_rules_locked "$@" || result=$?
-    finish_expiry_update
-    return "$result"
-}
-
-# 只识别本脚本固定命名格式的对象，避免触碰同表中的外部规则。
-list_orphaned_runtime_objects() {
-    local table_name
-    local family
-    local table_json
-    local allowed_prefixes
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    table_json=$(nft -j -a list table "$family" "$table_name" 2>/dev/null) || return 1
-    allowed_prefixes=$(get_active_runtime_prefixes_json) || return 1
-
-    printf '%s\n' "$table_json" | jq -r --argjson allowed "$allowed_prefixes" '
-        def is_owned_counter:
-            type == "string" and test("^port_[0-9]+(_[0-9]+)?_(in|out)$");
-        def is_owned_quota:
-            type == "string" and test("^port_[0-9]+(_[0-9]+)?_quota$");
-        def is_allowed($name):
-            ($name | sub("_(in|out|quota)$"; "")) as $prefix |
-            ($allowed | index($prefix)) != null;
-        [
-            .nftables[] |
-            if .counter?.name? | is_owned_counter then
-                select(is_allowed(.counter.name) | not) |
-                "counter \(.counter.name)"
-            elif .quota?.name? | is_owned_quota then
-                select(is_allowed(.quota.name) | not) |
-                "quota \(.quota.name)"
-            else
-                empty
-            end
-        ] | unique[]
-    ' || return 1
-}
-
-reconcile_orphaned_runtime_objects() {
-    reconcile_orphaned_expiry_rules || return 1
-
-    local orphaned
-    orphaned=$(list_orphaned_runtime_objects) || return 1
-    [ -n "$orphaned" ] || return 0
-
-    local table_name
-    local family
-    local rules_json
-    local cleanup_batch
-    local orphan_names
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-orphans.XXXXXX") || return 1
-    cleanup_batch=$(mktemp "$CONFIG_DIR/.nft-cleanup.XXXXXX") || {
-        rm -f "$rules_json"
-        return 1
-    }
-    orphan_names=$(printf '%s\n' "$orphaned" | awk '{print $2}' |
-        jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || {
-        rm -f "$rules_json" "$cleanup_batch"
-        return 1
-    }
-
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r \
-            --arg family "$family" \
-            --arg table "$table_name" \
-            --argjson orphan_names "$orphan_names" '
-            def named_refs($kind):
-                [
-                    .expr[]? | .[$kind]? |
-                    if type == "string" then .
-                    elif type == "object" then (.name // empty)
-                    else empty end
-                ];
-            .nftables[] |
-            select(.rule != null and .rule.handle != null) |
-            .rule as $rule |
-            ((($rule | named_refs("counter")) + ($rule | named_refs("quota"))) |
-                any(.[]; . as $name | ($orphan_names | index($name)) != null)) as $owned |
-            select($owned) |
-            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
-        ' "$rules_json" > "$cleanup_batch"; then
-        rm -f "$rules_json" "$cleanup_batch"
-        return 1
-    fi
-
-    while read -r object_type object_name; do
-        [ -n "$object_type" ] && [ -n "$object_name" ] || continue
-        printf 'delete %s %s %s %s\n' \
-            "$object_type" "$family" "$table_name" "$object_name" >> "$cleanup_batch"
-    done <<< "$orphaned"
-
-    if ! nft -f "$cleanup_batch" >/dev/null 2>&1; then
-        rm -f "$rules_json" "$cleanup_batch"
-        return 1
-    fi
-    rm -f "$rules_json" "$cleanup_batch"
-
-    [ -z "$(list_orphaned_runtime_objects)" ]
-}
-
-# 返回 0 表示目标方向存在位于 counter 之前的终止规则，1 表示顺序正常，2 表示无法读取。
-# 只针对单个端口区间做检查；端口组由 counter_direction_has_preceding_terminal_rule
-# 展开成员后逐一调用。
-counter_range_has_preceding_terminal_rule() {
-    local port="$1"
-    local direction="$2"
-    local start_port="$3"
-    local finish_port="$4"
-    local table_name
-    local family
-    local prefix
-    local quota_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    prefix=$(get_port_counter_prefix "$port")
-    quota_name=$(get_port_quota_name "$port")
-    [[ "$start_port" =~ ^[0-9]+$ && "$finish_port" =~ ^[0-9]+$ ]] || return 2
-
-    local counter_name="${prefix}_${direction}"
-    local chain
-    local field
-    local chain_json
-    local invalid
-    local chain_fields=()
-    if [ "$direction" = "in" ]; then
-        chain_fields=("input:dport" "forward:dport")
-    elif [ "$direction" = "out" ]; then
-        chain_fields=("output:sport" "forward:sport")
-    else
-        return 2
-    fi
-
-    local chain_field
-    for chain_field in "${chain_fields[@]}"; do
-        chain="${chain_field%%:*}"
-        field="${chain_field##*:}"
-        chain_json=$(nft -j -a list chain "$family" "$table_name" "$chain" 2>/dev/null) || return 2
-        invalid=$(printf '%s\n' "$chain_json" | jq -r \
-            --arg field "$field" \
-            --arg counter "$counter_name" \
-            --arg quota "$quota_name" \
-            --argjson start "$start_port" \
-            --argjson finish "$finish_port" '
-            def named_ref($kind; $name):
-                any(.expr[]?;
-                    (.[$kind]? |
-                        if type == "string" then . == $name
-                        elif type == "object" then (.name // "") == $name
-                        else false end));
-            def value_overlaps($value; $start; $finish):
-                if ($value | type) == "number" then
-                    $value >= $start and $value <= $finish
-                elif ($value | type) == "object" and ($value.range? | type) == "array" then
-                    $value.range[0] <= $finish and $value.range[1] >= $start
-                elif ($value | type) == "object" and ($value.set? | type) == "array" then
-                    any($value.set[]; value_overlaps(.; $start; $finish))
-                else
-                    true
-                end;
-            def port_match_may_apply($match; $start; $finish):
-                ($match.op // "==") as $op |
-                if $op == "==" or $op == "in" then
-                    value_overlaps($match.right; $start; $finish)
-                elif $op == "!=" then
-                    ($start != $finish) or
-                    (value_overlaps($match.right; $start; $finish) | not)
-                else
-                    true
-                end;
-            def protocol_value_may_apply($value):
-                if ($value | type) == "string" then
-                    $value == "tcp" or $value == "udp"
-                elif ($value | type) == "number" then
-                    $value == 6 or $value == 17
-                elif ($value | type) == "object" and ($value.set? | type) == "array" then
-                    any($value.set[]; protocol_value_may_apply(.))
-                else
-                    true
-                end;
-            def protocol_match_may_apply($match):
-                ($match.op // "==") as $op |
-                if $op == "==" or $op == "in" then
-                    protocol_value_may_apply($match.right)
-                else
-                    true
-                end;
-            def rule_protocol_may_apply:
-                [
-                    .expr[]? | .match? |
-                    select(
-                        .left.meta.key? == "l4proto" or
-                        (.left.payload.protocol? == "ip" and .left.payload.field? == "protocol") or
-                        (.left.payload.protocol? == "ip6" and .left.payload.field? == "nexthdr")
-                    )
-                ] as $protocol_matches |
-                [
-                    .expr[]? |
-                    (.match?.left.payload.protocol? //
-                        .vmap?.key.payload.protocol? // empty) as $protocol |
-                    select(
-                        ["tcp", "udp", "icmp", "icmpv6", "sctp", "dccp"] |
-                        index($protocol) != null
-                    ) |
-                    $protocol
-                ] as $payload_protocols |
-                (($protocol_matches | length) == 0 or
-                    all($protocol_matches[]; protocol_match_may_apply(.))) and
-                (($payload_protocols | length) == 0 or
-                    any($payload_protocols[]; . == "tcp" or . == "udp"));
-            def rule_port_may_apply($field; $start; $finish):
-                [
-                    .expr[]? | .match? |
-                    select(.left.payload.field? == $field)
-                ] as $matches |
-                [
-                    .expr[]? | .vmap? |
-                    select(.key.payload.field? == $field)
-                ] as $vmaps |
-                (($matches | length) == 0 or
-                    all($matches[]; port_match_may_apply(.; $start; $finish))) and
-                (($vmaps | length) == 0 or
-                    all($vmaps[];
-                        if (.data.set? | type) == "array" then
-                            any(.data.set[]?;
-                                value_overlaps(
-                                    if type == "array" then .[0] else . end;
-                                    $start; $finish
-                                ))
-                        else
-                            true
-                        end));
-            def rule_may_apply($field; $start; $finish):
-                rule_protocol_may_apply and rule_port_may_apply($field; $start; $finish);
-            def terminal_verdict:
-                any(.expr[]?;
-                    type == "object" and
-                    (has("accept") or has("drop") or has("reject") or
-                        has("queue") or has("return") or has("jump") or
-                        has("goto") or has("vmap")));
-            reduce (
-                .nftables[] | .rule? |
-                select(rule_may_apply($field; $start; $finish))
-            ) as $rule (
-                {terminal:false, invalid:false};
-                if ($rule | named_ref("quota"; $quota)) then .
-                elif ($rule | named_ref("counter"; $counter)) then
-                    if .terminal then .invalid = true else . end
-                elif ($rule | terminal_verdict) then .terminal = true
-                else . end
-            ) |
-            .invalid
-        ') || return 2
-        case "$invalid" in
-            true) return 0 ;;
-            false) ;;
-            *) return 2 ;;
-        esac
-    done
-    return 1
-}
-
-# 端口组的成员不连续，逐个成员检查：任一成员命中即认为该 counter 可能被挡住。
-counter_direction_has_preceding_terminal_rule() {
-    local port="$1"
-    local direction="$2"
-    local member_start
-    local member_end
-    local any=false
-    local status
-
-    while read -r member_start member_end; do
-        [ -n "$member_start" ] || continue
-        any=true
-        status=0
-        counter_range_has_preceding_terminal_rule \
-            "$port" "$direction" "$member_start" "$member_end" || status=$?
-        case "$status" in
-            0) return 0 ;;
-            2) return 2 ;;
-        esac
-    done < <(expand_unit_intervals "$port")
-
-    [ "$any" = "true" ] || return 2
-    return 1
-}
-
-get_invalid_counter_order_directions() {
-    local port="$1"
-    local invalid=()
-    local direction
-    local status
-    for direction in in out; do
-        status=0
-        counter_direction_has_preceding_terminal_rule "$port" "$direction" || status=$?
-        case "$status" in
-            0) invalid+=("$direction") ;;
-            1) ;;
-            *) return 1 ;;
-        esac
-    done
-    echo "${invalid[*]}"
-}
-
-remove_nftables_counter_rules() {
-    local port="$1"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local counter_prefix
-    counter_prefix=$(get_port_counter_prefix "$port")
-
-    local deleted_count=0
-    while true; do
-        local match_line
-        match_line=$(nft -a list table "$family" "$table_name" 2>/dev/null | awk -v prefix="$counter_prefix" '
-            /^[[:space:]]*chain[[:space:]]+/ {
-                chain = $2
-                next
-            }
-            index($0, "counter name \"" prefix "_") && $0 ~ /# handle [0-9]+/ {
-                handle = $0
-                sub(/^.*# handle /, "", handle)
-                sub(/[^0-9].*$/, "", handle)
-                print chain " " handle
-                exit
-            }
-        ' || true)
-
-        if [ -z "$match_line" ]; then
-            break
-        fi
-
-        local chain="${match_line%% *}"
-        local handle="${match_line##* }"
-        if [ -z "$chain" ] || [ -z "$handle" ]; then
-            break
-        fi
-
-        if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
-            deleted_count=$((deleted_count + 1))
-        else
-            break
-        fi
-
-        if [ "$deleted_count" -ge 150 ]; then
-            break
-        fi
-    done
-}
-
-repair_port_traffic_rules() {
-    local port="$1"
-    local force_rebuild="${2:-false}"
-    local convert_legacy_multiplier="${3:-false}"
-    LAST_REPAIR_CHANGED=false
-    local billing_mode
-    billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-    local expected_in_count
-    expected_in_count=$(get_expected_counter_rule_count "$billing_mode" "$port")
-    local expected_out_count="$expected_in_count"
-
-    local in_rule_count
-    in_rule_count=$(count_counter_rules "$port" "in")
-    local out_rule_count
-    out_rule_count=$(count_counter_rules "$port" "out")
-
-    local needs_rebuild=false
-    local repair_directions=()
-    if [ "$in_rule_count" -ne "$expected_in_count" ]; then
-        needs_rebuild=true
-        repair_directions+=("in")
-    fi
-    if [ "$out_rule_count" -ne "$expected_out_count" ]; then
-        needs_rebuild=true
-        repair_directions+=("out")
-    fi
-
-    if [ "$force_rebuild" = "true" ]; then
-        needs_rebuild=true
-    fi
-
-    local invalid_order=""
-    if [ "$in_rule_count" -eq "$expected_in_count" ] && \
-       [ "$out_rule_count" -eq "$expected_out_count" ]; then
-        invalid_order=$(get_invalid_counter_order_directions "$port") || {
-            log_notification "port $port traffic rule order could not be inspected"
-            return 1
-        }
-        if [ -n "$invalid_order" ]; then
-            needs_rebuild=true
-            local invalid_direction
-            for invalid_direction in $invalid_order; do
-                [[ " ${repair_directions[*]} " == *" $invalid_direction "* ]] ||
-                    repair_directions+=("$invalid_direction")
-            done
-        fi
-    fi
-    [ "$needs_rebuild" = "true" ] || return 0
-
-    local quota_enabled
-    quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE")
-    local monthly_limit
-    monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
-    local recovered_input=0
-    local recovered_output=0
-
-    if [ ${#repair_directions[@]} -gt 0 ]; then
-        # 先记录现有自然日增量，再以单个 nft 事务重建 counter 与 quota。
-        record_traffic_snapshot >/dev/null 2>&1 || true
-    fi
-
-    local traffic_data=()
-    local quota_used=-1
-    if [ ${#repair_directions[@]} -gt 0 ] && [ "$quota_enabled" = "true" ] && \
-       [ "$monthly_limit" != "unlimited" ]; then
-        local usage_snapshot=()
-        read -r -a usage_snapshot < <(get_port_runtime_usage_snapshot "$port") || {
-            log_notification "port $port runtime counter/quota snapshot failed"
-            return 1
-        }
-        traffic_data=("${usage_snapshot[0]:-0}" "${usage_snapshot[1]:-0}")
-        quota_used="${usage_snapshot[2]:--1}"
-    else
-        if ! read_nftables_counter_data "$port"; then
-            log_notification "port $port runtime counter snapshot failed"
-            return 1
-        fi
-        traffic_data=("$NFT_COUNTER_INPUT" "$NFT_COUNTER_OUTPUT")
-    fi
-    local current_input=${traffic_data[0]:-0}
-    local current_output=${traffic_data[1]:-0}
-    [[ "$current_input" =~ ^[0-9]+$ ]] || current_input=0
-    [[ "$current_output" =~ ^[0-9]+$ ]] || current_output=0
-
-    if [[ "$quota_used" =~ ^[0-9]+$ ]]; then
-        local current_total=$((current_input + current_output))
-        if [ "$quota_used" -gt "$current_total" ]; then
-            local missing_bytes=$((quota_used - current_total))
-            local invalid_in=false
-            local invalid_out=false
-            [[ " ${repair_directions[*]} " == *" in "* ]] && invalid_in=true
-            [[ " ${repair_directions[*]} " == *" out "* ]] && invalid_out=true
-            if [ "$invalid_in" = "true" ] && [ "$invalid_out" = "false" ]; then
-                current_input=$((current_input + missing_bytes))
-                recovered_input="$missing_bytes"
-            elif [ "$invalid_out" = "true" ] && [ "$invalid_in" = "false" ]; then
-                current_output=$((current_output + missing_bytes))
-                recovered_output="$missing_bytes"
-            elif [ "$missing_bytes" -gt $((1024 * 1024)) ]; then
-                log_notification "port $port counter/quota gap cannot be assigned safely: bytes=$missing_bytes, directions=${repair_directions[*]}"
-                return 1
-            fi
-        fi
-    fi
-
-    local target_multiplier
-    target_multiplier=$(get_billing_rule_multiplier "$billing_mode")
-    local input_source_multiplier="$target_multiplier"
-    local output_source_multiplier="$target_multiplier"
-    if [ "$convert_legacy_multiplier" = "true" ]; then
-        if ! input_source_multiplier=$(resolve_legacy_counter_multiplier \
-            "$port" "input" "$in_rule_count" "$target_multiplier" "$current_input") ||
-           ! output_source_multiplier=$(resolve_legacy_counter_multiplier \
-            "$port" "output" "$out_rule_count" "$target_multiplier" "$current_output"); then
-            log_notification "port $port legacy traffic multiplier is unknown; preserved counters and stopped automatic conversion"
-            return 1
-        fi
-    fi
-    local repaired_input
-    repaired_input=$(scale_counter_for_rule_multiplier "$current_input" "$input_source_multiplier" "$target_multiplier")
-    local repaired_output
-    repaired_output=$(scale_counter_for_rule_multiplier "$current_output" "$output_source_multiplier" "$target_multiplier")
-    local repaired_recovered_input
-    repaired_recovered_input=$(scale_counter_for_rule_multiplier "$recovered_input" "$input_source_multiplier" "$target_multiplier")
-    local repaired_recovered_output
-    repaired_recovered_output=$(scale_counter_for_rule_multiplier "$recovered_output" "$output_source_multiplier" "$target_multiplier")
-
-    if ! rebuild_port_counter_objects \
-        "$port" "$repaired_input" "$repaired_output" rebuild; then
-        log_notification "port $port traffic rules rebuild failed"
-        return 1
-    fi
-
-    scale_current_day_traffic_stats \
-        "$port" \
-        "$input_source_multiplier" "$target_multiplier" \
-        "$output_source_multiplier" "$target_multiplier" >/dev/null 2>&1 || true
-    update_traffic_snapshot_baseline \
-        "$port" "preserve_today" \
-        "$repaired_recovered_input" "$repaired_recovered_output" >/dev/null 2>&1 || true
-
-    LAST_REPAIR_CHANGED=true
-    log_notification "port $port traffic rules rebuilt: in_rules=$in_rule_count/$expected_in_count, out_rules=$out_rule_count/$expected_out_count, order=${invalid_order:-ok}, recovered_in=$repaired_recovered_input, recovered_out=$repaired_recovered_output, in_multiplier=$input_source_multiplier->$target_multiplier, out_multiplier=$output_source_multiplier->$target_multiplier"
-    return 0
-}
-
-repair_port_quota_rules() {
-    local port="$1"
-    LAST_REPAIR_CHANGED=false
-    local quota_enabled
-    quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE")
-    local monthly_limit
-    monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
-    if [ "$quota_enabled" != "true" ] || [ "$monthly_limit" = "unlimited" ]; then
-        local quota_name
-        local family
-        local table_name
-        quota_name=$(get_port_quota_name "$port")
-        family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-        table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-        if [ "$(count_quota_rules "$port")" -gt 0 ] ||
-           nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1; then
-            remove_nftables_quota "$port" >/dev/null 2>&1 || true
-            nftables_quota_is_absent "$port" || return 1
-            LAST_REPAIR_CHANGED=true
-        fi
-        return 0
-    fi
-
-    local billing_mode
-    billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-    local expected_count
-    expected_count=$(get_expected_quota_rule_count "$billing_mode" "$port")
-
-    local quota_rule_count
-    quota_rule_count=$(count_quota_rules "$port")
-    if [ "$quota_rule_count" -eq "$expected_count" ] && \
-       nftables_quota_limit_matches "$port" "$monthly_limit"; then
-        return 0
-    fi
-
-    if ! apply_nftables_quota "$port" "$monthly_limit"; then
-        log_notification "port $port quota rules rebuild failed: quota_rules=$quota_rule_count, expected=$expected_count, limit=$monthly_limit"
-        return 1
-    fi
-    nftables_quota_limit_matches "$port" "$monthly_limit" || return 1
-    LAST_REPAIR_CHANGED=true
-    log_notification "port $port quota rules rebuilt: quota_rules=$quota_rule_count, expected=$expected_count, limit=$monthly_limit"
-    return 0
-}
-
-repair_duplicate_traffic_rules() {
-    local force_rebuild="${1:-false}"
-    local convert_legacy_multiplier="${2:-false}"
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local repaired_count=0
-    local failed_count=0
-    local port
-    for port in "${active_ports[@]}"; do
-        local repaired=false
-        if repair_port_traffic_rules "$port" "$force_rebuild" "$convert_legacy_multiplier" >/dev/null 2>&1; then
-            [ "$LAST_REPAIR_CHANGED" = "true" ] && repaired=true
-        else
-            failed_count=$((failed_count + 1))
-            continue
-        fi
-        if repair_port_quota_rules "$port" >/dev/null 2>&1; then
-            [ "$LAST_REPAIR_CHANGED" = "true" ] && repaired=true
-        else
-            failed_count=$((failed_count + 1))
-            continue
-        fi
-        if [ "$repaired" = "true" ]; then
-            repaired_count=$((repaired_count + 1))
-        fi
-    done
-    echo "$repaired_count"
-    [ "$failed_count" -eq 0 ]
-}
-
-ensure_traffic_accounting_model() {
-    local current_model
-    current_model=$(jq -r '.global.traffic_accounting_model // ""' "$CONFIG_FILE" 2>/dev/null || true)
-    [ "$current_model" = "$TRAFFIC_ACCOUNTING_MODEL" ] && return 0
-
-    # 只有缺少模型标记的一次性升级允许按旧规则数量换算历史 counter。
-    repair_duplicate_traffic_rules true true >/dev/null || return 1
-
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local port
-    for port in "${active_ports[@]}"; do
-        local billing_mode
-        billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-        local expected_counter_count
-        expected_counter_count=$(get_expected_counter_rule_count "$billing_mode" "$port")
-        [ "$(count_counter_rules "$port" in)" -eq "$expected_counter_count" ] || return 1
-        [ "$(count_counter_rules "$port" out)" -eq "$expected_counter_count" ] || return 1
-
-        local quota_enabled
-        quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE")
-        local monthly_limit
-        monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
-        local expected_quota_count=0
-        if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ]; then
-            expected_quota_count=$(get_expected_quota_rule_count "$billing_mode" "$port")
-        fi
-        [ "$(count_quota_rules "$port")" -eq "$expected_quota_count" ] || return 1
-    done
-
-    update_config_file \
-        '.global = (.global // {}) | .global.traffic_accounting_model = $model' \
-        --arg model "$TRAFFIC_ACCOUNTING_MODEL"
-}
-
-ensure_tc_runtime_model() {
-    local current_model
-    current_model=$(jq -r '.global.tc_runtime_model // ""' "$CONFIG_FILE" 2>/dev/null || true)
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local has_bandwidth_limits=false
-    local port
-    for port in "${active_ports[@]}"; do
-        local limit_enabled
-        local rate_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
-            has_bandwidth_limits=true
-            break
-        fi
-    done
-
-    local need_restore=false
-    if [ "$has_bandwidth_limits" = "true" ] && [ "$current_model" != "$TC_RUNTIME_MODEL" ]; then
-        need_restore=true
-    fi
-    for port in "${active_ports[@]}"; do
-        local limit_enabled
-        local rate_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] &&
-           ! tc_limit_runtime_complete "$port"; then
-            need_restore=true
-            break
-        fi
-    done
-
-    if [ "$need_restore" = "true" ]; then
-        restore_runtime_state || return 1
-    fi
-
-    [ "$current_model" = "$TC_RUNTIME_MODEL" ] && return 0
-    update_config_file \
-        '.global = (.global // {}) | .global.tc_runtime_model = $model' \
-        --arg model "$TC_RUNTIME_MODEL"
-}
-
-
-get_port_status_label() {
-    local port=$1
-    local port_config=$(jq -r ".ports.\"$port\"" "$CONFIG_FILE" 2>/dev/null)
-
-    local remark=$(echo "$port_config" | jq -r '.remark // ""')
-    local billing_mode=$(echo "$port_config" | jq -r '.billing_mode // "single"')
-    local limit_enabled=$(echo "$port_config" | jq -r '.bandwidth_limit.enabled // false')
-    local rate_limit=$(echo "$port_config" | jq -r '.bandwidth_limit.rate // "unlimited"')
-    local quota_enabled=$(echo "$port_config" | jq -r '.quota.enabled // true')
-    local monthly_limit=$(echo "$port_config" | jq -r '.quota.monthly_limit // "unlimited"')
-    local expiry_date=$(echo "$port_config" | jq -r '.expiry_date // empty')
-    local status_tags=()
-
-    if [ -n "$remark" ] && [ "$remark" != "null" ] && [ "$remark" != "" ]; then
-        status_tags+=("[备注:$remark]")
-    fi
-
-    if [ "$quota_enabled" = "true" ]; then
-        if [ "$monthly_limit" != "unlimited" ]; then
-            local current_usage=""
-            local limit_bytes
-            limit_bytes=$(parse_size_to_bytes "$monthly_limit" 2>/dev/null || echo 0)
-            if ! [[ "$limit_bytes" =~ ^[0-9]+$ ]] || [ "$limit_bytes" -le 0 ]; then
-                status_tags+=("[配额配置异常:${monthly_limit}]")
-            else
-                local quota_display="$monthly_limit"
-                if [ "$billing_mode" = "double" ]; then
-                    status_tags+=("[双向${quota_display}]")
-                else
-                    status_tags+=("[单向${quota_display}]")
-                fi
-
-                local next_reset_label
-                next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
-                if [ -n "$next_reset_label" ]; then
-                    status_tags+=("[$next_reset_label]")
-                fi
-
-                if ! current_usage=$(get_port_monthly_usage "$port") ||
-                   ! [[ "$current_usage" =~ ^[0-9]+$ ]]; then
-                    status_tags+=("[流量读取失败]")
-                else
-                    local usage_percent=$((current_usage * 100 / limit_bytes))
-                    if [ "$usage_percent" -ge 100 ]; then
-                        status_tags+=("[已超限]")
-                    fi
-                fi
-            fi
-        else
-            if [ "$billing_mode" = "double" ]; then
-                status_tags+=("[双向无限制]")
-            else
-                status_tags+=("[单向无限制]")
-            fi
-        fi
-    fi
-
-    if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ]; then
-        status_tags+=("[限制带宽${rate_limit}]")
-    fi
-
-    if [ -n "$expiry_date" ]; then
-        if is_valid_date "$expiry_date" && date_le "$expiry_date" "$(get_current_date)"; then
-            if port_expiry_rule_layout_complete "$port"; then
-                status_tags+=("[已到期已封锁:${expiry_date}]")
-            else
-                status_tags+=("[已到期/封锁异常:${expiry_date}]")
-            fi
-        else
-            local expiry_rule_count
-            if ! expiry_rule_count=$(count_port_expiry_rules "$port"); then
-                status_tags+=("[到期状态无法读取:${expiry_date}]")
-            elif [ "$expiry_rule_count" -gt 0 ]; then
-                status_tags+=("[到期规则异常:${expiry_date}]")
-            else
-                status_tags+=("[到期:${expiry_date}]")
-            fi
-        fi
-    fi
-
-    if [ ${#status_tags[@]} -gt 0 ]; then
-        printf '%s' "${status_tags[@]}"
-        echo
-    fi
-}
-
-get_port_monthly_usage() {
-    local port=$1
-    read_nftables_counter_data "$port" || return 1
-    local input_bytes="$NFT_COUNTER_INPUT"
-    local output_bytes="$NFT_COUNTER_OUTPUT"
-    local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-
-    calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode"
-}
-
-validate_bandwidth() {
-    local input="$1"
-    local lower_input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-
-    if [[ "$input" == "0" ]]; then
-        return 0
-    elif [[ "$lower_input" =~ ^[0-9]+kbps$ ]] || [[ "$lower_input" =~ ^[0-9]+mbps$ ]] || [[ "$lower_input" =~ ^[0-9]+gbps$ ]]; then
-        return 0
-    else
-        return 1
-    fi
+    echo "$dev"
+}
+
+# 字节数格式化为二进制单位（KB/MB/GB/TB，1024 进制，保留两位小数）。
+format_bytes() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v b="$bytes" 'BEGIN {
+        split("B KB MB GB TB PB", u, " "); i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%dB\n", b; else printf "%.2f%s\n", b, u[i]
+    }'
+}
+
+# "240GB" / "1.5T" / "500M" / "800KB" → 字节；无法解析返回 1。
+parse_size_to_bytes() {
+    local s="${1^^}"
+    s="${s// /}"
+    [[ "$s" =~ ^([0-9]+(\.[0-9]+)?)(K|KB|M|MB|G|GB|T|TB)$ ]] || return 1
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[3]:0:1}" pow
+    case "$unit" in K) pow=1 ;; M) pow=2 ;; G) pow=3 ;; T) pow=4 ;; esac
+    awk -v n="$num" -v p="$pow" 'BEGIN { v = n * (1024 ^ p); printf "%.0f\n", v - (v % 1) }'
 }
 
 validate_quota() {
-    local input="$1"
-    local lower_input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    local bytes
+    bytes=$(parse_size_to_bytes "$1") || return 1
+    [ "$bytes" -gt 0 ]
+}
 
-    if [[ "$input" == "0" ]]; then
-        return 0
-    elif [[ "$lower_input" =~ ^[0-9]+(mb|gb|tb|m|g|t)$ ]]; then
-        return 0
-    else
-        return 1
-    fi
+# 带宽：0 或 数字+kbps/mbps/gbps（不区分大小写）。
+validate_bandwidth() {
+    local v="${1,,}"
+    [ "$v" = "0" ] || [[ "$v" =~ ^[1-9][0-9]*(kbps|mbps|gbps)$ ]]
+}
+
+# 用户输入的带宽（100Mbps）→ tc 速率（100mbit）。
+convert_bandwidth_to_tc() {
+    local v="${1,,}"
+    case "$v" in
+        *kbps) echo "${v%kbps}kbit" ;;
+        *mbps) echo "${v%mbps}mbit" ;;
+        *gbps) echo "${v%gbps}gbit" ;;
+        *) return 1 ;;
+    esac
 }
 
 validate_day_1_31() {
-    local day="$1"
-    [[ "$day" =~ ^[0-9]+$ ]] && [ "$day" -ge 1 ] && [ "$day" -le 31 ]
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 31 ]
 }
 
 validate_month_1_12() {
-    local month="$1"
-    [[ "$month" =~ ^[0-9]+$ ]] && [ "$month" -ge 1 ] && [ "$month" -le 12 ]
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 12 ]
 }
 
-build_reset_policy_json() {
-    local type="$1"
-    shift || true
-    case "$type" in
-        none)
-            echo '{"type":"none"}'
-            ;;
-        monthly)
-            local day="$1"
-            printf '{"type":"monthly","day":%s}\n' "$day"
-            ;;
-        interval_days)
-            local every="$1"
-            local anchor_date="$2"
-            printf '{"type":"interval_days","every":%s,"anchor_date":"%s"}\n' "$every" "$anchor_date"
-            ;;
-        interval_months)
-            local every="$1"
-            local anchor_date="$2"
-            local day="$3"
-            printf '{"type":"interval_months","every":%s,"anchor_date":"%s","day":%s}\n' "$every" "$anchor_date" "$day"
-            ;;
-        yearly)
-            local month="$1"
-            local day="$2"
-            printf '{"type":"yearly","month":%s,"day":%s}\n' "$month" "$day"
-            ;;
-        fixed_date)
-            local date_value="$1"
-            local reset_now="${2:-false}"
-            printf '{"type":"fixed_date","date":"%s","reset_now":%s}\n' "$date_value" "$reset_now"
-            ;;
-    esac
-}
-
-prompt_reset_policy() {
-    local default_day="${1:-1}"
-    RESET_POLICY_CONFIG=""
-
-    while true; do
-        echo
-        echo -e "${BLUE}=== 自动重置策略 ===${NC}"
-        echo "1. 每月几号重置（默认每月${default_day}日）"
-        echo "2. 每隔多少天重置"
-        echo "3. 每隔多少个月重置"
-        echo "4. 每年几月几号重置"
-        echo "5. 指定日期清零一次"
-        echo "0. 不自动重置"
-        echo
-        read -p "请选择(回车默认1) [0-5]: " policy_choice
-
-        case "$policy_choice" in
-            1|"")
-                read -p "每月几号重置(回车默认${default_day}) [1-31]: " reset_day
-                reset_day="${reset_day:-$default_day}"
-                if validate_day_1_31 "$reset_day"; then
-                    RESET_POLICY_CONFIG=$(build_reset_policy_json "monthly" "$reset_day")
-                    return 0
-                fi
-                echo -e "${RED}日期无效，必须是1-31之间的数字${NC}"
-                ;;
-            2)
-                read -p "每隔多少天重置 [1-3650]: " every_days
-                if ! [[ "$every_days" =~ ^[0-9]+$ ]] || [ "$every_days" -lt 1 ] || [ "$every_days" -gt 3650 ]; then
-                    echo -e "${RED}天数无效，必须是1-3650之间的数字${NC}"
-                    continue
-                fi
-                local default_anchor
-                default_anchor=$(get_current_date)
-                read -p "起算日期(回车默认今天${default_anchor}) [YYYY-MM-DD]: " anchor_date
-                anchor_date="${anchor_date:-$default_anchor}"
-                if ! is_valid_date "$anchor_date"; then
-                    echo -e "${RED}起算日期无效，请使用YYYY-MM-DD格式${NC}"
-                    continue
-                fi
-                RESET_POLICY_CONFIG=$(build_reset_policy_json "interval_days" "$every_days" "$anchor_date")
-                return 0
-                ;;
-            3)
-                read -p "每隔多少个月重置 [1-120]: " every_months
-                if ! [[ "$every_months" =~ ^[0-9]+$ ]] || [ "$every_months" -lt 1 ] || [ "$every_months" -gt 120 ]; then
-                    echo -e "${RED}月份间隔无效，必须是1-120之间的数字${NC}"
-                    continue
-                fi
-                local default_anchor
-                default_anchor=$(get_current_date)
-                read -p "起算日期(回车默认今天${default_anchor}) [YYYY-MM-DD]: " anchor_date
-                anchor_date="${anchor_date:-$default_anchor}"
-                if ! is_valid_date "$anchor_date"; then
-                    echo -e "${RED}起算日期无效，请使用YYYY-MM-DD格式${NC}"
-                    continue
-                fi
-                local anchor_parts=($(date_parts "$anchor_date"))
-                read -p "每次按几号重置(回车默认${anchor_parts[2]}) [1-31]: " reset_day
-                reset_day="${reset_day:-${anchor_parts[2]}}"
-                if ! validate_day_1_31 "$reset_day"; then
-                    echo -e "${RED}日期无效，必须是1-31之间的数字${NC}"
-                    continue
-                fi
-                RESET_POLICY_CONFIG=$(build_reset_policy_json "interval_months" "$every_months" "$anchor_date" "$reset_day")
-                return 0
-                ;;
-            4)
-                read -p "每年几月重置 [1-12]: " reset_month
-                read -p "每月几号重置 [1-31]: " reset_day
-                if ! validate_month_1_12 "$reset_month" || ! validate_day_1_31 "$reset_day"; then
-                    echo -e "${RED}月份或日期无效${NC}"
-                    continue
-                fi
-                RESET_POLICY_CONFIG=$(build_reset_policy_json "yearly" "$reset_month" "$reset_day")
-                return 0
-                ;;
-            5)
-                read -p "清零日期 [YYYY-MM-DD]: " fixed_date
-                if ! is_valid_date "$fixed_date"; then
-                    echo -e "${RED}清零日期无效，请使用YYYY-MM-DD格式${NC}"
-                    continue
-                fi
-                if date_lt "$fixed_date" "$(get_current_date)"; then
-                    echo -e "${RED}清零日期不能早于今天${NC}"
-                    continue
-                fi
-                local reset_now="false"
-                if [ "$fixed_date" = "$(get_current_date)" ]; then
-                    read -p "清零日期是今天，是否立即重置当前流量? [y/N]: " reset_now_choice
-                    if [[ "$reset_now_choice" =~ ^[Yy]$ ]]; then
-                        reset_now="true"
-                    else
-                        echo -e "${YELLOW}未立即重置，将在下一次周期检查时执行${NC}"
-                    fi
-                fi
-                RESET_POLICY_CONFIG=$(build_reset_policy_json "fixed_date" "$fixed_date" "$reset_now")
-                return 0
-                ;;
-            0)
-                RESET_POLICY_CONFIG=$(build_reset_policy_json "none")
-                return 0
-                ;;
-            *)
-                echo -e "${RED}无效选择，请输入0-5${NC}"
-                ;;
-        esac
-    done
-}
-
-apply_reset_policy_to_port_locked() {
-    local port="$1"
-    local policy_json="$2"
-    local current_date
-    current_date=$(get_current_date)
-    local policy_type
-    policy_type=$(printf '%s' "$policy_json" | jq -r '.type')
-    local reset_now
-    reset_now=$(printf '%s' "$policy_json" | jq -r '.reset_now // false')
-    local previous_quota
-    previous_quota=$(jq -c --arg port "$port" '.ports[$port].quota' "$CONFIG_FILE") || return 1
-    local policy_instance_id=""
-    if [ "$policy_type" != "none" ]; then
-        # 同一端口、同一应重置日重新建立的策略必须被视为新任务。
-        policy_instance_id="$(get_beijing_time +%s)-$$-${RANDOM:-0}"
-    fi
-
-    if ! update_config_file '
-        .ports[$port].quota.reset_policy = ($policy | del(.reset_now)) |
-        if $policy.type != "none" then
-            .ports[$port].quota.reset_policy.instance_id = $instance
-        else
-            del(.ports[$port].quota.reset_policy.instance_id)
-        end |
-        if $policy.type == "monthly" then
-            .ports[$port].quota.reset_day = $policy.day
-        else
-            del(.ports[$port].quota.reset_day)
-        end
-    ' --arg port "$port" --arg instance "$policy_instance_id" --argjson policy "$policy_json"; then
-        return 1
-    fi
-
-    if [ "$policy_type" = "fixed_date" ] && [ "$reset_now" = "true" ]; then
-        local immediate_status=0
-        check_reset_port_due "$port" || immediate_status=$?
-        case "$immediate_status" in
-            0) return 0 ;;
-            10)
-                if update_config_file '.ports[$port].quota = $quota' \
-                    --arg port "$port" --argjson quota "$previous_quota" >/dev/null 2>&1; then
-                    return 20
-                fi
-                return 22
-                ;;
-            *)
-                # counter 可能已清零，不能伪装恢复旧流量；保留新实例供 cron 幂等补推进。
-                return 21
-                ;;
-        esac
-    fi
-
-    if [ "$policy_type" != "none" ]; then
-        local from_date="$current_date"
-        if [ "$policy_type" != "fixed_date" ]; then
-            from_date=$(add_days_to_date "$current_date" 1)
-        fi
-        local next_reset_date
-        next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
-        if [ -n "$next_reset_date" ]; then
-            if ! update_config_file '
-                .ports[$port].quota.reset_policy.next_reset_date = $next
-            ' --arg port "$port" --arg next "$next_reset_date"; then
-                update_config_file '.ports[$port].quota = $quota' \
-                    --arg port "$port" --argjson quota "$previous_quota" >/dev/null 2>&1 || true
-                return 1
-            fi
-        fi
-    fi
-    return 0
-}
-
-apply_reset_policy_to_port() {
-    local result=0
-    begin_reset_update || return 1
-    apply_reset_policy_to_port_locked "$@" || result=$?
-    finish_reset_update
-    return "$result"
-}
-
-parse_size_to_bytes() {
-    local size_str=$1
-    local number=$(echo "$size_str" | grep -o '^[0-9]\+')
-    local unit=$(echo "$size_str" | grep -o '[A-Za-z]\+$' | tr '[:lower:]' '[:upper:]')
-
-    [ -z "$number" ] && echo "0" && return 1
-
-    case $unit in
-        "MB"|"M") echo $((number * 1048576)) ;;
-        "GB"|"G") echo $((number * 1073741824)) ;;
-        "TB"|"T") echo $((number * 1099511627776)) ;;
-        *) echo "0" ;;
-    esac
-}
-
-
-get_active_ports() {
-    local ports_output
-
-    [ -f "$CONFIG_FILE" ] || return 1
-    jq -e '.ports | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
-    ports_output=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null) || return 1
-    # 没有端口时必须“不输出任何内容”，不能输出一个空行：
-    # 调用方用 mapfile 读取，空行会变成一个“端口名为空”的元素，接着被当成真实端口去建规则、恢复状态。
-    [ -n "$ports_output" ] || return 0
-    printf '%s\n' "${ports_output//$'\r'/}" | sort -n
-}
-
-has_active_ports() {
-    local ports_output
-
-    [ -f "$CONFIG_FILE" ] || return 2
-    ports_output=$(get_active_ports) || return 2
-    [ -n "$ports_output" ]
-}
-
-is_port_range() {
-    local port=$1
-    [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]
-}
-
-get_port_spec_bounds() {
-    local port_spec="$1"
-    if [[ "$port_spec" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
-    elif [[ "$port_spec" =~ ^[0-9]+$ ]]; then
-        echo "$port_spec $port_spec"
-    else
-        return 1
-    fi
-}
-
-port_specs_overlap() {
-    # 逐成员展开比较：端口组的成员不连续，用单一区间近似会把不重叠的判定成重叠。
-    local first="$1"
-    local second="$2"
-    local f_start f_end s_start s_end
-    while read -r f_start f_end; do
-        [ -n "$f_start" ] || continue
-        while read -r s_start s_end; do
-            [ -n "$s_start" ] || continue
-            if [ "$f_start" -le "$s_end" ] && [ "$s_start" -le "$f_end" ]; then
-                return 0
-            fi
-        done < <(expand_unit_intervals "$second")
-    done < <(expand_unit_intervals "$first")
-    return 1
-}
-
-validate_config_file() {
-    local file="$1"
-    local error=""
-
-    if ! jq -e '
-        type == "object" and
-        ((.global // {}) | type == "object") and
-        (.ports | type == "object") and
-        ((.nftables // {}) | type == "object") and
-        ((.notifications // {}) | type == "object") and
-        ((.compat // {}) | type == "object") and
-        ((.notifications.telegram // {}) | type == "object") and
-        ((.notifications.wecom // {}) | type == "object") and
-        ((.notifications.email // {}) | type == "object") and
-        ((.notifications.telegram.status_notifications // {}) | type == "object") and
-        ((.notifications.wecom.status_notifications // {}) | type == "object") and
-        ([.ports[] | type == "object"] | all)
-    ' "$file" >/dev/null 2>&1; then
-        echo "配置根结构或对象字段类型无效" >&2
-        return 1
-    fi
-
-    local family
-    local table_name
-    family=$(jq -r '.nftables.family // "inet"' "$file")
-    table_name=$(jq -r '.nftables.table_name // "port_traffic_monitor"' "$file")
-    if [[ ! "$family" =~ ^(inet|ip|ip6)$ ]] || [[ ! "$table_name" =~ ^[A-Za-z_][A-Za-z0-9_]{0,31}$ ]]; then
-        echo "nftables family 或 table_name 无效" >&2
-        return 1
-    fi
-
-    if ! jq -e '
-        ((.notifications.telegram.enabled // false) | type == "boolean") and
-        ((.notifications.telegram.status_notifications.enabled // false) | type == "boolean") and
-        ((.notifications.wecom.enabled // false) | type == "boolean") and
-        ((.notifications.wecom.status_notifications.enabled // false) | type == "boolean")
-    ' "$file" >/dev/null 2>&1; then
-        echo "通知开关必须为 true 或 false" >&2
-        return 1
-    fi
-    local notification_channel notification_interval
-    for notification_channel in telegram wecom; do
-        notification_interval=$(jq -r --arg channel "$notification_channel" \
-            '.notifications[$channel].status_notifications.interval // "1h"' "$file") || return 1
-        if ! notification_interval_cron_expression "$notification_interval" >/dev/null; then
-            echo "${notification_channel} 状态通知周期无效: $notification_interval" >&2
-            return 1
+# 解析菜单多选输入 "1,3,5" → 去重后的合法序号数组（nameref）。
+parse_multi_choice_input() {
+    local input="$1" max_choice="$2"
+    local -n _pmc_out=$3
+    local choice
+    _pmc_out=()
+    IFS=',' read -ra _pmc_items <<< "$input"
+    for choice in "${_pmc_items[@]}"; do
+        choice="${choice//[[:space:]]/}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$max_choice" ]; then
+            [[ " ${_pmc_out[*]} " == *" $choice "* ]] || _pmc_out+=("$choice")
+        elif [ -n "$choice" ]; then
+            echo -e "${RED}无效选择: $choice${NC}" >&2
         fi
     done
-
-    local ports=()
-    mapfile -t ports < <(jq -r '.ports | keys[]' "$file" 2>/dev/null | tr -d '\r')
-    local port
-    for port in "${ports[@]}"; do
-        # 端口组的成员不连续，逐个成员校验范围与顺序。
-        # 这里刻意用 mapfile 一次收完再遍历，而不是 `while read ... done < <(...)`：
-        # 后者在部分环境下 read 会持续返回 0 却不给变量赋值（实测会空转打满 CPU），
-        # 且 read 的目标变量若声明在循环体内，赋值会落到外层变量上，读到的却是未绑定的新局部。
-        local member_valid=true
-        local member_count=0
-        local member_lines=()
-        mapfile -t member_lines < <(expand_unit_intervals "$port")
-        local member_line
-        local member_start
-        local member_end
-        for member_line in "${member_lines[@]}"; do
-            # 同样避免 read：用参数展开切出 "起始 结束" 两段。
-            member_start="${member_line%% *}"
-            member_end="${member_line##* }"
-            [ -n "$member_start" ] || continue
-            member_count=$((member_count + 1))
-            if ! [[ "$member_start" =~ ^[0-9]+$ && "$member_end" =~ ^[0-9]+$ ]] ||
-               [ "$member_start" -lt 1 ] || [ "$member_end" -gt 65535 ] ||
-               [ "$member_start" -gt "$member_end" ]; then
-                member_valid=false
-                break
-            fi
-        done
-        if [ "$member_valid" != "true" ] || [ "$member_count" -eq 0 ]; then
-            echo "端口或端口段无效: $port" >&2
-            return 1
-        fi
-        if ! unit_intervals_are_disjoint "$port"; then
-            echo "监控项内部端口范围重叠或格式无效: $port" >&2
-            return 1
-        fi
-
-        local billing_mode
-        billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$file")
-        if [ "$billing_mode" != "single" ] && [ "$billing_mode" != "double" ]; then
-            echo "端口 $port 的计费模式无效" >&2
-            return 1
-        fi
-
-        local quota_enabled
-        local quota_limit
-        quota_enabled=$(jq -r --arg port "$port" '.ports[$port].quota.enabled // true' "$file")
-        quota_limit=$(jq -r --arg port "$port" '.ports[$port].quota.monthly_limit // "unlimited"' "$file")
-        if [ "$quota_enabled" != "true" ] && [ "$quota_enabled" != "false" ]; then
-            echo "端口 $port 的配额开关无效" >&2
-            return 1
-        fi
-        if [ "$quota_limit" != "unlimited" ]; then
-            local quota_bytes
-            quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-            if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
-                echo "端口 $port 的流量配额无效" >&2
-                return 1
-            fi
-        fi
-
-        local limit_enabled
-        local rate_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$file")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$file")
-        if [ "$limit_enabled" != "true" ] && [ "$limit_enabled" != "false" ]; then
-            echo "端口 $port 的带宽限制开关无效" >&2
-            return 1
-        fi
-        if [ "$rate_limit" != "unlimited" ] && [ -z "$(convert_bandwidth_to_tc "$rate_limit")" ]; then
-            echo "端口 $port 的带宽限制格式无效" >&2
-            return 1
-        fi
-
-        local expiry_date
-        expiry_date=$(jq -r --arg port "$port" '.ports[$port].expiry_date // empty' "$file")
-        if [ -n "$expiry_date" ] && ! is_valid_date "$expiry_date"; then
-            echo "端口 $port 的服务到期日无效，必须使用 YYYY-MM-DD" >&2
-            return 1
-        fi
-
-        local policy_type
-        policy_type=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.type // empty' "$file")
-        if [ -n "$policy_type" ] && ! is_known_reset_policy_type "$policy_type"; then
-            echo "端口 $port 的重置策略类型无效" >&2
-            return 1
-        fi
-        if ! jq -e --arg port "$port" '
-            (.ports[$port].quota.reset_policy.instance_id? // null) as $id |
-            $id == null or
-            (($id | type) == "string" and ($id | test("^[A-Za-z0-9._-]{1,128}$")))
-        ' "$file" >/dev/null 2>&1; then
-            echo "端口 $port 的重置策略 instance_id 无效" >&2
-            return 1
-        fi
-        if [ -n "$policy_type" ] && [ "$policy_type" != "none" ]; then
-            local policy_day
-            local policy_month
-            local policy_every
-            local policy_date
-            local next_reset_date
-            policy_day=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.day // .ports[$port].quota.reset_day // empty' "$file")
-            policy_month=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.month // empty' "$file")
-            policy_every=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.every // empty' "$file")
-            policy_date=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.date // .ports[$port].quota.reset_policy.anchor_date // empty' "$file")
-            next_reset_date=$(jq -r --arg port "$port" '.ports[$port].quota.reset_policy.next_reset_date // empty' "$file")
-            case "$policy_type" in
-                monthly)
-                    validate_day_1_31 "${policy_day:-1}" || return 1
-                    ;;
-                interval_days)
-                    [[ "$policy_every" =~ ^[0-9]+$ ]] && [ "$policy_every" -ge 1 ] && [ "$policy_every" -le 36500 ] || return 1
-                    is_valid_date "$policy_date" || return 1
-                    ;;
-                interval_months)
-                    [[ "$policy_every" =~ ^[0-9]+$ ]] && [ "$policy_every" -ge 1 ] && [ "$policy_every" -le 1200 ] || return 1
-                    is_valid_date "$policy_date" || return 1
-                    [ -z "$policy_day" ] || validate_day_1_31 "$policy_day" || return 1
-                    ;;
-                yearly)
-                    [[ "$policy_month" =~ ^[0-9]+$ ]] && [ "$policy_month" -ge 1 ] && [ "$policy_month" -le 12 ] || return 1
-                    validate_day_1_31 "$policy_day" || return 1
-                    ;;
-                fixed_date)
-                    is_valid_date "$policy_date" || return 1
-                    ;;
-            esac
-            [ -z "$next_reset_date" ] || is_valid_date "$next_reset_date" || return 1
-        fi
-    done
-
-    local i j
-    for ((i=0; i<${#ports[@]}; i++)); do
-        for ((j=i+1; j<${#ports[@]}; j++)); do
-            if port_specs_overlap "${ports[$i]}" "${ports[$j]}"; then
-                error="${ports[$i]} 与 ${ports[$j]} 重叠"
-                echo "监控端口配置重叠: $error" >&2
-                return 1
-            fi
-        done
-    done
-
-    return 0
-}
-
-generate_port_range_mark() {
-    local port_range=$1
-    # 端口组没有 1.4.x 时代的旧标记（当时不存在端口组）。必须提前返回：
-    # "80,443" 不含 '-'，cut -f2 取到空串，$(( ... )) 会直接语法报错。
-    is_port_group "$port_range" && { echo 0; return 0; }
-    local start_port=$(echo "$port_range" | cut -d'-' -f1)
-    local end_port=$(echo "$port_range" | cut -d'-' -f2)
-    # 仅用于清理 1.4.x 及更早版本的旧 TC 过滤器。
-    echo $(( (start_port * 1000 + end_port) % 65536 ))
-}
-
-get_or_create_port_range_mark() {
-    local port="$1"
-    local class_id="$2"
-    local minor
-    minor=$(tc_class_id_minor "$class_id") || return 1
-    # 仅占用高 20 位，保留低 12 位给策略路由、透明代理等其他使用方。
-    local mark_id=$((0x50000000 | (minor << 12)))
-    if ! update_config_file \
-        '.ports[$port].bandwidth_limit.mark_id = $mark' \
-        --arg port "$port" --argjson mark "$mark_id"; then
-        return 1
-    fi
-    echo "$mark_id"
-}
-
-get_port_range_mark_comment() {
-    local port_safe
-    if is_port_group "$1"; then
-        # 端口组统一 g 前缀 + 全 ASCII 名，与 counter/quota/expiry 的命名保持一致。
-        # 组名里 , 和 - 都换成 _ 是安全的：normalize_unit_key 会拒绝跨监控项的端口重叠，
-        # 所以 "443,5000-5100" 与 "443,5000,5100" 不可能同时存在，不会撞名。
-        port_safe="g$(printf '%s' "$1" | tr ',-' '__')"
-    else
-        port_safe=$(echo "$1" | tr '-' '_')
-    fi
-    echo "ptd_tc_mark_${port_safe}"
-}
-
-remove_port_range_mark_rules() {
-    local port="$1"
-    uses_mark_based_tc_limit "$port" || return 0
-    local table_name
-    local family
-    local comment
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_range_mark_comment "$port")
-
-    while true; do
-        local match_line
-        match_line=$(nft -a list table "$family" "$table_name" 2>/dev/null | awk -v marker="$comment" '
-            /^[[:space:]]*chain[[:space:]]+/ { chain=$2; next }
-            index($0, "comment \"" marker "\"") && /# handle [0-9]+/ {
-                handle=$0; sub(/^.*# handle /, "", handle); sub(/[^0-9].*$/, "", handle)
-                print chain " " handle; exit
-            }
-        ' || true)
-        [ -n "$match_line" ] || break
-        local chain="${match_line%% *}"
-        local handle="${match_line##* }"
-        nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null || return 1
-    done
-}
-
-add_port_range_mark_rules() {
-    local port="$1"
-    local mark_id="$2"
-    local table_name
-    local family
-    local comment
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_range_mark_comment "$port")
-    remove_port_range_mark_rules "$port" || return 1
-
-    # 端口组与端口段的差别只在这里：端口段一个成员，端口组按成员数逐条展开。
-    # 所有成员共用同一个 mark_id，因而共用同一个 tc class，这就是"同组共享限速"。
-    local member_count=0
-    local sel
-    while IFS= read -r sel; do
-        [ -n "$sel" ] || continue
-        member_count=$((member_count + 1))
-        nft add rule "$family" "$table_name" output tcp sport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-        nft add rule "$family" "$table_name" output udp sport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-        nft add rule "$family" "$table_name" forward tcp dport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-        nft add rule "$family" "$table_name" forward udp dport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-        nft add rule "$family" "$table_name" forward tcp sport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-        nft add rule "$family" "$table_name" forward udp sport "$sel" \
-            meta mark set meta mark \& "$TC_MARK_PRESERVE_MASK" \| "$mark_id" comment "$comment" || return 1
-    done < <(port_selectors "$port")
-
-    [ "$member_count" -gt 0 ] || return 1
-    [ "$(nft -a list table "$family" "$table_name" 2>/dev/null | grep -Fc "comment \"$comment\"")" -eq $((6 * member_count)) ]
-}
-
-port_range_mark_rules_complete() {
-    local port="$1"
-    local mark_id="$2"
-    local table_name
-    local family
-    local comment
-    local combined_mask=$((mark_id | TC_MARK_PRESERVE_MASK))
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    comment=$(get_port_range_mark_comment "$port")
-
-    local member_count=0
-    local sel
-    while IFS= read -r sel; do
-        [ -n "$sel" ] && member_count=$((member_count + 1))
-    done < <(port_selectors "$port")
-    [ "$member_count" -gt 0 ] || return 1
-
-    nft -j list table "$family" "$table_name" 2>/dev/null |
-        jq -e --arg comment "$comment" --argjson mark "$mark_id" --argjson mask "$combined_mask" \
-              --argjson want $((6 * member_count)) '
-            [.nftables[] | .rule? | select(.comment == $comment) |
-                select(any(.expr[]?; .mangle? |
-                    .key.meta.key? == "mark" and
-                    .value["|"][1]? == $mark and
-                    .value["|"][0]["&"][1]? == $mask
-                ))
-            ] | length == $want
-        ' >/dev/null
-}
-
-# burst速率突发计算
-# 注意：不要照搬上游的 10ms/64KB 公式。burst 是相对 class **rate** 的桶，而本项目
-# 端口类的 rate 固定为 TC_PORT_CLASS_RATE(1kbit)、只有 ceil 承载限速值，内核会按 rate
-# 归一化 burst（实测：rate 1kbit 下传 6250000 显示 6Kb、传 64k 显示 31176b；rate 500Mbit
-# 下传 6250000 则原样显示）。上游用 rate=ceil=限速值 的结构，其公式在这里不适用，照搬
-# 反而会让高速率下的实际突发从 6Kb 变成 31176b，比原来更宽松。
-calculate_tc_burst() {
-    local base_rate=$1
-    local rate_bytes_per_sec=$((base_rate * 1000 / 8))
-    local burst_by_formula=$((rate_bytes_per_sec / 20))  # 50ms缓冲
-    local min_burst=$((2 * 1500))                        # 2个MTU最小值
-
-    if [ $burst_by_formula -gt $min_burst ]; then
-        echo $burst_by_formula
-    else
-        echo $min_burst
-    fi
-}
-
-format_tc_burst() {
-    local burst_bytes=$1
-    if [ $burst_bytes -lt 1024 ]; then
-        echo "${burst_bytes}"
-    elif [ $burst_bytes -lt 1048576 ]; then
-        echo "$((burst_bytes / 1024))k"
-    else
-        echo "$((burst_bytes / 1048576))m"
-    fi
-}
-
-parse_tc_rate_to_kbps() {
-    local total_limit=$1
-    if [[ "$total_limit" =~ gbit$ ]]; then
-        local rate=$(echo "$total_limit" | sed 's/gbit$//')
-        echo $((rate * 1000000))
-    elif [[ "$total_limit" =~ mbit$ ]]; then
-        local rate=$(echo "$total_limit" | sed 's/mbit$//')
-        echo $((rate * 1000))
-    else
-        echo $(echo "$total_limit" | sed 's/kbit$//')
-    fi
-}
-
-# 将用户输入的带宽值(Kbps/Mbps/Gbps)转换为TC格式(kbit/mbit/gbit)
-convert_bandwidth_to_tc() {
-    local rate="$1"
-    local lower=$(echo "$rate" | tr '[:upper:]' '[:lower:]')
-    if [[ "$lower" =~ kbps$ ]]; then
-        echo "${lower/%kbps/kbit}"
-    elif [[ "$lower" =~ mbps$ ]]; then
-        echo "${lower/%mbps/mbit}"
-    elif [[ "$lower" =~ gbps$ ]]; then
-        echo "${lower/%gbps/gbit}"
-    elif [[ "$lower" =~ ^[0-9]+(kbit|mbit|gbit|bit)$ ]]; then
-        echo "$lower"
-    fi
-}
-
-generate_tc_class_id() {
-    local port=$1
-
-    local stored_class_id
-    stored_class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    local stored_minor
-    if tc_port_class_id_valid "$stored_class_id" >/dev/null 2>&1 &&
-       stored_minor=$(tc_class_id_minor "$stored_class_id" 2>/dev/null); then
-        if ! tc_minor_in_use "$port" "$stored_minor"; then
-            echo "$stored_class_id"
-            return
-        fi
-    fi
-
-    local minor
-    minor=$(generate_tc_minor_base "$port")
-    local attempts=0
-    while [ "$attempts" -lt 65534 ]; do
-        local class_id="1:$(printf '%x' "$minor")"
-        if ! tc_minor_in_use "$port" "$minor"; then
-            local class_exists_status=0
-            tc_class_id_exists "$class_id" || class_exists_status=$?
-            case "$class_exists_status" in
-                0) ;;
-                1)
-                    if save_tc_class_id "$port" "$class_id"; then
-                        echo "$class_id"
-                        return
-                    fi
-                    return 1
-                    ;;
-                *) return 1 ;;
-            esac
-        fi
-
-        minor=$((minor + 1))
-        if [ "$minor" -gt 65535 ]; then
-            minor=2
-        fi
-        attempts=$((attempts + 1))
-    done
-
-    return 1
-}
-
-tc_class_id_minor() {
-    local class_id="$1"
-    [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]] || return 1
-    local minor=$((16#${BASH_REMATCH[1]}))
-    [ "$minor" -ge 2 ] && [ "$minor" -le 65535 ] || return 1
-    echo "$minor"
-}
-
-tc_minor_is_reserved() {
-    local minor="$1"
-    [ "$minor" -eq 1 ] || [ "$minor" -eq $((16#30)) ]
-}
-
-tc_port_class_id_valid() {
-    local class_id="$1"
-    local minor
-    minor=$(tc_class_id_minor "$class_id") || return 1
-    ! tc_minor_is_reserved "$minor"
-}
-
-tc_minor_in_use() {
-    local current_port="$1"
-    local target_minor="$2"
-    tc_minor_is_reserved "$target_minor" && return 0
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local other
-    for other in "${active_ports[@]}"; do
-        [ "$other" = "$current_port" ] && continue
-        local class_id
-        class_id=$(jq -r --arg port "$other" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        local other_minor
-        if tc_port_class_id_valid "$class_id" >/dev/null 2>&1 &&
-           other_minor=$(tc_class_id_minor "$class_id" 2>/dev/null); then
-            if [ "$other_minor" -eq "$target_minor" ]; then
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-tc_class_id_exists() {
-    local class_id="$1"
-    local interface
-    interface=$(get_default_interface 2>/dev/null || true)
-    [ -n "$interface" ] || return 2
-    local class_state
-    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 2
-    printf '%s\n' "$class_state" |
-        awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { found=1 } END { exit found ? 0 : 1 }'
-}
-
-save_tc_class_id() {
-    local port="$1"
-    local class_id="$2"
-
-    tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
-    jq -e --arg port "$port" '.ports[$port] // empty' "$CONFIG_FILE" >/dev/null 2>&1 || return 1
-    update_config_file '
-        if ([.ports | to_entries[] |
-            select(.key != $port and (.value.bandwidth_limit.class_id // "") == $class_id)] | length) == 0 then
-            .ports[$port].bandwidth_limit.class_id = $class_id
-        else
-            error("tc class id collision")
-        end
-    ' \
-        --arg port "$port" \
-        --arg class_id "$class_id"
-}
-
-generate_legacy_tc_class_id() {
-    local port=$1
-    local minor
-    if is_port_range "$port"; then
-        local mark_id
-        mark_id=$(generate_port_range_mark "$port")
-        minor=$((0x2000 + mark_id))
-    elif is_port_group "$port"; then
-        # 端口组是 1.5.21 才引入的概念，1.4.x 及更早版本不存在对应的 legacy class。
-        # 必须显式返回空：落到单端口分支时 $((0x1000 + "80,443")) 里逗号是算术运算符，
-        # 会静默算出 0x1000+443 这样一个错值，进而误删单端口 443 的 class。
-        return 0
-    else
-        minor=$((0x1000 + port))
-    fi
-    echo "1:$(printf '%x' "$minor")"
-}
-
-generate_tc_minor_base() {
-    local port=$1
-    local preferred_minor
-    local fallback_minor
-    if is_port_range "$port"; then
-        local mark_id
-        mark_id=$(generate_port_range_mark "$port")
-        preferred_minor=$((0x2000 + mark_id))
-        fallback_minor=$((0x8000 + (mark_id % 0x7fff)))
-    elif is_port_group "$port"; then
-        # 端口组：成员是变长集合，没法像单端口那样从端口号直接派生，只能哈希。
-        # 取值落在 [2, 0xFFF]，与上游 assign_group_rule_id 的区间一致，避开单端口
-        # (0x1000+) 与端口段 (0x2000+) 两段；真撞车由 generate_tc_class_id 的递增循环兜底。
-        local seed=2166136261
-        local m ci ch
-        while IFS= read -r m; do
-            for ((ci = 0; ci < ${#m}; ci++)); do
-                ch=$(printf '%d' "'${m:$ci:1}")
-                seed=$(( ((seed ^ ch) * 16777619) & 0x7fffffff ))
-            done
-            seed=$(( ((seed ^ 44) * 16777619) & 0x7fffffff ))
-        done < <(port_selectors "$port")
-        preferred_minor=$((2 + seed % 0xFFE))
-        fallback_minor=$((2 + (seed / 8191) % 0xFFE))
-    else
-        preferred_minor=$((0x1000 + port))
-        fallback_minor=$((2 + (((port * 1103515245 + 12345) & 0x7fffffff) % 65534)))
-    fi
-
-    if [ "$preferred_minor" -ge 2 ] && [ "$preferred_minor" -le 65535 ]; then
-        echo "$preferred_minor"
-    else
-        echo "$fallback_minor"
-    fi
-}
-
-get_daily_total_traffic() {
-    local total_bytes=0
-    local ports=($(get_active_ports))
-    for port in "${ports[@]}"; do
-        read_nftables_counter_data "$port" || return 1
-        local input_bytes="$NFT_COUNTER_INPUT"
-        local output_bytes="$NFT_COUNTER_OUTPUT"
-        local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-        local port_total=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
-        total_bytes=$(( total_bytes + port_total ))
-    done
-    format_bytes $total_bytes
 }
 
 is_leap_year() {
@@ -4999,7 +879,7 @@ clamp_day_to_month() {
 }
 
 get_current_date() {
-    get_beijing_time +%Y-%m-%d
+    beijing_date +%Y-%m-%d
 }
 
 date_parts() {
@@ -5018,7 +898,7 @@ is_valid_date() {
     local date_value="$1"
     [[ "$date_value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
 
-    local parts=($(date_parts "$date_value"))
+    local -a parts; read -ra parts <<< "$(date_parts "$date_value")"
     local year="${parts[0]}"
     local month="${parts[1]}"
     local day="${parts[2]}"
@@ -5038,12 +918,6 @@ date_le() {
     [[ "$1" < "$2" || "$1" = "$2" ]]
 }
 
-is_before_daily_reset_check() {
-    local hm
-    hm=$(get_beijing_time +%H%M)
-    [ "$((10#$hm))" -lt 5 ]
-}
-
 days_before_year() {
     local year="$1"
     local previous_year=$((year - 1))
@@ -5053,7 +927,7 @@ days_before_year() {
 date_to_ordinal() {
     local date_value="$1"
     is_valid_date "$date_value" || return 1
-    local parts=($(date_parts "$date_value"))
+    local -a parts; read -ra parts <<< "$(date_parts "$date_value")"
     local year="${parts[0]}"
     local month="${parts[1]}"
     local day="${parts[2]}"
@@ -5112,7 +986,7 @@ add_months_to_date() {
     local date_value="$1"
     local months="$2"
     local desired_day="${3:-}"
-    local parts=($(date_parts "$date_value"))
+    local -a parts; read -ra parts <<< "$(date_parts "$date_value")"
     local year="${parts[0]}"
     local month="${parts[1]}"
     local day="${parts[2]}"
@@ -5121,7 +995,7 @@ add_months_to_date() {
         day="$desired_day"
     fi
 
-    local normalized=($(normalize_year_month "$year" "$((month + months))"))
+    local -a normalized; read -ra normalized <<< "$(normalize_year_month "$year" "$((month + months))")"
     year="${normalized[0]}"
     month="${normalized[1]}"
     day=$(clamp_day_to_month "$year" "$month" "$day")
@@ -5134,7 +1008,7 @@ add_years_to_date() {
     local years="$2"
     local desired_month="${3:-}"
     local desired_day="${4:-}"
-    local parts=($(date_parts "$date_value"))
+    local -a parts; read -ra parts <<< "$(date_parts "$date_value")"
     local year="${parts[0]}"
     local month="${parts[1]}"
     local day="${parts[2]}"
@@ -5151,21 +1025,1000 @@ add_years_to_date() {
     format_date "$year" "$month" "$day"
 }
 
-get_port_created_date() {
-    local port="$1"
-    local created_at
-    created_at=$(jq -r ".ports.\"$port\".created_at // empty" "$CONFIG_FILE" 2>/dev/null)
-    if [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
-        echo "${created_at:0:10}"
-    else
-        get_current_date
+# 清屏只在交互终端、非 dumb、未设置 NO_COLOR 时进行（clear 输出的是控制序列）。
+menu_clear() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
+}
+
+# ── 配置（schema 2） ──────────────────────────────────────────────
+# 监控项以稳定 ID（m1、m2…）为身份，端口只是成员列表：
+#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at }
+# 所有 nft/tc/统计/历史的名字都从 ID 派生，所以加减端口不会改变身份。
+
+default_config_json() {
+    jq -n --argjson schema "$CONFIG_SCHEMA" '{
+        schema: $schema,
+        global: { billing_mode: "double", next_monitor_id: 1, data_retention_days: 400 },
+        monitors: {},
+        notifications: {
+            telegram: { enabled: false, bot_token: "", chat_id: "", server_name: "",
+                        api_route: "official", custom_api_base: "",
+                        status_notifications: { enabled: false, interval: "1h" } },
+            wecom: { enabled: false, webhook_url: "", server_name: "",
+                     status_notifications: { enabled: false, interval: "1h" } }
+        }
+    }'
+}
+
+# jq 程序：校验 schema 2 配置。输出错误字符串数组，空数组表示通过。
+readonly CONFIG_VALIDATOR_JQ='
+def leap($y): (($y % 4 == 0) and ($y % 100 != 0)) or ($y % 400 == 0);
+def mdays($y; $m): if $m == 2 then (if leap($y) then 29 else 28 end)
+                   elif ([4,6,9,11] | index($m)) then 30 else 31 end;
+def valid_date: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$") and
+    ((.[0:4] | tonumber) as $y | (.[5:7] | tonumber) as $m | (.[8:10] | tonumber) as $d |
+     $m >= 1 and $m <= 12 and $d >= 1 and $d <= mdays($y; $m));
+def day_ok: type == "number" and . >= 1 and . <= 31 and floor == .;
+def size_ok: type == "string" and (. == "unlimited" or test("^[0-9]+(\\.[0-9]+)?(K|KB|M|MB|G|GB|T|TB)$"; "i"));
+def rate_ok: type == "string" and (. == "unlimited" or test("^[1-9][0-9]*(kbit|mbit|gbit)$"));
+def interval_ok: type == "string" and IN("1m","15m","30m","1h","2h","6h","12h","24h");
+def spec_bounds: if test("^[0-9]+$") then [tonumber, tonumber]
+                 elif test("^[0-9]+-[0-9]+$") then (split("-") | map(tonumber))
+                 else null end;
+def monitor_errors($id):
+    . as $m |
+    [ (if ($id | test("^m[1-9][0-9]{0,5}$")) | not then "监控项 ID 无效: \($id)" else empty end),
+      (if ($m | type) != "object" then "监控项 \($id) 不是对象" else empty end),
+      (if ($m.ports | type) != "array" or ($m.ports | length) == 0 then "监控项 \($id) 没有端口"
+       else ($m.ports[] | select(type != "string" or spec_bounds == null or
+               (spec_bounds | .[0] < 1 or .[1] > 65535 or .[0] > .[1])) |
+             "监控项 \($id) 的端口无效: \(.)") end),
+      (if (($m.billing_mode // "double") | IN("single", "double")) | not then "监控项 \($id) 计费模式无效" else empty end),
+      (if (($m.remark // "") | type) != "string" or (($m.remark // "") | length) > 64 then "监控项 \($id) 备注无效（最长 64 字符）" else empty end),
+      (if ($m.quota // {}) | type != "object" then "监控项 \($id) quota 无效" else empty end),
+      (if (($m.quota.enabled // false) | type) != "boolean" then "监控项 \($id) 配额开关无效" else empty end),
+      (if (($m.quota.monthly_limit // "unlimited") | size_ok) | not then "监控项 \($id) 配额大小无效" else empty end),
+      (if (($m.bandwidth_limit.enabled // false) | type) != "boolean" then "监控项 \($id) 限速开关无效" else empty end),
+      (if (($m.bandwidth_limit.rate // "unlimited") | rate_ok) | not then "监控项 \($id) 限速值无效" else empty end),
+      (if ($m.expiry_date // "") != "" and (($m.expiry_date | valid_date) | not) then "监控项 \($id) 到期日无效（YYYY-MM-DD）" else empty end),
+      ( ($m.reset_policy // null) as $p |
+        if $p == null then empty
+        elif ($p | type) != "object" then "监控项 \($id) 重置策略无效"
+        else
+          (if ($p.type | IN("none","monthly","interval_days","interval_months","yearly","fixed_date")) | not
+             then "监控项 \($id) 重置策略类型无效" else empty end),
+          (if $p.type == "monthly" and ((($p.day // 1) | day_ok) | not) then "监控项 \($id) 每月重置日无效" else empty end),
+          (if ($p.type | IN("interval_days","interval_months")) and
+              (($p.every | type) != "number" or $p.every < 1 or $p.every > 36500 or ((($p.date // $p.anchor_date) | valid_date) | not))
+             then "监控项 \($id) 周期重置参数无效" else empty end),
+          (if $p.type == "yearly" and ((($p.month | type) != "number") or $p.month < 1 or $p.month > 12 or (($p.day | day_ok) | not))
+             then "监控项 \($id) 每年重置日期无效" else empty end),
+          (if $p.type == "fixed_date" and ((($p.date | valid_date) | not)) then "监控项 \($id) 一次性重置日期无效" else empty end),
+          (if ($p.next_reset_date // "") != "" and (($p.next_reset_date | valid_date) | not) then "监控项 \($id) 下次重置日期无效" else empty end)
+        end )
+    ];
+if type != "object" then ["配置根不是对象"]
+elif .schema != 2 then ["配置 schema 不是 2"]
+elif (.monitors | type) != "object" then ["monitors 不是对象"]
+else
+  [ (.monitors | to_entries[] | .value as $v | .key as $k | $v | monitor_errors($k)[]),
+    ( [ .monitors | to_entries[] | .key as $k | .value.ports[]? | select(type == "string") |
+        spec_bounds | select(. != null) | {k: $k, s: .[0], e: .[1]} ] | sort_by(.s) as $iv |
+      range(1; $iv | length) | select($iv[.].s <= $iv[. - 1].e) |
+      "端口重叠：\($iv[. - 1].k) 与 \($iv[.].k)" ),
+    (if ((.global.next_monitor_id // 1) | type) != "number" then "global.next_monitor_id 无效" else empty end),
+    (.notifications // {} | to_entries[] | select(.key | IN("telegram","wecom")) |
+      .key as $c | .value |
+      (if ((.enabled // false) | type) != "boolean" then "\($c) 开关无效" else empty end),
+      (if ((.status_notifications.interval // "1h") | interval_ok) | not then "\($c) 推送周期无效" else empty end))
+  ]
+end
+'
+
+# 校验配置文件；有错误时逐条打印到 stderr 并返回 1。
+# 1.5.x 配置（有 .ports、无 .schema）按“迁移后能否通过校验”判断：1.5.x 的 --update 会先用新脚本
+# 校验当前配置再安装，这里拒绝就会让旧版无法原地升级。
+validate_config_file() {
+    local file="$1" errors input
+    if ! input=$(jq -c '.' "$file" 2>/dev/null) || [ -z "$input" ]; then
+        echo "配置文件不是有效 JSON: $file" >&2
+        return 1
     fi
+    if jq -e 'type == "object" and (has("schema") | not) and (.ports | type) == "object"' <<< "$input" >/dev/null 2>&1; then
+        input=$(legacy_build_config "$input" 2>/dev/null | jq -c '.config' 2>/dev/null) || input=""
+        if [ -z "$input" ] || [ "$input" = "null" ]; then
+            echo "1.5.x 配置无法转换为 2.0 格式: $file" >&2
+            return 1
+        fi
+    fi
+    errors=$(jq -c "$CONFIG_VALIDATOR_JQ" <<< "$input" 2>/dev/null) || errors='["配置校验器执行失败"]'
+    [ "$errors" = "[]" ] && return 0
+    jq -r '.[]' <<< "$errors" | sed 's/^/配置错误：/' >&2
+    return 1
+}
+
+config_exists() {
+    [ -s "$CONFIG_FILE" ]
+}
+
+config_schema() {
+    jq -r '.schema // (if has("ports") then 1 else 0 end)' "$CONFIG_FILE" 2>/dev/null || echo 0
+}
+
+# 读取配置字段：cfg '<jq 过滤器>' [jq 参数...]；输出原始字符串。
+cfg() {
+    local filter="$1"
+    shift
+    jq -r "$@" "$filter" "$CONFIG_FILE"
+}
+
+# 在 Dog 锁内修改配置，并在写入前校验结果，非法结果不会落盘。
+config_update() {
+    local filter="$1" out rc=0
+    shift
+    dog_lock || return 75
+    if ! out=$(jq "$@" "$filter" "$CONFIG_FILE"); then
+        dog_unlock; dog_log_event config_update 1; return 1
+    fi
+    # 内容未变化：不写文件、不记日志。
+    if [ "$(jq -cS . <<< "$out")" = "$(jq -cS . "$CONFIG_FILE" 2>/dev/null)" ]; then
+        dog_unlock; return 0
+    fi
+    local errors
+    errors=$(jq -c "$CONFIG_VALIDATOR_JQ" <<< "$out" 2>/dev/null || echo '["jq 失败"]')
+    if [ "$errors" != "[]" ]; then
+        jq -r '.[]' <<< "$errors" 2>/dev/null | sed 's/^/配置错误：/' >&2
+        dog_unlock; dog_log_event config_update 1; return 1
+    fi
+    printf '%s\n' "$out" | atomic_write "$CONFIG_FILE" 600 || rc=1
+    dog_unlock
+    dog_log_event config_update "$rc"
+    return "$rc"
+}
+
+ensure_config() {
+    mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$BACKUP_DIR"
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+    if ! config_exists; then
+        default_config_json | atomic_write "$CONFIG_FILE" 600 || return 1
+    fi
+}
+
+# 监控项 ID 列表，按数字顺序。
+monitor_ids() {
+    jq -r '.monitors | keys[]' "$CONFIG_FILE" 2>/dev/null | sort -t m -k2 -n
+}
+
+has_monitors() {
+    jq -e '(.monitors // {}) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+monitor_exists() {
+    [[ "$1" =~ ^m[0-9]+$ ]] && jq -e --arg id "$1" '.monitors | has($id)' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 读取监控项字段：mget <id> <jq 路径（相对监控项）> [默认值]
+mget() {
+    local id="$1" path="$2" default="${3:-}"
+    jq -r --arg id "$id" --arg d "$default" ".monitors[\$id]${path} // \$d" "$CONFIG_FILE"
+}
+
+monitor_ports() {
+    jq -r --arg id "$1" '.monitors[$id].ports[]?' "$CONFIG_FILE"
+}
+
+monitor_ports_csv() {
+    jq -r --arg id "$1" '(.monitors[$id].ports // []) | join(",")' "$CONFIG_FILE"
+}
+
+# 显示用标签：备注 + 端口，端口过多时截断。
+monitor_label() {
+    jq -r --arg id "$1" '
+        .monitors[$id] as $m |
+        ($m.ports | join(",")) as $p |
+        (if ($p | length) > 40 then ($p[0:37] + "…") else $p end) as $ps |
+        if ($m.remark // "") != "" then "\($m.remark)（\($ps)）" else $ps end
+    ' "$CONFIG_FILE"
+}
+
+monitor_billing_multiplier() {
+    [ "$(mget "$1" .billing_mode double)" = "single" ] && echo 1 || echo 2
+}
+
+# 分配新 ID（调用方需持有 Dog 锁，并在同一次 config_update 中写回 next_monitor_id）。
+next_monitor_id() {
+    jq -r '
+        ([.monitors | keys[] | ltrimstr("m") | tonumber] | max // 0) as $max |
+        [(.global.next_monitor_id // 1), $max + 1] | max | "m\(.)"
+    ' "$CONFIG_FILE"
+}
+
+# 把 "m3" 或成员端口 "8031" 解析为监控项 ID。
+resolve_monitor() {
+    local ref="$1" id
+    if [[ "$ref" =~ ^[mM]([0-9]+)$ ]]; then
+        id="m${BASH_REMATCH[1]}"
+        monitor_exists "$id" && { echo "$id"; return 0; }
+        return 1
+    fi
+    [[ "$ref" =~ ^[0-9]+$ ]] || return 1
+    id=$(jq -r --argjson p "$ref" '
+        .monitors | to_entries[] | select(any(.value.ports[];
+            (if test("-") then (split("-") | map(tonumber)) else [tonumber, tonumber] end) as $b |
+            $p >= $b[0] and $p <= $b[1])) | .key' "$CONFIG_FILE" | head -n1)
+    [ -n "$id" ] || return 1
+    echo "$id"
+}
+
+# ── 端口解析 ──────────────────────────────────────────────────────
+# 输入语法：`;` 分隔多个独立监控项；`,` 分隔同一监控项的成员；`-` 表示端口段。
+# 例：`80,443;8080-8090` → 两个监控项 [80,443] 与 [8080-8090]。
+
+# 规范化单个端口或端口段；非法时返回 1。
+port_spec_normalize() {
+    local s="${1//[[:space:]]/}" a b
+    if [[ "$s" =~ ^[0-9]+$ ]]; then
+        a=$((10#$s))
+        [ "$a" -ge 1 ] && [ "$a" -le 65535 ] || return 1
+        echo "$a"
+    elif [[ "$s" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+        [ "$a" -ge 1 ] && [ "$b" -le 65535 ] && [ "$a" -le "$b" ] || return 1
+        if [ "$a" -eq "$b" ]; then echo "$a"; else echo "$a-$b"; fi
+    else
+        return 1
+    fi
+}
+
+port_spec_start() { echo "${1%%-*}"; }
+port_spec_end() { echo "${1##*-}"; }
+
+# 把 "443,80,8000-8010" 解析为规范化、排序后的成员（每行一个）。
+# 成员之间重叠时报错；完全重复的成员自动去重。
+parse_port_list() {
+    local input="$1" item norm
+    local -a specs=()
+    IFS=',' read -ra _ppl_items <<< "$input"
+    for item in "${_ppl_items[@]}"; do
+        [ -n "${item//[[:space:]]/}" ] || continue
+        if ! norm=$(port_spec_normalize "$item"); then
+            echo -e "${RED}无效端口或端口段：$item（范围 1-65535，端口段写作 起始-结束）${NC}" >&2
+            return 1
+        fi
+        specs+=("$norm")
+    done
+    [ "${#specs[@]}" -gt 0 ] || { echo -e "${RED}没有输入端口${NC}" >&2; return 1; }
+    local sorted prev_end=0 prev="" spec s e
+    sorted=$(printf '%s\n' "${specs[@]}" | sort -t- -k1,1n -k2,2n -u)
+    while IFS= read -r spec; do
+        s=$(port_spec_start "$spec"); e=$(port_spec_end "$spec")
+        if [ -n "$prev" ] && [ "$s" -le "$prev_end" ]; then
+            echo -e "${RED}端口 $prev 与 $spec 重叠${NC}" >&2
+            return 1
+        fi
+        prev="$spec"; prev_end="$e"
+        echo "$spec"
+    done <<< "$sorted"
+}
+
+# 把 "a;b;c" 拆成若干监控项，每项是规范化后的逗号串，写入 nameref 数组。
+parse_monitor_units() {
+    local input="$1" unit members
+    local -n _pmu_out=$2
+    _pmu_out=()
+    IFS=';' read -ra _pmu_units <<< "$input"
+    for unit in "${_pmu_units[@]}"; do
+        [ -n "${unit//[[:space:]]/}" ] || continue
+        members=$(parse_port_list "$unit") || return 1
+        _pmu_out+=("$(paste -sd, <<< "$members")")
+    done
+    [ "${#_pmu_out[@]}" -gt 0 ] || { echo -e "${RED}没有输入端口${NC}" >&2; return 1; }
+    # 新输入的各项之间也不能重叠
+    local all
+    all=$(IFS=,; echo "${_pmu_out[*]}")
+    parse_port_list "$all" >/dev/null || return 1
+}
+
+# 逗号串 → JSON 数组
+ports_csv_to_json() {
+    jq -cn --arg s "$1" '$s | split(",") | map(select(length > 0))'
+}
+
+# 检查端口（JSON 数组）是否与现有监控项冲突；$2 为要排除的监控项 ID。
+# 冲突时输出 "监控项ID 端口" 并返回 0；无冲突返回 1。
+find_port_conflict() {
+    local ports_json="$1" exclude="${2:-}"
+    jq -r --argjson new "$ports_json" --arg ex "$exclude" '
+        def b: if test("-") then (split("-") | map(tonumber)) else [tonumber, tonumber] end;
+        [ .monitors | to_entries[] | select(.key != $ex) | .key as $k | .value.ports[] |
+          {k: $k, p: ., r: b} ] as $old |
+        [ $new[] | b as $n | . as $np | $old[] |
+          select(.r[0] <= $n[1] and $n[0] <= .r[1]) | "\(.k) \(.p) \($np)" ] | first // empty
+    ' "$CONFIG_FILE"
+}
+
+# 端口集合运算：在 JSON 数组上做并/差（按规范化字符串精确匹配成员）。
+ports_json_union() {
+    jq -cn --argjson a "$1" --argjson b "$2" '$a + $b | unique'
+}
+
+ports_json_minus() {
+    jq -cn --argjson a "$1" --argjson b "$2" '$a - $b'
+}
+
+# 端口 JSON 数组按数值排序并检查内部重叠；输出排序后的 JSON。
+ports_json_normalize() {
+    local csv members
+    csv=$(jq -r 'join(",")' <<< "$1")
+    members=$(parse_port_list "$csv") || return 1
+    jq -cRn '[inputs | select(length > 0)]' <<< "$members"
+}
+
+# 渲染为 nft 集合元素："8031, 9000-9010"
+ports_json_to_nft_elements() {
+    jq -r 'join(", ")' <<< "$1"
+}
+
+# 当前系统监听端口（程序名 → 端口），添加监控时作参考。
+show_listening_ports() {
+    command -v ss >/dev/null 2>&1 || return 0
+    echo -e "${GREEN}当前监听端口：${NC}"
+    ss -tulnpH 2>/dev/null | awk '
+        {
+            n = split($5, a, ":"); port = a[n]
+            prog = "-"
+            if (match($0, /users:\(\("[^"]+"/)) { prog = substr($0, RSTART + 9, RLENGTH - 10) }
+            if (port ~ /^[0-9]+$/ && !seen[prog SUBSEP port]++) list[prog] = list[prog] (list[prog] ? "," : "") port
+        }
+        END { for (p in list) printf "  %-18s %s\n", p, list[p] }
+    ' | sort | head -n 30
+}
+
+# ── nftables 后端 ─────────────────────────────────────────────────
+# 表结构（每个监控项的规则数固定，与端口数量无关）：
+#
+#   map ptd_in_dport   { inet_service : verdict; interval }   端口 → jump ptd_<id>_in
+#   map ptd_out_sport  { inet_service : verdict; interval }   端口 → jump ptd_<id>_out
+#   map ptd_mark_sport / ptd_mark_dport                       启用限速时：端口 → jump ptd_<id>_mark
+#   chain input   : meta l4proto {tcp,udp} th dport vmap @ptd_in_dport
+#   chain output  : … th sport vmap @ptd_out_sport ; … th sport vmap @ptd_mark_sport
+#   chain forward : … th dport vmap @ptd_in_dport ; … th sport vmap @ptd_out_sport ;
+#                   … th dport vmap @ptd_mark_dport ; … th sport vmap @ptd_mark_sport
+#   chain ptd_<id>_in / _out : [到期 drop] [quota … drop] counter name ptd_<id>_in|out
+#   chain ptd_<id>_mark      : meta mark set meta mark & 0xfff | <mark>
+#
+# 计数器只记原始字节；计费倍率（双向 ×2 / 单向 ×1）在软件中计算，配额阈值 = 限额 ÷ 倍率。
+# 加减端口只增删 map 元素，counter/quota 对象不受影响，因此流量与已用配额完整保留。
+
+nft_t() { printf '%s %s' "$NFT_FAMILY" "$NFT_TABLE"; }
+
+nft_available() {
+    command -v nft >/dev/null 2>&1
+}
+
+nft_table_exists() {
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1
+}
+
+# 原子执行一段 nft 脚本（标准输入）。失败时把错误和脚本保存到日志目录，便于排查。
+nft_apply() {
+    local script err rc=0
+    script=$(cat)
+    [ -n "$script" ] || return 0
+    err=$(printf '%s\n' "$script" | nft -f - 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        { echo "# $(date -u +%FT%TZ) rc=$rc"; echo "$err" | sed 's/^/# /'; echo "$script"; } \
+            > "$LOG_DIR/nft-last-failure.nft" 2>/dev/null || true
+        chmod 600 "$LOG_DIR/nft-last-failure.nft" 2>/dev/null || true
+        dog_error "nftables 事务失败：$(head -n 3 <<< "$err" | tr '\n' ' ')（详见 $LOG_DIR/nft-last-failure.nft）"
+        return 1
+    fi
+}
+
+# 当前运行状态摘要（一次 nft 调用）：
+# {counters:{name:bytes}, quotas:{name:{limit,used}}, chains:{name:[rule 摘要]}, maps:{name:{key:target}}}
+nft_runtime_json() {
+    local raw
+    raw=$(nft -j list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null) || { echo 'null'; return 1; }
+    jq -c '
+        def key: if type == "object" and has("range") then "\(.range[0])-\(.range[1])" else tostring end;
+        .nftables as $o |
+        { counters: ([$o[] | .counter? // empty | {(.name): .bytes}] | add // {}),
+          quotas:   ([$o[] | .quota? // empty | {(.name): {limit: .bytes, used: .used}}] | add // {}),
+          chains:   ([$o[] | .chain? // empty | {(.name): []}] | add // {}),
+          rules:    ([$o[] | .rule? // empty | {chain, comment: (.comment // ""),
+                        kind: ([.expr[] | keys[0]] | join("+"))}] ),
+          maps:     ([$o[] | .map? // empty | {(.name): ([(.elem // [])[] | {(.[0] | key): (.[1].jump.target // "")}] | add // {})}] | add // {})
+        } | .chains = (reduce .rules[] as $r (.chains; .[$r.chain] += [($r.kind + (if $r.comment != "" then "#" + $r.comment else "" end))])) | del(.rules)
+    ' <<< "$raw"
+}
+
+# 期望的配额原始字节阈值：限额 ÷ 倍率（向上取整）。不启用配额时输出空。
+monitor_quota_raw_limit() {
+    local id="$1" enabled limit bytes mult
+    enabled=$(mget "$id" .quota.enabled false)
+    limit=$(mget "$id" .quota.monthly_limit unlimited)
+    [ "$enabled" = "true" ] && [ "$limit" != "unlimited" ] || return 0
+    bytes=$(parse_size_to_bytes "$limit") || return 0
+    mult=$(monitor_billing_multiplier "$id")
+    echo $(( (bytes + mult - 1) / mult ))
+}
+
+monitor_is_expired() {
+    local id="$1" exp
+    exp=$(mget "$id" .expiry_date "")
+    [ -n "$exp" ] && date_le "$exp" "$(get_current_date)"
+}
+
+monitor_tc_mark() {
+    local id="$1"
+    [ "$(mget "$id" .bandwidth_limit.enabled false)" = "true" ] || return 1
+    local mark
+    mark=$(mget "$id" .bandwidth_limit.mark_id "")
+    [[ "$mark" =~ ^[0-9]+$ ]] && [ "$mark" -gt 0 ] || return 1
+    echo "$mark"
+}
+
+# 渲染监控项链内规则（假定链已存在且为空）。
+nft_render_monitor_rules() {
+    local id="$1" t dir quota mark
+    t=$(nft_t)
+    quota=$(monitor_quota_raw_limit "$id")
+    for dir in in out; do
+        if monitor_is_expired "$id"; then
+            printf 'add rule %s ptd_%s_%s drop comment "ptd_expired"\n' "$t" "$id" "$dir"
+        fi
+        if [ -n "$quota" ]; then
+            printf 'add rule %s ptd_%s_%s quota name "ptd_%s_quota" drop\n' "$t" "$id" "$dir" "$id"
+        fi
+        printf 'add rule %s ptd_%s_%s counter name "ptd_%s_%s"\n' "$t" "$id" "$dir" "$id" "$dir"
+    done
+    if mark=$(monitor_tc_mark "$id"); then
+        printf 'add rule %s ptd_%s_mark meta mark set meta mark and %s or %s\n' \
+            "$t" "$id" "$TC_MARK_PRESERVE_MASK" "$(printf '0x%08x' "$mark")"
+    fi
+}
+
+# 渲染 map 元素（add 或 delete）。$3 为端口 JSON 数组。
+nft_render_elements() {
+    local op="$1" id="$2" ports_json="$3" t elems
+    t=$(nft_t)
+    [ "$(jq 'length' <<< "$ports_json")" -gt 0 ] || return 0
+    if [ "$op" = "add" ]; then
+        elems=$(jq -r --arg id "$id" 'map("\(.) : jump ptd_\($id)_DIR") | join(", ")' <<< "$ports_json")
+        printf 'add element %s %s { %s }\n' "$t" "$NFT_MAP_IN" "${elems//_DIR/_in}"
+        printf 'add element %s %s { %s }\n' "$t" "$NFT_MAP_OUT" "${elems//_DIR/_out}"
+        if monitor_tc_mark "$id" >/dev/null; then
+            printf 'add element %s %s { %s }\n' "$t" "$NFT_MAP_MARK_SPORT" "${elems//_DIR/_mark}"
+            printf 'add element %s %s { %s }\n' "$t" "$NFT_MAP_MARK_DPORT" "${elems//_DIR/_mark}"
+        fi
+    else
+        elems=$(ports_json_to_nft_elements "$ports_json")
+        printf 'delete element %s %s { %s }\n' "$t" "$NFT_MAP_IN" "$elems"
+        printf 'delete element %s %s { %s }\n' "$t" "$NFT_MAP_OUT" "$elems"
+        if [ "${4:-}" = "with_mark" ]; then
+            printf 'delete element %s %s { %s }\n' "$t" "$NFT_MAP_MARK_SPORT" "$elems"
+            printf 'delete element %s %s { %s }\n' "$t" "$NFT_MAP_MARK_DPORT" "$elems"
+        fi
+    fi
+}
+
+# 渲染一个监控项的对象、链与规则（不含映射元素）。$2..$4 为初始 in/out/quota_used 原始字节。
+nft_render_monitor_objects() {
+    local id="$1" in_b="${2:-0}" out_b="${3:-0}" used="${4:-0}" t quota
+    t=$(nft_t)
+    printf 'add counter %s ptd_%s_in { packets 0 bytes %s }\n' "$t" "$id" "$in_b"
+    printf 'add counter %s ptd_%s_out { packets 0 bytes %s }\n' "$t" "$id" "$out_b"
+    quota=$(monitor_quota_raw_limit "$id")
+    if [ -n "$quota" ]; then
+        printf 'add quota %s ptd_%s_quota { over %s bytes used %s bytes }\n' "$t" "$id" "$quota" "$used"
+    fi
+    printf 'add chain %s ptd_%s_in\n' "$t" "$id"
+    printf 'add chain %s ptd_%s_out\n' "$t" "$id"
+    if monitor_tc_mark "$id" >/dev/null; then
+        printf 'add chain %s ptd_%s_mark\n' "$t" "$id"
+    fi
+    nft_render_monitor_rules "$id"
+}
+
+monitor_ports_json() {
+    jq -c --arg id "$1" '.monitors[$id].ports' "$CONFIG_FILE"
+}
+
+# 渲染一个监控项的全部对象与映射元素（用于向已有表中添加：映射已存在）。
+nft_render_monitor() {
+    nft_render_monitor_objects "$@"
+    nft_render_elements add "$1" "$(monitor_ports_json "$1")"
+}
+
+# 渲染整张表。$1 为初始值 JSON：{id:{in,out,quota_used}}。
+# 顺序有讲究：同一事务内 interval verdict map 若先于被 jump 的链创建，nft 1.0.x 会拒绝
+# 添加元素（No such file or directory），因此先建全部监控项链，再建映射，最后加元素。
+nft_render_table() {
+    local values="${1:-}" t id v in_b out_b used
+    [ -n "$values" ] || values='{}'
+    t=$(nft_t)
+    local l4='meta l4proto { tcp, udp }'
+    local -a ids=()
+    mapfile -t ids < <(monitor_ids)
+    printf 'add table %s\ndelete table %s\nadd table %s\n' "$t" "$t" "$t"
+    for id in "${ids[@]}"; do
+        [ -n "$id" ] || continue
+        read -r in_b out_b used < <(jq -r --arg id "$id" \
+            '.[$id] // {} | "\(.in // 0) \(.out // 0) \(.quota_used // 0)"' <<< "$values")
+        nft_render_monitor_objects "$id" "$in_b" "$out_b" "$used"
+    done
+    for v in "$NFT_MAP_IN" "$NFT_MAP_OUT" "$NFT_MAP_MARK_SPORT" "$NFT_MAP_MARK_DPORT"; do
+        printf 'add map %s %s { type inet_service : verdict; flags interval; }\n' "$t" "$v"
+    done
+    for id in "${ids[@]}"; do
+        [ -n "$id" ] || continue
+        nft_render_elements add "$id" "$(monitor_ports_json "$id")"
+    done
+    printf 'add chain %s input { type filter hook input priority 0; policy accept; }\n' "$t"
+    printf 'add chain %s output { type filter hook output priority 0; policy accept; }\n' "$t"
+    printf 'add chain %s forward { type filter hook forward priority 0; policy accept; }\n' "$t"
+    printf 'add rule %s input %s th dport vmap @%s\n' "$t" "$l4" "$NFT_MAP_IN"
+    printf 'add rule %s output %s th sport vmap @%s\n' "$t" "$l4" "$NFT_MAP_OUT"
+    printf 'add rule %s output %s th sport vmap @%s\n' "$t" "$l4" "$NFT_MAP_MARK_SPORT"
+    printf 'add rule %s forward %s th dport vmap @%s\n' "$t" "$l4" "$NFT_MAP_IN"
+    printf 'add rule %s forward %s th sport vmap @%s\n' "$t" "$l4" "$NFT_MAP_OUT"
+    printf 'add rule %s forward %s th dport vmap @%s\n' "$t" "$l4" "$NFT_MAP_MARK_DPORT"
+    printf 'add rule %s forward %s th sport vmap @%s\n' "$t" "$l4" "$NFT_MAP_MARK_SPORT"
+}
+
+# 读取全部监控项当前原始计数：{id:{in,out,quota_used}}；表不存在时输出 {}。
+nft_read_values() {
+    local rt
+    rt=$(nft_runtime_json 2>/dev/null) || { echo '{}'; return 0; }
+    [ "$rt" != "null" ] || { echo '{}'; return 0; }
+    jq -c '
+        .counters as $c | .quotas as $q |
+        [ $c | keys[] | capture("^ptd_(?<id>m[0-9]+)_(in|out)$")? | .id ] | unique |
+        map({(.): {in: ($c["ptd_\(.)_in"] // 0), out: ($c["ptd_\(.)_out"] // 0),
+                   quota_used: ($q["ptd_\(.)_quota"].used // 0)}}) | add // {}
+    ' <<< "$rt"
+}
+
+# 读取单个监控项原始计数，输出 "in out quota_used"；不存在返回 1。
+nft_read_monitor() {
+    local id="$1" values
+    values=$(nft_read_values)
+    jq -e -r --arg id "$id" '.[$id] | select(. != null) | "\(.in) \(.out) \(.quota_used)"' <<< "$values"
+}
+
+# 期望的运行状态与实际是否一致；不一致时把原因逐行输出并返回 1。
+nft_runtime_drift() {
+    local rt="${1:-}" desired
+    [ -n "$rt" ] || rt=$(nft_runtime_json 2>/dev/null || echo null)
+    if [ "$rt" = "null" ]; then
+        has_monitors && { echo "nftables 表 $NFT_TABLE 不存在"; return 1; }
+        return 0
+    fi
+    desired=$(nft_desired_json)
+    jq -rn --argjson rt "$rt" --argjson want "$desired" '
+        [ ($want.chains | to_entries[] | . as $e |
+            if ($rt.chains[$e.key] // null) == null then "缺少链 \($e.key)"
+            elif $rt.chains[$e.key] != $e.value then "链 \($e.key) 规则与配置不一致" else empty end),
+          ($want.counters[] | select(($rt.counters[.] // null) == null) | "缺少计数器 \(.)"),
+          ($want.quotas | to_entries[] | . as $e |
+            if ($rt.quotas[$e.key] // null) == null then "缺少配额对象 \($e.key)"
+            elif $rt.quotas[$e.key].limit != $e.value then "配额 \($e.key) 阈值与配置不一致" else empty end),
+          ($rt.quotas | keys[] | select(($want.quotas[.] // null) == null) | "多余的配额对象 \(.)"),
+          ($want.maps | to_entries[] | . as $m |
+            if (($rt.maps[$m.key] // {}) != $m.value) then "映射 \($m.key) 元素与配置不一致" else empty end),
+          (["input","output","forward"][] | select(($rt.chains[.] // null) == null) | "缺少基础链 \(.)")
+        ] | .[]
+    ' | { local any=false; while IFS= read -r line; do any=true; echo "$line"; done; [ "$any" = false ]; }
+}
+
+# 按配置生成期望状态（与 nft_runtime_json 同构，用于比较）。
+nft_desired_json() {
+    local today
+    today=$(get_current_date)
+    jq -c --arg today "$today" '
+        def bytes($s): ($s | ascii_upcase | capture("^(?<n>[0-9]+(\\.[0-9]+)?)(?<u>[KMGT])") ) as $c |
+            ($c.n | tonumber) * ({"K":1024,"M":1048576,"G":1073741824,"T":1099511627776}[$c.u]) | floor;
+        .monitors as $ms |
+        ($ms | to_entries | map(
+            .key as $id | .value as $m |
+            (if ($m.billing_mode // "double") == "single" then 1 else 2 end) as $mult |
+            (($m.quota.enabled // false) and (($m.quota.monthly_limit // "unlimited") != "unlimited")) as $hasq |
+            (($m.expiry_date // "") != "" and $m.expiry_date <= $today) as $exp |
+            (($m.bandwidth_limit.enabled // false) and (($m.bandwidth_limit.mark_id // 0) > 0)) as $tc |
+            { id: $id, ports: $m.ports, tc: $tc,
+              quota: (if $hasq then ((bytes($m.quota.monthly_limit) + $mult - 1) / $mult | floor) else null end),
+              chain: ((if $exp then ["drop#ptd_expired"] else [] end) +
+                      (if $hasq then ["quota+drop"] else [] end) + ["counter"]) })) as $list |
+        { counters: [$list[] | "ptd_\(.id)_in", "ptd_\(.id)_out"],
+          quotas: ([$list[] | select(.quota != null) | {("ptd_\(.id)_quota"): .quota}] | add // {}),
+          chains: ([$list[] | {("ptd_\(.id)_in"): .chain}, {("ptd_\(.id)_out"): .chain},
+                    (select(.tc) | {("ptd_\(.id)_mark"): ["mangle"]})] | add // {}),
+          maps: {
+            ptd_in_dport: ([$list[] | .id as $id | .ports[] | {(.): "ptd_\($id)_in"}] | add // {}),
+            ptd_out_sport: ([$list[] | .id as $id | .ports[] | {(.): "ptd_\($id)_out"}] | add // {}),
+            ptd_mark_sport: ([$list[] | select(.tc) | .id as $id | .ports[] | {(.): "ptd_\($id)_mark"}] | add // {}),
+            ptd_mark_dport: ([$list[] | select(.tc) | .id as $id | .ports[] | {(.): "ptd_\($id)_mark"}] | add // {})
+          } }
+    ' "$CONFIG_FILE"
+}
+
+# 整表重建：优先保留内核当前计数，缺失的再从灾备文件补。调用方持有 Dog 锁。
+nft_rebuild_all() {
+    local values backup
+    values=$(nft_read_values)
+    backup=$(traffic_backup_values)
+    values=$(jq -cn --argjson cur "$values" --argjson bak "$backup" '$bak + $cur')
+    nft_render_table "$values" | nft_apply || return 1
+    dog_log_event runtime_restore 0
+}
+
+nft_add_monitor() {
+    local id="$1"
+    { nft_runtime_json >/dev/null 2>&1 && nft_table_exists; } || { nft_rebuild_all; return; }
+    nft_render_monitor "$id" 0 0 0 | nft_apply
+}
+
+# 渲染：删除监控项的全部运行对象（只删实际存在的，避免事务因对象不存在而整体失败）。
+nft_render_remove_monitor() {
+    local id="$1" rt="$2" t obj
+    t=$(nft_t)
+    jq -r --arg id "$id" --arg t "$t" '
+        .maps | to_entries[] | .key as $map |
+        [.value | to_entries[] | select(.value | test("^ptd_\($id)_")) | .key] |
+        select(length > 0) | "delete element \($t) \($map) { \(join(", ")) }"
+    ' <<< "$rt"
+    for obj in in out mark; do
+        if jq -e --arg c "ptd_${id}_$obj" '.chains | has($c)' <<< "$rt" >/dev/null; then
+            printf 'flush chain %s ptd_%s_%s\ndelete chain %s ptd_%s_%s\n' "$t" "$id" "$obj" "$t" "$id" "$obj"
+        fi
+    done
+    for obj in in out; do
+        if jq -e --arg c "ptd_${id}_$obj" '.counters | has($c)' <<< "$rt" >/dev/null; then
+            printf 'delete counter %s ptd_%s_%s\n' "$t" "$id" "$obj"
+        fi
+    done
+    if jq -e --arg c "ptd_${id}_quota" '.quotas | has($c)' <<< "$rt" >/dev/null; then
+        printf 'delete quota %s ptd_%s_quota\n' "$t" "$id"
+    fi
+}
+
+nft_remove_monitor() {
+    local id="$1" rt
+    rt=$(nft_runtime_json 2>/dev/null || echo null)
+    [ "$rt" != "null" ] || return 0
+    nft_render_remove_monitor "$id" "$rt" | nft_apply
+}
+
+# 端口变更：只增删 map 元素（单事务）。计数与配额对象不动。
+nft_change_ports() {
+    local id="$1" old_json="$2" new_json="$3" added removed with_mark=""
+    added=$(jq -cn --argjson a "$new_json" --argjson b "$old_json" '$a - $b')
+    removed=$(jq -cn --argjson a "$old_json" --argjson b "$new_json" '$a - $b')
+    monitor_tc_mark "$id" >/dev/null && with_mark=with_mark
+    {
+        nft_render_elements delete "$id" "$removed" "$with_mark"
+        nft_render_elements add "$id" "$added"
+    } | nft_apply
+}
+
+# 渲染：按配置重建监控项的链、映射元素与 counter/quota（以指定初值）。要求链已存在。
+nft_render_sync_monitor() {
+    local id="$1" in_b="$2" out_b="$3" used="$4" rt="$5" t quota ports
+    t=$(nft_t)
+    quota=$(monitor_quota_raw_limit "$id")
+    ports=$(jq -c --arg id "$id" '.monitors[$id].ports' "$CONFIG_FILE")
+    jq -r --arg id "$id" --arg t "$t" '
+        .maps | to_entries[] | .key as $map |
+        [.value | to_entries[] | select(.value | test("^ptd_\($id)_")) | .key] |
+        select(length > 0) | "delete element \($t) \($map) { \(join(", ")) }"
+    ' <<< "$rt"
+    printf 'flush chain %s ptd_%s_in\nflush chain %s ptd_%s_out\n' "$t" "$id" "$t" "$id"
+    if jq -e --arg c "ptd_${id}_mark" '.chains | has($c)' <<< "$rt" >/dev/null; then
+        printf 'flush chain %s ptd_%s_mark\ndelete chain %s ptd_%s_mark\n' "$t" "$id" "$t" "$id"
+    fi
+    printf 'delete counter %s ptd_%s_in\ndelete counter %s ptd_%s_out\n' "$t" "$id" "$t" "$id"
+    printf 'add counter %s ptd_%s_in { packets 0 bytes %s }\n' "$t" "$id" "$in_b"
+    printf 'add counter %s ptd_%s_out { packets 0 bytes %s }\n' "$t" "$id" "$out_b"
+    if jq -e --arg c "ptd_${id}_quota" '.quotas | has($c)' <<< "$rt" >/dev/null; then
+        printf 'delete quota %s ptd_%s_quota\n' "$t" "$id"
+    fi
+    if [ -n "$quota" ]; then
+        printf 'add quota %s ptd_%s_quota { over %s bytes used %s bytes }\n' "$t" "$id" "$quota" "$used"
+    fi
+    if monitor_tc_mark "$id" >/dev/null; then
+        printf 'add chain %s ptd_%s_mark\n' "$t" "$id"
+    fi
+    nft_render_monitor_rules "$id"
+    nft_render_elements add "$id" "$ports"
+}
+
+# 重新生成监控项链内容（配额/到期/限速/计费变化后调用）。$2..$4 为 counter/quota 初值，
+# 省略时保留当前值。全部在一个事务内完成。
+nft_sync_monitor() {
+    local id="$1" in_b="${2:-}" out_b="${3:-}" used="${4:-}" rt cur
+    rt=$(nft_runtime_json 2>/dev/null || echo null)
+    if [ "$rt" = "null" ] || ! jq -e --arg c "ptd_${id}_in" '.chains | has($c)' <<< "$rt" >/dev/null; then
+        nft_rebuild_all; return
+    fi
+    if [ -z "$in_b" ]; then
+        cur=$(nft_read_monitor "$id" 2>/dev/null || echo "0 0 0")
+        read -r in_b out_b used <<< "$cur"
+    fi
+    nft_render_sync_monitor "$id" "$in_b" "$out_b" "$used" "$rt" | nft_apply
+}
+
+# 清零监控项计数与配额（周期重置）。
+nft_reset_monitor() {
+    nft_sync_monitor "$1" 0 0 0
+}
+
+# ── 运行状态灾备与恢复 ────────────────────────────────────────────
+# traffic_data.json：{schema:2, saved_at, monitors:{id:{in,out,quota_used}}}（原始字节）。
+# 重启后 nft 计数丢失，按此文件恢复。任何读取失败都不会删除或清空该文件。
+
+traffic_backup_values() {
+    [ -s "$TRAFFIC_DATA_FILE" ] || { echo '{}'; return 0; }
+    jq -c 'if .schema == 2 then (.monitors // {}) else {} end' "$TRAFFIC_DATA_FILE" 2>/dev/null || echo '{}'
+}
+
+# 写入灾备。$1 为 nft_read_values 的结果；只保留配置中存在的监控项。
+traffic_backup_write() {
+    local values="$1" ids
+    ids=$(jq -c '.monitors | keys' "$CONFIG_FILE" 2>/dev/null) || return 1
+    jq -n --argjson v "$values" --argjson ids "$ids" --arg at "$(date -u +%FT%TZ)" \
+        '{schema: 2, saved_at: $at, monitors: ($v | with_entries(select(.key as $k | $ids | index($k))))}' |
+        atomic_write "$TRAFFIC_DATA_FILE" 600
+}
+
+traffic_backup_save() {
+    nft_table_exists || return 1
+    traffic_backup_write "$(nft_read_values)"
+}
+
+traffic_backup_drop_monitor() {
+    [ -s "$TRAFFIC_DATA_FILE" ] || return 0
+    json_update "$TRAFFIC_DATA_FILE" 'del(.monitors[$id])' --arg id "$1"
+}
+
+# 规则缺失或与配置不一致时按配置重建（保留计数）。$1=quiet 时不打印。
+runtime_ensure_nft() {
+    local drift
+    has_monitors || return 0
+    drift=$(nft_runtime_drift 2>/dev/null) && return 0
+    [ "${1:-}" = "quiet" ] || echo -e "${YELLOW}检测到 nftables 规则与配置不一致，正在按配置修复：${NC}\n$drift" >&2
+    log_notification "nftables 规则漂移，已自动重建：$(tr '\n' ';' <<< "$drift")"
+    nft_rebuild_all
+}
+
+# 完整恢复：nft 计数/配额/到期 + TC 限速。
+restore_runtime() {
+    local rc=0
+    dog_lock || return 75
+    runtime_ensure_nft quiet || rc=1
+    stats_rebaseline_all || true
+    if [ "$rc" -eq 0 ]; then
+        tc_restore_all || rc=1
+    fi
+    dog_unlock
+    dog_log_event runtime_restore "$rc"
+    return "$rc"
+}
+
+# 开机恢复：只恢复 nft（TC 交给共享恢复服务）。
+restore_runtime_nft_only() {
+    local rc=0
+    dog_lock || return 75
+    runtime_ensure_nft quiet || rc=1
+    stats_rebaseline_all || true
+    dog_unlock
+    dog_log_event runtime_restore "$rc" mode=nft-only
+    return "$rc"
+}
+
+# ── 自然日统计 ────────────────────────────────────────────────────
+# traffic_stats.json：
+#   {schema:2, monitors:{id:{last:{in,out}, daily:{"YYYY-MM-DD":{in,out}}}}}
+# 每分钟快照：增量 = 当前计数 − 上次读数（计数回落视为被清零，增量取当前值）。
+# 所有值都是原始字节，展示时乘当前计费倍率。周期流量以 nft 计数为准，日统计只用于历史展示。
+
+stats_empty() { echo '{"schema":2,"monitors":{}}'; }
+
+stats_load() {
+    if [ ! -s "$TRAFFIC_STATS_FILE" ]; then
+        stats_empty
+        return 0
+    fi
+    if jq -e '.schema == 2 and (.monitors | type == "object")' "$TRAFFIC_STATS_FILE" >/dev/null 2>&1; then
+        cat "$TRAFFIC_STATS_FILE"
+        return 0
+    fi
+    # 损坏或旧格式：保留副本并告警，不静默清零。
+    local keep
+    keep="$TRAFFIC_STATS_FILE.corrupt.$(date +%Y%m%d%H%M%S)"
+    cp -p "$TRAFFIC_STATS_FILE" "$keep" 2>/dev/null || true
+    log_notification "traffic_stats.json 无法解析，已保留副本 $keep 并从空统计继续"
+    stats_empty
+}
+
+stats_retention_days() {
+    local d
+    d=$(cfg '.global.data_retention_days // empty' 2>/dev/null || true)
+    [[ "$d" =~ ^[0-9]+$ ]] && [ "$d" -ge 1 ] || d="$DEFAULT_TRAFFIC_RETENTION_DAYS"
+    echo "$d"
+}
+
+# 执行一次快照：更新日统计、刷新灾备。调用方持有 Dog 锁。
+stats_snapshot() {
+    local values stats today cutoff ids
+    nft_table_exists || return 1
+    values=$(nft_read_values)
+    ids=$(jq -c '.monitors | keys' "$CONFIG_FILE") || return 1
+    # 有监控项却一个计数都读不到：规则异常，禁止用 0 覆盖统计与灾备。
+    if [ "$ids" != "[]" ] && [ "$values" = "{}" ]; then
+        return 1
+    fi
+    stats=$(stats_load)
+    today=$(get_current_date)
+    cutoff=$(add_days_to_date "$today" "-$(stats_retention_days)")
+    jq -n --argjson s "$stats" --argjson v "$values" --argjson ids "$ids" \
+          --arg today "$today" --arg cutoff "$cutoff" '
+        def delta($cur; $last): if $last == null or $cur < $last then $cur else $cur - $last end;
+        $s | .monitors = (
+            reduce $ids[] as $id ((.monitors // {}) | with_entries(select(.key as $k | $ids | index($k)));
+                if $v[$id] == null then .
+                else
+                    (.[$id] // {last: null, daily: {}}) as $m |
+                    delta($v[$id].in; $m.last.in) as $di |
+                    delta($v[$id].out; $m.last.out) as $do |
+                    .[$id] = ($m
+                        | .last = {in: $v[$id].in, out: $v[$id].out}
+                        | .daily[$today].in = ((.daily[$today].in // 0) + $di)
+                        | .daily[$today].out = ((.daily[$today].out // 0) + $do)
+                        | .daily = (.daily | with_entries(select(.key >= $cutoff))))
+                end))
+    ' | atomic_write "$TRAFFIC_STATS_FILE" 600 || return 1
+    traffic_backup_write "$values"
+}
+
+# 把统计基线对齐到当前计数（重置、合并、恢复之后调用，避免把计数变化算成流量）。
+stats_rebaseline() {
+    local id="$1" in_b="$2" out_b="$3" stats
+    stats=$(stats_load)
+    jq -n --argjson s "$stats" --arg id "$id" --argjson i "$in_b" --argjson o "$out_b" \
+        '$s | .monitors[$id] = ((.monitors[$id] // {daily: {}}) | .last = {in: $i, out: $o})' |
+        atomic_write "$TRAFFIC_STATS_FILE" 600
+}
+
+stats_rebaseline_all() {
+    local values stats
+    nft_table_exists || return 0
+    values=$(nft_read_values)
+    stats=$(stats_load)
+    jq -n --argjson s "$stats" --argjson v "$values" '
+        $s | reduce ($v | to_entries[]) as $e (.;
+            .monitors[$e.key] = ((.monitors[$e.key] // {daily: {}}) | .last = {in: $e.value.in, out: $e.value.out}))
+    ' | atomic_write "$TRAFFIC_STATS_FILE" 600
+}
+
+stats_drop_monitor() {
+    [ -s "$TRAFFIC_STATS_FILE" ] || return 0
+    json_update "$TRAFFIC_STATS_FILE" 'del(.monitors[$id])' --arg id "$1"
+}
+
+# 合并历史：把 $1 的日统计按日期加到 $2。
+stats_merge_monitor() {
+    local src="$1" dst="$2"
+    [ -s "$TRAFFIC_STATS_FILE" ] || return 0
+    json_update "$TRAFFIC_STATS_FILE" '
+        (.monitors[$s].daily // {}) as $sd |
+        .monitors[$d] = ((.monitors[$d] // {daily: {}}) |
+            .daily = reduce ($sd | to_entries[]) as $e (.daily // {};
+                .[$e.key].in = ((.[$e.key].in // 0) + $e.value.in) |
+                .[$e.key].out = ((.[$e.key].out // 0) + $e.value.out))) |
+        del(.monitors[$s])
+    ' --arg s "$src" --arg d "$dst"
+}
+
+# 某监控项在日期区间 [from, to] 内的日统计（原始字节），输出 "in out"。
+stats_sum_range() {
+    local id="$1" from="$2" to="$3"
+    [ -s "$TRAFFIC_STATS_FILE" ] || { echo "0 0"; return 0; }
+    jq -r --arg id "$id" --arg f "$from" --arg t "$to" '
+        [(.monitors[$id].daily // {}) | to_entries[] | select(.key >= $f and .key <= $t) | .value] |
+        "\(map(.in) | add // 0) \(map(.out) | add // 0)"
+    ' "$TRAFFIC_STATS_FILE" 2>/dev/null || echo "0 0"
+}
+
+# ── 服务到期 ──────────────────────────────────────────────────────
+# 到期日（北京时间）当天起，ptd_<id>_in/_out 链首插入 drop（comment "ptd_expired"），
+# 覆盖该项全部端口的入站、出站和转发流量；规则引用端口映射，加减端口自动生效。
+# 延期或取消后立即解除。每分钟 tick 检查一次，开机恢复时随整表重建。
+
+monitor_set_expiry() {
+    local id="$1" date="$2" rc=0
+    if [ -n "$date" ] && ! is_valid_date "$date"; then
+        dog_error "到期日格式应为 YYYY-MM-DD"
+        return 1
+    fi
+    dog_lock || return 75
+    config_update '.monitors[$id].expiry_date = $d' --arg id "$id" --arg d "$date" || rc=1
+    [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
+    dog_unlock
+    if monitor_is_expired "$id"; then
+        dog_log_event expiry_apply "$rc" "id=$id"
+    else
+        dog_log_event expiry_clear "$rc" "id=$id"
+    fi
+    return "$rc"
+}
+
+# 对比配置与内核中的到期封锁状态，只同步不一致的监控项。
+check_expirations() {
+    local rt id want have failed=0
+    rt=$(nft_runtime_json 2>/dev/null) || return 1
+    [ "$rt" != "null" ] || return 1
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        want=false; monitor_is_expired "$id" && want=true
+        have=$(jq -r --arg c "ptd_${id}_in" '(.chains[$c] // []) | any(. == "drop#ptd_expired")' <<< "$rt")
+        [ "$want" = "$have" ] && continue
+        if nft_sync_monitor "$id"; then
+            if [ "$want" = "true" ]; then
+                log_notification "监控项 $id（$(monitor_label "$id")）已到期，已封锁其端口流量"
+                dog_log_event expiry_apply 0 "id=$id"
+            else
+                log_notification "监控项 $id（$(monitor_label "$id")）到期封锁已解除"
+                dog_log_event expiry_clear 0 "id=$id"
+            fi
+        else
+            failed=1
+        fi
+    done < <(monitor_ids)
+    return "$failed"
+}
+
+monitor_expiry_label() {
+    local id="$1" exp today days
+    exp=$(mget "$id" .expiry_date "")
+    [ -n "$exp" ] || return 1
+    today=$(get_current_date)
+    if date_le "$exp" "$today"; then
+        echo "已到期:${exp}"
+    else
+        days=$(( $(date_to_ordinal "$exp") - $(date_to_ordinal "$today") ))
+        echo "到期:${exp}(剩${days}天)"
+    fi
+}
+
+# ── 周期重置 ──────────────────────────────────────────────────────
+# 策略保存在 .monitors[id].reset_policy：
+#   monthly{day} | interval_days{every,anchor_date} | interval_months{every,anchor_date,day}
+#   yearly{month,day} | fixed_date{date} | none
+# 运行时字段：next_reset_date、last_reset_date。
+# 重置历史 reset_history.json：{id:[{due,at,in,out}]}，同一 due 只清零一次。
+
+reset_policy_type() {
+    local t
+    t=$(mget "$1" .reset_policy.type none)
+    case "$t" in monthly|interval_days|interval_months|yearly|fixed_date) echo "$t" ;; *) echo none ;; esac
+}
+
+monitor_has_auto_reset() {
+    [ "$(reset_policy_type "$1")" != "none" ]
+}
+
+monitor_created_date() {
+    local c
+    c=$(mget "$1" .created_at "")
+    if [[ "$c" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then echo "${c:0:10}"; else get_current_date; fi
 }
 
 calculate_monthly_next_date() {
     local day="$1"
     local from_date="$2"
-    local parts=($(date_parts "$from_date"))
+    local -a parts; read -ra parts <<< "$(date_parts "$from_date")"
     local year="${parts[0]}"
     local month="${parts[1]}"
     local candidate_day
@@ -5174,7 +2027,7 @@ calculate_monthly_next_date() {
     candidate=$(format_date "$year" "$month" "$candidate_day")
 
     if date_lt "$candidate" "$from_date"; then
-        local next=($(normalize_year_month "$year" "$((month + 1))"))
+        local -a next; read -ra next <<< "$(normalize_year_month "$year" "$((month + 1))")"
         year="${next[0]}"
         month="${next[1]}"
         candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
@@ -5213,8 +2066,8 @@ calculate_interval_months_next_date() {
         return
     fi
 
-    local anchor_parts=($(date_parts "$anchor_date"))
-    local from_parts=($(date_parts "$from_date"))
+    local -a anchor_parts; read -ra anchor_parts <<< "$(date_parts "$anchor_date")"
+    local -a from_parts; read -ra from_parts <<< "$(date_parts "$from_date")"
     local anchor_month_index=$((anchor_parts[0] * 12 + anchor_parts[1] - 1))
     local from_month_index=$((from_parts[0] * 12 + from_parts[1] - 1))
     local month_distance=$((from_month_index - anchor_month_index))
@@ -5231,7 +2084,7 @@ calculate_yearly_next_date() {
     local month="$1"
     local day="$2"
     local from_date="$3"
-    local parts=($(date_parts "$from_date"))
+    local -a parts; read -ra parts <<< "$(date_parts "$from_date")"
     local year="${parts[0]}"
     local candidate_day
     candidate_day=$(clamp_day_to_month "$year" "$month" "$day")
@@ -5247,417 +2100,771 @@ calculate_yearly_next_date() {
     echo "$candidate"
 }
 
-get_quota_limit() {
-    local port="$1"
-    jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE" 2>/dev/null
-}
 
-get_quota_enabled() {
-    local port="$1"
-    jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE" 2>/dev/null
-}
-
-is_known_reset_policy_type() {
-    case "$1" in
-        monthly|interval_days|interval_months|yearly|fixed_date|none) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-get_reset_policy_type() {
-    local port="$1"
-    local policy_type
-    policy_type=$(jq -r ".ports.\"$port\".quota.reset_policy.type // empty" "$CONFIG_FILE" 2>/dev/null)
-    if [ -n "$policy_type" ] && [ "$policy_type" != "null" ] && is_known_reset_policy_type "$policy_type"; then
-        echo "$policy_type"
-        return
-    fi
-
-    local reset_day_raw
-    reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_day // null" "$CONFIG_FILE" 2>/dev/null)
-    if [[ "$reset_day_raw" =~ ^[0-9]+$ ]] && [ "$reset_day_raw" -ge 1 ] && [ "$reset_day_raw" -le 31 ]; then
-        echo "monthly"
-    else
-        echo "none"
-    fi
-}
-
-port_has_auto_reset_policy() {
-    local port="$1"
-    local quota_enabled
-    quota_enabled=$(get_quota_enabled "$port")
-    local quota_limit
-    quota_limit=$(get_quota_limit "$port")
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-
-    [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ] && [ "$policy_type" != "none" ]
-}
-
-calculate_port_next_reset_date() {
-    local port="$1"
-    local from_date="${2:-$(get_current_date)}"
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-
-    case "$policy_type" in
+# 从 from_date（含）起计算下一次重置日期。
+monitor_compute_next_reset() {
+    local id="$1" from="${2:-$(get_current_date)}" type every anchor day month
+    type=$(reset_policy_type "$id")
+    case "$type" in
         monthly)
-            local day
-            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // 1" "$CONFIG_FILE" 2>/dev/null)
-            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
-                day=1
-            fi
-            calculate_monthly_next_date "$day" "$from_date"
-            ;;
+            day=$(mget "$id" .reset_policy.day 1)
+            calculate_monthly_next_date "$day" "$from" ;;
         interval_days)
-            local every_days
-            every_days=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 30" "$CONFIG_FILE" 2>/dev/null)
-            local anchor_date
-            anchor_date=$(jq -r ".ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
-            if ! [[ "$every_days" =~ ^[0-9]+$ ]] || [ "$every_days" -lt 1 ]; then
-                every_days=30
-            fi
-            if ! is_valid_date "$anchor_date"; then
-                anchor_date=$(get_port_created_date "$port")
-            fi
-            calculate_interval_days_next_date "$anchor_date" "$every_days" "$from_date"
-            ;;
+            every=$(mget "$id" .reset_policy.every 30)
+            anchor=$(mget "$id" .reset_policy.anchor_date "")
+            is_valid_date "$anchor" || anchor=$(monitor_created_date "$id")
+            calculate_interval_days_next_date "$anchor" "$every" "$from" ;;
         interval_months)
-            local every_months
-            every_months=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 1" "$CONFIG_FILE" 2>/dev/null)
-            local anchor_date
-            anchor_date=$(jq -r ".ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
-            local day
-            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // empty" "$CONFIG_FILE" 2>/dev/null)
-            if ! [[ "$every_months" =~ ^[0-9]+$ ]] || [ "$every_months" -lt 1 ]; then
-                every_months=1
-            fi
-            if ! is_valid_date "$anchor_date"; then
-                anchor_date=$(get_port_created_date "$port")
-            fi
-            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
-                local parts=($(date_parts "$anchor_date"))
-                day="${parts[2]}"
-            fi
-            calculate_interval_months_next_date "$anchor_date" "$every_months" "$day" "$from_date"
-            ;;
+            every=$(mget "$id" .reset_policy.every 1)
+            anchor=$(mget "$id" .reset_policy.anchor_date "")
+            is_valid_date "$anchor" || anchor=$(monitor_created_date "$id")
+            day=$(mget "$id" .reset_policy.day "${anchor:8:2}")
+            calculate_interval_months_next_date "$anchor" "$every" "$((10#$day))" "$from" ;;
         yearly)
-            local month
-            local day
-            month=$(jq -r ".ports.\"$port\".quota.reset_policy.month // 1" "$CONFIG_FILE" 2>/dev/null)
-            day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // 1" "$CONFIG_FILE" 2>/dev/null)
-            if ! [[ "$month" =~ ^[0-9]+$ ]] || [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
-                month=1
-            fi
-            if ! [[ "$day" =~ ^[0-9]+$ ]] || [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
-                day=1
-            fi
-            calculate_yearly_next_date "$month" "$day" "$from_date"
-            ;;
+            calculate_yearly_next_date "$(mget "$id" .reset_policy.month 1)" "$(mget "$id" .reset_policy.day 1)" "$from" ;;
         fixed_date)
-            local date_value
-            date_value=$(jq -r ".ports.\"$port\".quota.reset_policy.date // empty" "$CONFIG_FILE" 2>/dev/null)
-            if is_valid_date "$date_value"; then
-                echo "$date_value"
-            else
-                echo ""
-            fi
-            ;;
-        *)
-            echo ""
-            ;;
-    esac
-}
-
-ensure_port_next_reset_date() {
-    local port="$1"
-    port_has_auto_reset_policy "$port" || return 1
-
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-    local migrated_legacy_monthly="false"
-    if [ "$policy_type" = "monthly" ]; then
-        local policy_saved_type
-        policy_saved_type=$(jq -r ".ports.\"$port\".quota.reset_policy.type // empty" "$CONFIG_FILE" 2>/dev/null)
-        if [ -z "$policy_saved_type" ] || ! is_known_reset_policy_type "$policy_saved_type"; then
-            migrated_legacy_monthly="true"
-            local reset_day
-            reset_day=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // 1" "$CONFIG_FILE" 2>/dev/null)
-            if ! [[ "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -lt 1 ] || [ "$reset_day" -gt 31 ]; then
-                reset_day=1
-            fi
-            update_config_file '
-                .ports[$port].quota.reset_policy.type = "monthly" |
-                .ports[$port].quota.reset_policy.day = $day |
-                .ports[$port].quota.reset_day = $day
-            ' --arg port "$port" --argjson day "$reset_day"
-        fi
-    fi
-
-    local next_reset_date
-    next_reset_date=$(jq -r ".ports.\"$port\".quota.reset_policy.next_reset_date // empty" "$CONFIG_FILE" 2>/dev/null)
-    if ! is_valid_date "$next_reset_date"; then
-        local from_date
-        from_date=$(get_current_date)
-        if [ "$policy_type" != "fixed_date" ]; then
-            if [ "$migrated_legacy_monthly" != "true" ] || ! is_before_daily_reset_check; then
-                from_date=$(add_days_to_date "$from_date" 1)
-            fi
-        fi
-        next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
-        [ -n "$next_reset_date" ] || return 1
-        update_config_file '
-            .ports[$port].quota.reset_policy.next_reset_date = $next
-        ' --arg port "$port" --arg next "$next_reset_date"
-    fi
-
-    echo "$next_reset_date"
-}
-
-advance_port_next_reset_date() {
-    local port="$1"
-    local after_date="${2:-$(get_current_date)}"
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-
-    if [ "$policy_type" = "fixed_date" ]; then
-        update_config_file '
-            .ports[$port].quota.reset_policy = {"type":"none"}
-        ' --arg port "$port" || return 1
-        setup_port_auto_reset_cron "$port" || return 1
-        return
-    fi
-
-    local from_date
-    from_date=$(add_days_to_date "$after_date" 1)
-    local next_reset_date
-    next_reset_date=$(calculate_port_next_reset_date "$port" "$from_date")
-    [ -n "$next_reset_date" ] || return 1
-
-    update_config_file '
-        .ports[$port].quota.reset_policy.last_reset_date = $last |
-        .ports[$port].quota.reset_policy.next_reset_date = $next
-    ' --arg port "$port" --arg last "$after_date" --arg next "$next_reset_date"
-}
-
-get_port_next_reset_label() {
-    local port="$1"
-    port_has_auto_reset_policy "$port" || return 1
-
-    local next_reset_date
-    next_reset_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
-    [ -n "$next_reset_date" ] || return 1
-
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
-    case "$policy_type" in
-        monthly) echo "${next_reset_date}重置" ;;
-        interval_days)
-            local every
-            every=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 30" "$CONFIG_FILE" 2>/dev/null)
-            echo "每${every}天，${next_reset_date}重置"
-            ;;
-        interval_months)
-            local every
-            every=$(jq -r ".ports.\"$port\".quota.reset_policy.every // 1" "$CONFIG_FILE" 2>/dev/null)
-            echo "每${every}个月，${next_reset_date}重置"
-            ;;
-        yearly) echo "每年，${next_reset_date}重置" ;;
-        fixed_date) echo "${next_reset_date}清零一次" ;;
+            mget "$id" .reset_policy.date "" ;;
         *) return 1 ;;
     esac
 }
 
-get_port_cycle_range() {
-    local port="$1"
-    local policy_type
-    policy_type=$(get_reset_policy_type "$port")
+# 读取（必要时计算并保存）下一次重置日期。
+monitor_next_reset() {
+    local id="$1" next
+    monitor_has_auto_reset "$id" || return 1
+    next=$(mget "$id" .reset_policy.next_reset_date "")
+    if ! is_valid_date "$next"; then
+        local from
+        from=$(get_current_date)
+        [ "$(reset_policy_type "$id")" = "fixed_date" ] || from=$(add_days_to_date "$from" 1)
+        next=$(monitor_compute_next_reset "$id" "$from") || return 1
+        is_valid_date "$next" || return 1
+        config_update '.monitors[$id].reset_policy.next_reset_date = $n' --arg id "$id" --arg n "$next" || return 1
+    fi
+    echo "$next"
+}
 
-    if [ "$policy_type" != "monthly" ]; then
-        local start_date
-        start_date=$(jq -r ".ports.\"$port\".quota.reset_policy.last_reset_date // .ports.\"$port\".quota.reset_policy.anchor_date // empty" "$CONFIG_FILE" 2>/dev/null)
-        if ! is_valid_date "$start_date"; then
-            start_date=$(get_port_created_date "$port")
-        fi
+# 设置新策略：$2 为策略 JSON；立即计算 next_reset_date。
+monitor_set_reset_policy() {
+    local id="$1" policy="$2" next=""
+    config_update '.monitors[$id].reset_policy = $p' --arg id "$id" --argjson p "$policy" || return 1
+    if monitor_has_auto_reset "$id"; then
+        local from
+        from=$(get_current_date)
+        [ "$(reset_policy_type "$id")" = "fixed_date" ] || from=$(add_days_to_date "$from" 1)
+        next=$(monitor_compute_next_reset "$id" "$from") || return 1
+        config_update '.monitors[$id].reset_policy.next_reset_date = $n' --arg id "$id" --arg n "$next" || return 1
+    fi
+}
 
-        local next_date
-        next_date=$(ensure_port_next_reset_date "$port" 2>/dev/null || true)
-        if is_valid_date "$next_date"; then
-            if [ "$policy_type" = "fixed_date" ]; then
-                echo "${start_date}-${next_date}"
-            else
-                local end_date
-                end_date=$(add_days_to_date "$next_date" -1 2>/dev/null || true)
-                if [ -n "$end_date" ] && ! date_lt "$end_date" "$start_date"; then
-                    echo "${start_date}-${end_date}"
-                else
-                    echo "${start_date}-${next_date}"
-                fi
-            fi
-        else
-            echo "${start_date}-未设置"
-        fi
+# 重置完成后推进日期：一次性策略改为 none。
+monitor_advance_reset() {
+    local id="$1" today="${2:-$(get_current_date)}" next
+    if [ "$(reset_policy_type "$id")" = "fixed_date" ]; then
+        config_update '.monitors[$id].reset_policy = {type: "none", last_reset_date: $d}' \
+            --arg id "$id" --arg d "$today"
         return
     fi
-
-    local reset_day_raw
-    reset_day_raw=$(jq -r ".ports.\"$port\".quota.reset_policy.day // .ports.\"$port\".quota.reset_day // null" "$CONFIG_FILE" 2>/dev/null)
-
-    local reset_day=1
-    if [[ "$reset_day_raw" =~ ^[0-9]+$ ]] && [ "$reset_day_raw" -ge 1 ] && [ "$reset_day_raw" -le 31 ]; then
-        reset_day="$reset_day_raw"
-    fi
-
-    local time_info=($(get_beijing_month_year))
-    local current_day="${time_info[0]}"
-    local current_month="${time_info[1]}"
-    local current_year="${time_info[2]}"
-
-    local start_year
-    local start_month
-    local current_reset_day
-    current_reset_day=$(clamp_day_to_month "$current_year" "$current_month" "$reset_day")
-    if [ "$current_day" -ge "$current_reset_day" ]; then
-        start_year="$current_year"
-        start_month="$current_month"
-    else
-        local prev=($(normalize_year_month "$current_year" "$((current_month - 1))"))
-        start_year="${prev[0]}"
-        start_month="${prev[1]}"
-    fi
-
-    local start_day
-    start_day=$(clamp_day_to_month "$start_year" "$start_month" "$reset_day")
-
-    local end_year
-    local end_month
-    local end_day
-    if [ "$reset_day" -eq 1 ]; then
-        end_year="$start_year"
-        end_month="$start_month"
-        end_day=$(get_days_in_month "$end_year" "$end_month")
-    else
-        local next=($(normalize_year_month "$start_year" "$((start_month + 1))"))
-        end_year="${next[0]}"
-        end_month="${next[1]}"
-        end_day=$(clamp_day_to_month "$end_year" "$end_month" "$((reset_day - 1))")
-    fi
-
-    echo "${start_year}/${start_month}/${start_day}-${end_year}/${end_month}/${end_day}"
+    next=$(monitor_compute_next_reset "$id" "$(add_days_to_date "$today" 1)") || return 1
+    config_update '.monitors[$id].reset_policy.last_reset_date = $l | .monitors[$id].reset_policy.next_reset_date = $n' \
+        --arg id "$id" --arg l "$today" --arg n "$next"
 }
 
-build_usage_progress_bar() {
-    local percent="${1:-0}"
-    local width=20
-    local capped="$percent"
-
-    if [ "$capped" -lt 0 ]; then
-        capped=0
-    fi
-    if [ "$capped" -gt 100 ]; then
-        capped=100
-    fi
-
-    local filled=0
-    if [ "$capped" -le 0 ]; then
-        filled=0
-    elif [ "$capped" -lt 50 ]; then
-        # 50%以下按5%一格向上取整：1%-5%显示1格
-        filled=$(((capped + 4) / 5))
-    else
-        # 50%及以上保持线性：50%=10格，100%=20格
-        filled=$((capped / 5))
-    fi
-    if [ "$filled" -gt "$width" ]; then
-        filled="$width"
-    fi
-    local empty=$((width - filled))
-    local bar=""
-    local i
-    for ((i=0; i<filled; i++)); do
-        bar="${bar}█"
-    done
-    for ((i=0; i<empty; i++)); do
-        bar="${bar}░"
-    done
-
-    echo "$bar"
+monitor_reset_label() {
+    local id="$1" next type
+    next=$(monitor_next_reset "$id" 2>/dev/null) || return 1
+    type=$(reset_policy_type "$id")
+    case "$type" in
+        monthly) echo "每月$(mget "$id" .reset_policy.day 1)日，下次${next}" ;;
+        interval_days) echo "每$(mget "$id" .reset_policy.every 30)天，下次${next}" ;;
+        interval_months) echo "每$(mget "$id" .reset_policy.every 1)个月，下次${next}" ;;
+        yearly) echo "每年，下次${next}" ;;
+        fixed_date) echo "${next}清零一次" ;;
+    esac
 }
 
-format_port_list() {
-    local format_type="$1"
-    local active_ports=($(get_active_ports))
-    local result=""
-    local index=1
+# 当前计费周期起止（YYYY-MM-DD~YYYY-MM-DD 或 起点~未设置）。
+monitor_cycle_range() {
+    local id="$1" start next end
+    start=$(mget "$id" .reset_policy.last_reset_date "")
+    if ! is_valid_date "$start"; then
+        start=$(mget "$id" .reset_policy.anchor_date "")
+        is_valid_date "$start" && date_le "$start" "$(get_current_date)" || start=$(monitor_created_date "$id")
+    fi
+    if next=$(monitor_next_reset "$id" 2>/dev/null); then
+        end=$(add_days_to_date "$next" -1)
+        date_lt "$end" "$start" && end="$next"
+        echo "${start}~${end}"
+    else
+        echo "${start}~不自动重置"
+    fi
+}
 
-    for port in "${active_ports[@]}"; do
-        read_nftables_counter_data "$port" || return 1
-        local input_bytes="$NFT_COUNTER_INPUT"
-        local output_bytes="$NFT_COUNTER_OUTPUT"
-        local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-        local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
-        local total_formatted=$(format_bytes $total_bytes)
-        local output_formatted=$(format_bytes $output_bytes)
-        local status_label=$(get_port_status_label "$port")
+reset_history_has() {
+    local id="$1" due="$2"
+    [ -s "$RESET_HISTORY_FILE" ] || return 1
+    jq -e --arg id "$id" --arg due "$due" 'any((.[$id] // [])[]; .due == $due)' "$RESET_HISTORY_FILE" >/dev/null 2>&1
+}
 
-        local input_formatted=$(format_bytes $input_bytes)
+reset_history_record() {
+    local id="$1" due="$2" in_b="$3" out_b="$4"
+    [ -s "$RESET_HISTORY_FILE" ] || echo '{}' | atomic_write "$RESET_HISTORY_FILE" 600
+    json_update "$RESET_HISTORY_FILE" \
+        '.[$id] = (((.[$id] // []) + [{due: $due, at: $at, in: $i, out: $o}]) | .[-24:])' \
+        --arg id "$id" --arg due "$due" --arg at "$(date -u +%FT%TZ)" --argjson i "$in_b" --argjson o "$out_b"
+}
 
+reset_history_drop() {
+    [ -s "$RESET_HISTORY_FILE" ] || return 0
+    json_update "$RESET_HISTORY_FILE" 'del(.[$id])' --arg id "$1"
+}
 
-        if [ "$format_type" = "display" ]; then
-            echo -e "端口:${GREEN}$port${NC} | 总流量:${GREEN}$total_formatted${NC} | 入站(下载):${GREEN}$input_formatted${NC} | 出站(上传):${GREEN}$output_formatted${NC} | ${YELLOW}$status_label${NC}"
-        elif [ "$format_type" = "markdown" ]; then
-            result+="> 端口:**${port}** | 总流量:**${total_formatted}** | 入站:**${input_formatted}** | 出站:**${output_formatted}** | ${status_label}
-"
-        elif [ "$format_type" = "telegram" ]; then
-            local status_prefix=""
-            if [ -n "$status_label" ]; then
-                status_prefix="${status_label} | "
-            fi
+# 清零一个监控项的计数与配额。$2 为到期日（手动重置传 manual）。
+reset_monitor() {
+    local id="$1" due="${2:-manual}" cur in_b out_b used rc=0
+    dog_lock || return 75
+    stats_snapshot >/dev/null 2>&1 || true
+    cur=$(nft_read_monitor "$id" 2>/dev/null || echo "0 0 0")
+    read -r in_b out_b used <<< "$cur"
+    if nft_reset_monitor "$id"; then
+        reset_history_record "$id" "$due" "$in_b" "$out_b" || true
+        stats_rebaseline "$id" 0 0 || true
+        traffic_backup_save || true
+        log_notification "监控项 $id（$(monitor_label "$id")）流量已重置（${due}），重置前 入站 $(format_bytes "$in_b") 出站 $(format_bytes "$out_b")（原始字节）"
+    else
+        rc=1
+    fi
+    dog_unlock
+    dog_log_event traffic_reset "$rc" "id=$id"
+    return "$rc"
+}
 
-            if [ -n "$result" ]; then
-                result+="
-
-"
-            fi
-
-            result+="${index}. ${status_prefix}端口:${port}
-总流量:${total_formatted} | 入站(下载):${input_formatted} | 出站(上传):${output_formatted}"
-
-            local quota_enabled=$(jq -r ".ports.\"$port\".quota.enabled // true" "$CONFIG_FILE")
-            local monthly_limit=$(jq -r ".ports.\"$port\".quota.monthly_limit // \"unlimited\"" "$CONFIG_FILE")
-            if [ "$quota_enabled" = "true" ] && [ "$monthly_limit" != "unlimited" ]; then
-                local limit_bytes=$(parse_size_to_bytes "$monthly_limit")
-                local usage_percent=0
-                if [ "$limit_bytes" -gt 0 ]; then
-                    usage_percent=$((total_bytes * 100 / limit_bytes))
-                fi
-
-                local cycle_range
-                cycle_range=$(get_port_cycle_range "$port")
-                local progress_bar
-                progress_bar=$(build_usage_progress_bar "$usage_percent")
-
-                local percent_text="${usage_percent}%"
-                if [ "$usage_percent" -ge 100 ]; then
-                    percent_text="${usage_percent}% (超限)"
-                fi
-
-                result+="
-${total_formatted}/${monthly_limit} | ${percent_text} | ${cycle_range}
-[${progress_bar}]"
-            fi
-        else
-            result+="
-端口:${port} | 总流量:${total_formatted} | 入站(下载):${input_formatted} | 出站(上传):${output_formatted} | ${status_label}"
+# 检查并执行到期的自动重置（每分钟 tick 调用）。
+check_due_resets() {
+    local id today next failed=0
+    today=$(get_current_date)
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        monitor_has_auto_reset "$id" || continue
+        next=$(monitor_next_reset "$id" 2>/dev/null) || { failed=1; continue; }
+        date_le "$next" "$today" || continue
+        if reset_history_has "$id" "$next"; then
+            # 已清零但日期推进失败：只补推进，避免重复清零。
+            monitor_advance_reset "$id" "$today" || failed=1
+            continue
         fi
+        if reset_monitor "$id" "$next"; then
+            monitor_advance_reset "$id" "$today" || failed=1
+        else
+            failed=1
+        fi
+    done < <(monitor_ids)
+    return "$failed"
+}
 
-        index=$((index + 1))
+# 交互选择重置策略，结果 JSON 输出到 stdout（提示走 stderr）。
+prompt_reset_policy() {
+    local default_day="${1:-1}" choice day every anchor month date today
+    today=$(get_current_date)
+    while true; do
+        {
+            echo
+            echo -e "${BLUE}=== 自动重置策略 ===${NC}"
+            echo "1. 每月几号重置（默认每月${default_day}日）"
+            echo "2. 每隔多少天重置"
+            echo "3. 每隔多少个月重置"
+            echo "4. 每年几月几号重置"
+            echo "5. 指定日期清零一次"
+            echo "0. 不自动重置"
+        } >&2
+        read -r -p "请选择(回车默认1) [0-5]: " choice
+        case "$choice" in
+            1|"")
+                read -r -p "每月几号重置(回车默认${default_day}) [1-31]: " day
+                day="${day:-$default_day}"
+                validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
+                jq -cn --argjson d "$day" '{type: "monthly", day: $d}'; return 0 ;;
+            2|3)
+                if [ "$choice" = 2 ]; then
+                    read -r -p "每隔多少天重置 [1-3650]: " every
+                    [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 3650 ] || { echo -e "${RED}天数无效${NC}" >&2; continue; }
+                else
+                    read -r -p "每隔多少个月重置 [1-120]: " every
+                    [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 120 ] || { echo -e "${RED}月数无效${NC}" >&2; continue; }
+                fi
+                read -r -p "起算日期(回车默认今天 ${today}) [YYYY-MM-DD]: " anchor
+                anchor="${anchor:-$today}"
+                is_valid_date "$anchor" || { echo -e "${RED}日期格式应为 YYYY-MM-DD${NC}" >&2; continue; }
+                if [ "$choice" = 2 ]; then
+                    jq -cn --argjson e "$every" --arg a "$anchor" '{type: "interval_days", every: $e, anchor_date: $a}'
+                else
+                    read -r -p "每次按几号重置(回车默认 $((10#${anchor:8:2}))) [1-31]: " day
+                    day="${day:-$((10#${anchor:8:2}))}"
+                    validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
+                    jq -cn --argjson e "$every" --arg a "$anchor" --argjson d "$day" \
+                        '{type: "interval_months", every: $e, anchor_date: $a, day: $d}'
+                fi
+                return 0 ;;
+            4)
+                read -r -p "每年几月 [1-12]: " month
+                read -r -p "几号 [1-31]: " day
+                validate_month_1_12 "$month" && validate_day_1_31 "$day" || { echo -e "${RED}月份或日期无效${NC}" >&2; continue; }
+                jq -cn --argjson m "$month" --argjson d "$day" '{type: "yearly", month: $m, day: $d}'; return 0 ;;
+            5)
+                read -r -p "清零日期 [YYYY-MM-DD]: " date
+                is_valid_date "$date" && ! date_lt "$date" "$today" || { echo -e "${RED}日期无效或早于今天${NC}" >&2; continue; }
+                jq -cn --arg d "$date" '{type: "fixed_date", date: $d}'; return 0 ;;
+            0) echo '{"type":"none"}'; return 0 ;;
+            *) echo -e "${RED}请输入 0-5${NC}" >&2 ;;
+        esac
     done
+}
 
-    if [ "$format_type" = "message" ] || [ "$format_type" = "markdown" ] || [ "$format_type" = "telegram" ]; then
-        echo "$result"
+# ── 监控项增删改 ──────────────────────────────────────────────────
+# 所有操作在 Dog 锁内执行：先校验 → 写配置 → 提交 nft 事务；nft 失败时恢复原配置。
+# 端口变化只增删 nft 映射元素，因此流量计数与已用配额保持连续。
+
+# 备份当前配置文本，供失败时恢复。
+_config_snapshot() { cat "$CONFIG_FILE"; }
+_config_restore() { printf '%s\n' "$1" | atomic_write "$CONFIG_FILE" 600; }
+
+# 新建监控项。$1=规范化逗号串，$2=备注。成功时输出新 ID。
+monitor_add() {
+    local csv="$1" remark="${2:-}" ports conflict id snap now
+    ports=$(ports_csv_to_json "$csv")
+    dog_lock || return 75
+    if conflict=$(find_port_conflict "$ports") && [ -n "$conflict" ]; then
+        dog_unlock
+        read -r cid cport cnew <<< "$conflict"
+        dog_error "端口 $cnew 与监控项 $cid 的 $cport 重叠"
+        return 1
+    fi
+    snap=$(_config_snapshot)
+    id=$(next_monitor_id)
+    now=$(beijing_date '+%Y-%m-%dT%H:%M:%S+08:00')
+    if ! config_update '
+        .monitors[$id] = {ports: $p, remark: $r, billing_mode: (.global.billing_mode // "double"),
+                          quota: {enabled: false, monthly_limit: "unlimited"},
+                          bandwidth_limit: {enabled: false, rate: "unlimited"},
+                          reset_policy: {type: "none"}, expiry_date: "", created_at: $now} |
+        .global.next_monitor_id = (($id | ltrimstr("m") | tonumber) + 1)
+    ' --arg id "$id" --argjson p "$ports" --arg r "$remark" --arg now "$now"; then
+        dog_unlock; return 1
+    fi
+    if ! nft_add_monitor "$id"; then
+        _config_restore "$snap"
+        dog_unlock
+        dog_log_event monitor_add 1 "id=$id" "ports=$csv"
+        return 1
+    fi
+    stats_rebaseline "$id" 0 0 || true
+    dog_unlock
+    dog_log_event monitor_add 0 "id=$id" "ports=$csv"
+    echo "$id"
+}
+
+monitor_remove() {
+    local id="$1" rc=0 snap
+    dog_lock || return 75
+    monitor_exists "$id" || { dog_unlock; dog_error "监控项 $id 不存在"; return 1; }
+    stats_snapshot >/dev/null 2>&1 || true
+    snap=$(_config_snapshot)
+    if monitor_tc_rate "$id" >/dev/null; then
+        # 拿不到共享 TC 锁就中止：否则配置删掉了、内核里留下孤儿类。
+        begin_tc_update || { dog_unlock; dog_error "无法取得 TC 锁，未删除 $id"; return 1; }
+        tc_remove_monitor_locked "$id" || true
+        tc_write_interop "$id" || true
+        finish_tc_update
+    fi
+    if ! nft_remove_monitor "$id"; then
+        dog_unlock; dog_log_event monitor_remove 1 "id=$id"; return 1
+    fi
+    if ! config_update 'del(.monitors[$id])' --arg id "$id"; then
+        _config_restore "$snap"; nft_rebuild_all || true
+        dog_unlock; dog_log_event monitor_remove 1 "id=$id"; return 1
+    fi
+    stats_drop_monitor "$id" || true
+    traffic_backup_drop_monitor "$id" || true
+    reset_history_drop "$id" || true
+    tc_write_interop || true
+    dog_unlock
+    dog_log_event monitor_remove "$rc" "id=$id"
+    return "$rc"
+}
+
+# 修改端口。$2=要加的逗号串，$3=要删的逗号串，$4=整组替换的逗号串（非空时忽略 2/3）。
+monitor_edit_ports() {
+    local id="$1" add_csv="${2:-}" del_csv="${3:-}" set_csv="${4:-}" old new tmp conflict snap missing
+    dog_lock || return 75
+    monitor_exists "$id" || { dog_unlock; dog_error "监控项 $id 不存在"; return 1; }
+    old=$(jq -c --arg id "$id" '.monitors[$id].ports' "$CONFIG_FILE")
+    if [ -n "$set_csv" ]; then
+        new=$(ports_csv_to_json "$set_csv")
+    else
+        new="$old"
+        if [ -n "$del_csv" ]; then
+            tmp=$(ports_csv_to_json "$del_csv")
+            missing=$(jq -rn --argjson a "$tmp" --argjson b "$old" '$a - $b | join(",")')
+            if [ -n "$missing" ]; then
+                dog_unlock
+                dog_error "监控项 $id 不包含成员：$missing（端口段需按原样整体删除，如 8000-8010）"
+                return 1
+            fi
+            new=$(ports_json_minus "$new" "$tmp")
+        fi
+        [ -n "$add_csv" ] && new=$(ports_json_union "$new" "$(ports_csv_to_json "$add_csv")")
+    fi
+    if [ "$(jq 'length' <<< "$new")" -eq 0 ]; then
+        dog_unlock
+        dog_error "监控项至少保留一个端口；如需移除整个监控项，请使用删除"
+        return 1
+    fi
+    if ! new=$(ports_json_normalize "$new"); then
+        dog_unlock; return 1
+    fi
+    if conflict=$(find_port_conflict "$new" "$id") && [ -n "$conflict" ]; then
+        dog_unlock
+        read -r cid cport cnew <<< "$conflict"
+        dog_error "端口 $cnew 与监控项 $cid 的 $cport 重叠"
+        return 1
+    fi
+    if [ "$new" = "$old" ]; then
+        dog_unlock; echo "端口未变化"; return 0
+    fi
+    snap=$(_config_snapshot)
+    config_update '.monitors[$id].ports = $p' --arg id "$id" --argjson p "$new" || { dog_unlock; return 1; }
+    if ! nft_change_ports "$id" "$old" "$new"; then
+        _config_restore "$snap"
+        dog_unlock
+        dog_log_event monitor_edit 1 "id=$id"
+        return 1
+    fi
+    tc_refresh_monitor_ports "$id" || log_notification "监控项 $id 端口已更新，但入向限速过滤器刷新失败，请运行 dog --repair"
+    tc_write_interop || true
+    dog_unlock
+    dog_log_event monitor_edit 0 "id=$id" "ports=$(jq -r 'join(",")' <<< "$new")"
+}
+
+# 拆分：把 $2（成员逗号串）移到新监控项。$3=备注，$4=copy 时复制配额/重置/到期设置。
+monitor_split() {
+    local id="$1" move_csv="$2" remark="${3:-}" copy="${4:-}" old move rest new_id snap rt now missing
+    dog_lock || return 75
+    monitor_exists "$id" || { dog_unlock; dog_error "监控项 $id 不存在"; return 1; }
+    old=$(jq -c --arg id "$id" '.monitors[$id].ports' "$CONFIG_FILE")
+    move=$(ports_csv_to_json "$move_csv")
+    missing=$(jq -rn --argjson a "$move" --argjson b "$old" '$a - $b | join(",")')
+    if [ -n "$missing" ]; then
+        dog_unlock; dog_error "监控项 $id 不包含成员：$missing"; return 1
+    fi
+    rest=$(ports_json_minus "$old" "$move")
+    if [ "$(jq 'length' <<< "$rest")" -eq 0 ]; then
+        dog_unlock; dog_error "拆分后原监控项不能为空"; return 1
+    fi
+    snap=$(_config_snapshot)
+    new_id=$(next_monitor_id)
+    now=$(beijing_date '+%Y-%m-%dT%H:%M:%S+08:00')
+    config_update '
+        .monitors[$id] as $src |
+        .monitors[$id].ports = $rest |
+        .monitors[$nid] = {ports: $move, remark: $r, billing_mode: ($src.billing_mode // "double"),
+            quota: (if $copy then ($src.quota // {enabled: false, monthly_limit: "unlimited"}) else {enabled: false, monthly_limit: "unlimited"} end),
+            bandwidth_limit: {enabled: false, rate: "unlimited"},
+            reset_policy: (if $copy then ($src.reset_policy // {type: "none"}) else {type: "none"} end),
+            expiry_date: (if $copy then ($src.expiry_date // "") else "" end), created_at: $now} |
+        .global.next_monitor_id = (($nid | ltrimstr("m") | tonumber) + 1)
+    ' --arg id "$id" --arg nid "$new_id" --argjson rest "$rest" --argjson move "$move" \
+      --arg r "$remark" --arg now "$now" --argjson copy "$([ "$copy" = copy ] && echo true || echo false)" ||
+        { dog_unlock; return 1; }
+    rt=$(nft_runtime_json 2>/dev/null || echo null)
+    if [ "$rt" = "null" ] || ! {
+            nft_render_elements delete "$id" "$move" "$(monitor_tc_mark "$id" >/dev/null && echo with_mark)"
+            nft_render_monitor "$new_id" 0 0 0
+        } | nft_apply; then
+        _config_restore "$snap"
+        dog_unlock; dog_log_event monitor_split 1 "id=$id"; return 1
+    fi
+    stats_rebaseline "$new_id" 0 0 || true
+    tc_refresh_monitor_ports "$id" || true
+    tc_write_interop || true
+    dog_unlock
+    dog_log_event monitor_split 0 "id=$id" "ports=$(jq -r 'join(",")' <<< "$move")"
+    echo "$new_id"
+}
+
+# 合并：把 $1 并入 $2。计数与已用配额相加，日统计按日期相加；$2 的配额/限速/到期设置保留。
+monitor_merge() {
+    local src="$1" dst="$2" snap rt sv dv si so su di dout du merged src_tc=false
+    [ "$src" != "$dst" ] || { dog_error "不能合并到自身"; return 1; }
+    dog_lock || return 75
+    monitor_exists "$src" && monitor_exists "$dst" || { dog_unlock; dog_error "监控项不存在"; return 1; }
+    stats_snapshot >/dev/null 2>&1 || true
+    rt=$(nft_runtime_json 2>/dev/null || echo null)
+    [ "$rt" != "null" ] || { dog_unlock; dog_error "nftables 规则缺失，请先运行 dog --repair"; return 1; }
+    sv=$(nft_read_monitor "$src" 2>/dev/null || echo "0 0 0"); read -r si so su <<< "$sv"
+    dv=$(nft_read_monitor "$dst" 2>/dev/null || echo "0 0 0"); read -r di dout du <<< "$dv"
+    monitor_tc_rate "$src" >/dev/null && src_tc=true
+    snap=$(_config_snapshot)
+    merged=$(jq -c --arg s "$src" --arg d "$dst" '.monitors[$d].ports + .monitors[$s].ports' "$CONFIG_FILE")
+    merged=$(ports_json_normalize "$merged") || { dog_unlock; return 1; }
+    config_update '.monitors[$d].ports = $p | del(.monitors[$s])' \
+        --arg s "$src" --arg d "$dst" --argjson p "$merged" || { dog_unlock; return 1; }
+    if ! {
+            nft_render_remove_monitor "$src" "$rt"
+            nft_render_sync_monitor "$dst" $((si + di)) $((so + dout)) $((su + du)) "$rt"
+        } | nft_apply; then
+        _config_restore "$snap"
+        dog_unlock; dog_log_event monitor_merge 1 "id=$dst"; return 1
+    fi
+    if [ "$src_tc" = "true" ] && begin_tc_update; then
+        # 合并后源监控项已不在配置中；若锁暂不可得，孤儿类由下次 --repair 清理。
+        tc_remove_monitor_locked "$src" || true
+        tc_write_interop "$src" || true
+        finish_tc_update
+    fi
+    tc_refresh_monitor_ports "$dst" || true
+    stats_merge_monitor "$src" "$dst" || true
+    stats_rebaseline "$dst" $((si + di)) $((so + dout)) || true
+    traffic_backup_save || true
+    reset_history_drop "$src" || true
+    tc_write_interop || true
+    dog_unlock
+    dog_log_event monitor_merge 0 "id=$dst"
+}
+
+monitor_set_remark() {
+    local id="$1" remark="$2"
+    [ "${#remark}" -le 64 ] || { dog_error "备注最长 64 个字符"; return 1; }
+    config_update '.monitors[$id].remark = $r' --arg id "$id" --arg r "$remark"
+}
+
+# 设置配额：$2 为 "240GB" 之类或 0（取消）。
+monitor_set_quota() {
+    local id="$1" limit="$2" rc=0
+    if [ "$limit" != "0" ]; then
+        validate_quota "$limit" || { dog_error "配额格式无效，示例：500GB、1.5TB、800MB"; return 1; }
+        limit="${limit^^}"
+    fi
+    dog_lock || return 75
+    if [ "$limit" = "0" ]; then
+        config_update '.monitors[$id].quota.enabled = false | .monitors[$id].quota.monthly_limit = "unlimited"' --arg id "$id" || rc=1
+    else
+        config_update '.monitors[$id].quota.enabled = true | .monitors[$id].quota.monthly_limit = $l' \
+            --arg id "$id" --arg l "$limit" || rc=1
+    fi
+    [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
+    dog_unlock
+    dog_log_event quota_apply "$rc" "id=$id"
+    return "$rc"
+}
+
+# 计费模式：double（入站+出站，各×2，与上游一致）| single（入站+出站，×1）。
+# 计数器只记原始字节，切换模式只改倍率与配额阈值，不改写计数。
+monitor_set_billing() {
+    local id="$1" mode="$2" rc=0
+    case "$mode" in single|double) ;; *) dog_error "计费模式只能是 single 或 double"; return 1 ;; esac
+    dog_lock || return 75
+    config_update '.monitors[$id].billing_mode = $m' --arg id "$id" --arg m "$mode" || rc=1
+    [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
+    dog_unlock
+    dog_log_event config_update "$rc" "id=$id" "mode=$mode"
+    return "$rc"
+}
+
+# ── 1.5.x → 2.0 迁移 ──────────────────────────────────────────────
+# 1.5.x 以端口串为 key（.ports["8031,8032"]），计数器名由 key 派生，且“双倍计费”靠重复规则实现，
+# 内核计数已包含倍率。迁移把计数除以旧倍率得到原始字节，在新结构中以初值原样恢复。
+# 迁移前完整备份；任何一步失败都恢复旧配置、旧 nft 表与 crontab。
+
+legacy_counter_prefix() {
+    local key="$1"
+    if [[ "$key" == *,* ]]; then
+        echo "port_g$(printf '%s' "$key" | tr ',-' '__')"
+    else
+        echo "port_${key//-/_}"
     fi
 }
+
+legacy_rate_to_tc() {
+    local v="${1,,}"
+    case "$v" in
+        unlimited|"") echo unlimited ;;
+        *kbps|*mbps|*gbps) convert_bandwidth_to_tc "$v" ;;
+        *kbit|*mbit|*gbit) echo "$v" ;;
+        *) echo unlimited ;;
+    esac
+}
+
+# 读取旧计数：{key:{in,out,quota_used}}（原始字节，已除以倍率）。
+legacy_read_values() {
+    local old_cfg="$1" old_data="$2" nft_json key prefix mult in_b out_b used values="{}" src
+    nft_json=$(nft -j list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || echo '{"nftables":[]}')
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        prefix=$(legacy_counter_prefix "$key")
+        mult=$(jq -r --arg k "$key" 'if (.ports[$k].billing_mode // "double") == "single" then 1 else 2 end' <<< "$old_cfg")
+        read -r in_b out_b used < <(jq -r --arg p "$prefix" '
+            [.nftables[] | .counter? // empty] as $c | [.nftables[] | .quota? // empty] as $q |
+            "\(($c[] | select(.name == "\($p)_in") | .bytes) // "x") \(($c[] | select(.name == "\($p)_out") | .bytes) // "x") \(($q[] | select(.name == "\($p)_quota") | .used) // 0)"
+        ' <<< "$nft_json")
+        src=kernel
+        if [ "$in_b" = "x" ] || [ "$out_b" = "x" ]; then
+            # 内核里没有（如重启后未恢复）：用旧灾备文件。
+            read -r in_b out_b < <(jq -r --arg k "$key" '.[$k] // {} | "\(.input // 0) \(.output // 0)"' <<< "$old_data")
+            used=$((in_b + out_b))
+            src=backup
+        fi
+        values=$(jq -c --arg k "$key" --argjson i "$((in_b / mult))" --argjson o "$((out_b / mult))" \
+            --argjson u "$((used / mult))" --arg s "$src" '. + {($k): {in: $i, out: $o, quota_used: $u, source: $s}}' <<< "$values")
+    done < <(jq -r '.ports | keys[] | select(. != "00")' <<< "$old_cfg" | sort -t, -k1,1n)
+    echo "$values"
+}
+
+# 由旧配置生成 schema 2 配置；输出 {config, idmap:{key:id}}。
+legacy_build_config() {
+    local old_cfg="$1"
+    # 上游 1.4.x 的 "00" 是整机流量伪端口，2.0 由独立的整机统计负责，不迁移为监控项。
+    jq -c --argjson keys "$(jq -c '[.ports | keys[] | select(. != "00")] | sort_by(split(",")[0] | split("-")[0] | tonumber)' <<< "$old_cfg")" '
+        def rate_tc: ascii_downcase |
+            if test("^[0-9]+kbps$") then sub("kbps$"; "kbit") elif test("^[0-9]+mbps$") then sub("mbps$"; "mbit")
+            elif test("^[0-9]+gbps$") then sub("gbps$"; "gbit") elif test("^[0-9]+(kbit|mbit|gbit)$") then .
+            else "unlimited" end;
+        . as $o |
+        ([range(0; $keys | length) | {($keys[.]): "m\(. + 1)"}] | add // {}) as $idmap |
+        { idmap: $idmap,
+          config: {
+            schema: 2,
+            global: { billing_mode: ($o.global.billing_mode // "double"),
+                      next_monitor_id: (($keys | length) + 1),
+                      data_retention_days: ($o.global.data_retention_days // 400) },
+            monitors: ([$keys[] as $k | $o.ports[$k] as $p |
+                (($p.quota.enabled // true) and (($p.quota.monthly_limit // "unlimited") != "unlimited")) as $q |
+                ($p.quota.reset_policy // (if ($p.quota.reset_day // null) != null then {type: "monthly", day: $p.quota.reset_day} else {type: "none"} end)) as $rp |
+                { ($idmap[$k]): {
+                    ports: ($k | split(",")),
+                    remark: (($p.remark // "") | if . == "" then (($p.name // "") | if startswith("端口") then "" else . end) else . end | .[0:64]),
+                    billing_mode: ($p.billing_mode // "double"),
+                    quota: { enabled: $q, monthly_limit: (if $q then ($p.quota.monthly_limit | ascii_upcase) else "unlimited" end) },
+                    bandwidth_limit: ((($p.bandwidth_limit.rate // "unlimited") | rate_tc) as $r |
+                        { enabled: (($p.bandwidth_limit.enabled // false) and $r != "unlimited"), rate: $r }),
+                    reset_policy: (if $q and (($rp.type // "none") != "none") then ($rp | del(.instance_id, .reset_now) |
+                                     if .type == "interval_days" or .type == "interval_months" then .anchor_date = (.anchor_date // .date) else . end)
+                                   else {type: "none"} end),
+                    expiry_date: ($p.expiry_date // $p.expiry.expire_date // ""),   # 上游 1.4.x：.expiry.expire_date
+                    created_at: ($p.created_at // "")
+                } }] | add // {}),
+            notifications: ($o.notifications // {} | del(.email))
+          } }
+    ' <<< "$old_cfg"
+}
+
+legacy_build_stats() {
+    local old_stats="$1" idmap="$2" old_cfg="$3"
+    jq -c --argjson m "$idmap" --argjson cfg "$old_cfg" '
+        {schema: 2, monitors: ([ $m | to_entries[] | .key as $k | .value as $id |
+            (if ($cfg.ports[$k].billing_mode // "double") == "single" then 1 else 2 end) as $mult |
+            { ($id): { last: null,
+                daily: ((.daily[$k]? // {}) | with_entries(.value = {in: ((.value.input // 0) / $mult | floor), out: ((.value.output // 0) / $mult | floor)})) } }
+        ] | add // {})}
+    ' <<< "$old_stats" 2>/dev/null || stats_empty
+}
+
+legacy_needs_migration() {
+    config_exists && [ "$(config_schema)" = "1" ]
+}
+
+migrate_from_legacy() {
+    local ts dir old_cfg old_data old_stats built idmap new_cfg values new_values legacy_tc=false rc=0
+    legacy_needs_migration || return 0
+    old_cfg=$(cat "$CONFIG_FILE")
+    if ! jq -e '.ports | type == "object"' <<< "$old_cfg" >/dev/null 2>&1; then
+        dog_error "旧配置无法解析，已停止迁移：$CONFIG_FILE"
+        return 1
+    fi
+    if jq -e '[.ports[] | select((.bandwidth_limit.enabled // false) and ((.bandwidth_limit.rate // "unlimited") != "unlimited"))] | length > 0' \
+        <<< "$old_cfg" >/dev/null; then
+        legacy_tc=true
+        tc_require_ntc_compatible || { dog_error "迁移已中止，未做任何修改"; return 1; }
+    fi
+    echo -e "${BLUE}检测到 1.5.x 配置，开始迁移到 2.0（监控项改为稳定 ID，可直接增删端口）...${NC}"
+    dog_lock || return 75
+    ts=$(date +%Y%m%d-%H%M%S)
+    dir="$BACKUP_DIR/migrate-1.5-$ts"
+    mkdir -p "$dir" && chmod 700 "$dir"
+    cp -p "$CONFIG_FILE" "$dir/" 2>/dev/null || true
+    local f
+    for f in "$TRAFFIC_DATA_FILE" "$TRAFFIC_STATS_FILE" "$CONFIG_DIR/reset_history.log"; do
+        [ -f "$f" ] && cp -p "$f" "$dir/"
+    done
+    [ -d "$CONFIG_DIR/notifications" ] && cp -rp "$CONFIG_DIR/notifications" "$dir/"
+    crontab -l > "$dir/crontab.txt" 2>/dev/null || true
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" > "$dir/nft-table.nft" 2>/dev/null || true
+    { iface=$(get_default_interface 2>/dev/null) && tc -s class show dev "$iface" && tc filter show dev "$iface" parent 1:0; } \
+        > "$dir/tc-state.txt" 2>/dev/null || true
+
+    old_data=$(cat "$TRAFFIC_DATA_FILE" 2>/dev/null || echo '{}')
+    old_stats=$(cat "$TRAFFIC_STATS_FILE" 2>/dev/null || echo '{}')
+    values=$(legacy_read_values "$old_cfg" "$old_data")
+    built=$(legacy_build_config "$old_cfg") || { dog_unlock; dog_error "生成新配置失败"; return 1; }
+    idmap=$(jq -c '.idmap' <<< "$built")
+    new_cfg=$(jq '.config' <<< "$built")
+    local errors
+    errors=$(jq -c "$CONFIG_VALIDATOR_JQ" <<< "$new_cfg")
+    if [ "$errors" != "[]" ]; then
+        dog_unlock
+        jq -r '.[]' <<< "$errors" | sed 's/^/迁移后配置错误：/' >&2
+        dog_error "迁移已中止，旧配置未改动（备份：$dir）"
+        return 1
+    fi
+    new_values=$(jq -c --argjson m "$idmap" 'with_entries(.key = $m[.key] | .value |= del(.source))' <<< "$values")
+
+    _migrate_rollback() {
+        cp -p "$dir/config.json" "$CONFIG_FILE" 2>/dev/null || true
+        [ -f "$dir/traffic_data.json" ] && cp -p "$dir/traffic_data.json" "$TRAFFIC_DATA_FILE"
+        [ -f "$dir/traffic_stats.json" ] && cp -p "$dir/traffic_stats.json" "$TRAFFIC_STATS_FILE"
+        if [ -s "$dir/nft-table.nft" ]; then
+            { printf 'add table %s\ndelete table %s\n' "$(nft_t)" "$(nft_t)"; cat "$dir/nft-table.nft"; } | nft -f - 2>/dev/null || true
+        fi
+        [ -f "$dir/crontab.txt" ] && crontab "$dir/crontab.txt" 2>/dev/null || true
+    }
+
+    printf '%s\n' "$new_cfg" | atomic_write "$CONFIG_FILE" 600 || { dog_unlock; return 1; }
+    if ! nft_render_table "$new_values" | nft_apply; then
+        _migrate_rollback
+        dog_unlock
+        dog_error "nftables 新规则写入失败，已恢复 1.5.x 状态（备份：$dir）"
+        dog_log_event migrate 1
+        return 1
+    fi
+    traffic_backup_write "$new_values" || rc=1
+    legacy_build_stats "$old_stats" "$idmap" "$old_cfg" | atomic_write "$TRAFFIC_STATS_FILE" 600 || rc=1
+    stats_rebaseline_all || true
+    # 当期已完成的重置记录（防止迁移后对同一到期日重复清零）
+    if [ -f "$CONFIG_DIR/reset_history.log" ]; then
+        local hist="{}" line key due id next
+        while IFS='|' read -r _ key _ due _; do
+            id=$(jq -r --arg k "$key" '.[$k] // empty' <<< "$idmap")
+            [ -n "$id" ] && is_valid_date "$due" || continue
+            next=$(jq -r --arg id "$id" '.monitors[$id].reset_policy.next_reset_date // ""' <<< "$new_cfg")
+            [ "$due" = "$next" ] || continue
+            hist=$(jq -c --arg id "$id" --arg d "$due" '.[$id] = [{due: $d, at: "migrated", in: 0, out: 0}]' <<< "$hist")
+        done < "$CONFIG_DIR/reset_history.log"
+        printf '%s\n' "$hist" | atomic_write "$RESET_HISTORY_FILE" 600 || true
+        rm -f "$CONFIG_DIR/reset_history.log"
+    fi
+    if [ "$legacy_tc" = "true" ]; then
+        legacy_remove_tc_objects "$old_cfg" || rc=1
+        tc_restore_all || { rc=1; dog_error "限速规则迁移未完成，请运行 dog --repair"; }
+    else
+        tc_write_interop || true
+    fi
+    rm -rf "$CONFIG_DIR/notifications"
+    dog_unlock
+    cron_sync || rc=1
+    dog_log_event migrate "$rc"
+    echo -e "${GREEN}迁移完成：$(jq '.monitors | length' <<< "$new_cfg") 个监控项，流量计数与配额已按原值保留。备份位于 $dir${NC}"
+    jq -r --argjson v "$values" 'to_entries[] | "  \(.value)  ←  端口 \(.key)（计数来源：\($v[.key].source)）"' <<< "$idmap"
+    return "$rc"
+}
+
+# 删除 1.5.x 创建的 TC 子类与过滤器（按旧配置记录的 class_id）。
+legacy_remove_tc_objects() {
+    local old_cfg="$1" iface class dev json
+    iface=$(get_default_interface 2>/dev/null) || return 0
+    begin_tc_update || return 1
+    while IFS= read -r class; do
+        [[ "$class" =~ ^1:[0-9a-fA-F]+$ ]] || continue
+        for dev in "$iface" "$TC_IFB_DEVICE"; do
+            ip link show "$dev" >/dev/null 2>&1 || continue
+            json=$(tc -j filter show dev "$dev" parent 1:0 2>/dev/null || echo '[]')
+            jq -r --arg c "$class" '.[] | select((.options.classid? // .options.flowid? // "") == $c and .options.handle? != null) |
+                "\(.protocol) \(.pref) \(.kind) \(.options.handle)"' <<< "$json" 2>/dev/null |
+            while read -r proto pref kind handle; do
+                tc filter del dev "$dev" parent 1:0 protocol "$proto" pref "$pref" handle "$handle" "$kind" 2>/dev/null || true
+            done
+            # u32 过滤器的 handle 形如 800::800，按 pref 整组删除更可靠
+            tc filter show dev "$dev" parent 1:0 2>/dev/null | awk -v c="$class" '$0 ~ "flowid " c "( |$)" {
+                for (i = 1; i <= NF; i++) if ($i == "pref") print $(i + 1) }' | sort -u |
+            while read -r pref; do
+                tc filter del dev "$dev" parent 1:0 pref "$pref" 2>/dev/null || true
+            done
+            tc class del dev "$dev" classid "$class" 2>/dev/null || true
+        done
+    done < <(jq -r '.ports[] | .bandwidth_limit.class_id // empty' <<< "$old_cfg")
+    finish_tc_update
+}
+
+begin_tc_update() {
+    if [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ]; then
+        TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH + 1))
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$TC_SHARED_LOCK_FILE")" || return 1
+    exec 9>"$TC_SHARED_LOCK_FILE" || return 1
+    if ! flock -w 15 9; then
+        exec 9>&-
+        return 1
+    fi
+    TC_SHARED_LOCK_DEPTH=1
+    TC_UPDATE_MIGRATED_LEGACY_TBF=false
+    TC_UPDATE_LEGACY_TBF_RATE=""
+}
+
+finish_tc_update() {
+    [ "$TC_SHARED_LOCK_DEPTH" -gt 0 ] || return 0
+    TC_SHARED_LOCK_DEPTH=$((TC_SHARED_LOCK_DEPTH - 1))
+    if [ "$TC_SHARED_LOCK_DEPTH" -eq 0 ]; then
+        TC_UPDATE_MIGRATED_LEGACY_TBF=false
+        TC_UPDATE_LEGACY_TBF_RATE=""
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+    fi
+}
+
+# 端口段与端口组走同一条 TC 限速路径：nft 侧按端口打 meta mark，tc 侧用一条 fw
+# 过滤器按 mark 归入同一个 class。单端口则走 u32/flower 精确匹配。
+# 组内成员既可以是单端口也可以是端口段，靠 port_selectors 逐条展开。
+
+# burst速率突发计算
+# 注意：不要照搬上游的 10ms/64KB 公式。burst 是相对 class **rate** 的桶，而本项目
+# 端口类的 rate 固定为 TC_PORT_CLASS_RATE(1kbit)、只有 ceil 承载限速值，内核会按 rate
+# 归一化 burst（实测：rate 1kbit 下传 6250000 显示 6Kb、传 64k 显示 31176b；rate 500Mbit
+# 下传 6250000 则原样显示）。上游用 rate=ceil=限速值 的结构，其公式在这里不适用，照搬
+# 反而会让高速率下的实际突发从 6Kb 变成 31176b，比原来更宽松。
+calculate_tc_burst() {
+    local base_rate=$1
+    local rate_bytes_per_sec=$((base_rate * 1000 / 8))
+    local burst_by_formula=$((rate_bytes_per_sec / 20))  # 50ms缓冲
+    local min_burst=$((2 * 1500))                        # 2个MTU最小值
+
+    if [ $burst_by_formula -gt $min_burst ]; then
+        echo $burst_by_formula
+    else
+        echo $min_burst
+    fi
+}
+
+format_tc_burst() {
+    local burst_bytes=$1
+    if [ $burst_bytes -lt 1024 ]; then
+        echo "${burst_bytes}"
+    elif [ $burst_bytes -lt 1048576 ]; then
+        echo "$((burst_bytes / 1024))k"
+    else
+        echo "$((burst_bytes / 1048576))m"
+    fi
+}
+
+parse_tc_rate_to_kbps() {
+    local total_limit="$1"
+    case "$total_limit" in
+        *gbit) echo $(( ${total_limit%gbit} * 1000000 )) ;;
+        *mbit) echo $(( ${total_limit%mbit} * 1000 )) ;;
+        *) echo "${total_limit%kbit}" ;;
+    esac
+}
+
+# 将用户输入的带宽值(Kbps/Mbps/Gbps)转换为TC格式(kbit/mbit/gbit)
 
 # Dog 与 NTC 共用同一个恢复入口和同一个 systemd oneshot，避免两边各自抢 root。
 tc_recovery_systemd_available() {
@@ -5900,7 +3107,7 @@ manage_tc_recovery() {
     local status_output=""
     local status_kind=""
 
-    clear 2>/dev/null || true
+    menu_clear
     echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
     echo "TC 状态: $(dog_tc_status_label)"
     echo "自动恢复: $(tc_auto_recovery_state)"
@@ -5966,1576 +3173,9 @@ manage_tc_recovery() {
                 echo -e "${RED}开机自动恢复关闭失败；现有启用状态未被确认改变。${NC}"
             fi
             ;;
-        0) show_main_menu; return ;;
+        0|"") return 0 ;;
         *) echo -e "${RED}无效选择。${NC}" ;;
     esac
-    echo
-    read -r -p "按回车键返回主菜单..."
-    show_main_menu
-}
-
-validate_ip_guard_script_file() {
-    local candidate="$1"
-    [ -s "$candidate" ] &&
-        grep -Fq '# PORT_TRAFFIC_DOG_IP_GUARD' "$candidate" 2>/dev/null &&
-        bash -n "$candidate" >/dev/null 2>&1
-}
-
-install_ip_guard_script_file() {
-    local source_file="$1"
-    local temp_file
-    mkdir -p "$CONFIG_DIR" || return 1
-    temp_file=$(mktemp "$CONFIG_DIR/.port-ip-guard.sh.XXXXXX") || return 1
-    if ! install -m 755 "$source_file" "$temp_file" ||
-       ! mv -f "$temp_file" "$IP_GUARD_SCRIPT_PATH"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-}
-
-get_ip_guard_service_state() {
-    if [ ! -e "$IP_GUARD_SERVICE_FILE" ]; then
-        echo "absent"
-        return 0
-    fi
-    command -v "$IP_GUARD_SYSTEMCTL" >/dev/null 2>&1 || return 1
-
-    local active_state
-    active_state=$("$IP_GUARD_SYSTEMCTL" show "$IP_GUARD_SERVICE" \
-        --property=ActiveState --value 2>/dev/null) || return 1
-    case "$active_state" in
-        active|activating|reloading|deactivating) echo "active" ;;
-        inactive|failed) echo "inactive" ;;
-        *) return 1 ;;
-    esac
-}
-
-restart_ip_guard_after_update() {
-    validate_ip_guard_script_file "$IP_GUARD_SCRIPT_PATH" || return 1
-    command -v "$IP_GUARD_SYSTEMCTL" >/dev/null 2>&1 || return 1
-    "$IP_GUARD_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || return 1
-    "$IP_GUARD_SYSTEMCTL" restart "$IP_GUARD_SERVICE" >/dev/null 2>&1 || return 1
-    local attempt
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        if "$IP_GUARD_SYSTEMCTL" is-active --quiet "$IP_GUARD_SERVICE" >/dev/null 2>&1 &&
-           bash "$IP_GUARD_SCRIPT_PATH" --self-check >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-ensure_ip_guard_script() {
-    if validate_ip_guard_script_file "$IP_GUARD_SCRIPT_PATH"; then
-        chmod 755 "$IP_GUARD_SCRIPT_PATH" 2>/dev/null || true
-        return 0
-    fi
-
-    local script_dir
-    local bundled_script
-    script_dir=$(dirname "$SCRIPT_PATH")
-    bundled_script="$script_dir/port-ip-guard.sh"
-    if validate_ip_guard_script_file "$bundled_script"; then
-        install_ip_guard_script_file "$bundled_script"
-        return $?
-    fi
-
-    local download_file
-    mkdir -p "$CONFIG_DIR" || return 1
-    download_file=$(mktemp "$CONFIG_DIR/.port-ip-guard-download.XXXXXX") || return 1
-    if ! download_with_sources "$IP_GUARD_SCRIPT_URL" "$download_file" ||
-       ! validate_ip_guard_script_file "$download_file" ||
-       ! install_ip_guard_script_file "$download_file"; then
-        rm -f "$download_file"
-        return 1
-    fi
-    rm -f "$download_file"
-}
-
-manage_ip_guard() {
-    if [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
-    echo -e "${BLUE}=== 在线 IP / 并发连接限制（测试中） ===${NC}"
-    echo -e "${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
-    echo "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
-    echo "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
-    echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
-    echo
-    if ! dependency_install_missing false all; then
-        echo '依赖未就绪；可在主菜单 12 管理依赖。未启用新的防火墙限制。' >&2
-        read -r -p '按回车返回主菜单...' || return 0
-        return 0
-    fi
-    if ! ensure_ip_guard_script; then
-        echo -e "${RED}独立组件下载或校验失败，未修改防火墙。${NC}"
-    elif ! bash "$IP_GUARD_SCRIPT_PATH"; then
-        echo -e "${RED}在线 IP / 并发连接限制组件执行失败。${NC}"
-    fi
-    echo
-    read -r -p "按回车键返回主菜单..."
-    show_main_menu
-}
-
-# 显示主界面
-# 中文按终端显示列宽布局，避免用固定空格拼接菜单列。
-menu_text_width() {
-    local text="$1" index character code width=0 LC_CTYPE=C.UTF-8
-    for ((index=0; index<${#text}; index++)); do
-        character="${text:index:1}"
-        printf -v code '%d' "'$character"
-        if (( code >= 0x300 && code <= 0x36f )); then continue; fi
-        if (( code >= 0x1100 && (code <= 0x115f || code >= 0x2e80) )); then
-            width=$((width+2))
-        else width=$((width+1)); fi
-    done
-    printf '%s' "$width"
-}
-
-menu_columns() {
-    local columns="${COLUMNS:-80}" size
-    if [ -t 1 ]; then
-        size=$(stty size 2>/dev/null) || size=''
-        [ -z "$size" ] || columns="${size##* }"
-    fi
-    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
-    printf '%s' "$columns"
-}
-
-menu_item() {
-    local number="$1" text="$2" columns="${3:-80}" index character width=4 amount
-    local LC_CTYPE=C.UTF-8
-    printf '%b%2s.%b ' "$BLUE" "$number" "$NC"
-    for ((index=0; index<${#text}; index++)); do
-        character="${text:index:1}"
-        amount=$(menu_text_width "$character")
-        if [ "$((width+amount))" -gt "$columns" ]; then printf '\n    '; width=4; fi
-        printf '%s' "$character"
-        width=$((width+amount))
-    done
-    printf '\n'
-}
-
-show_main_menu_options() {
-    local columns left right index width gap
-    columns=$(menu_columns)
-    local -a labels=('添加/删除端口监控' '端口限制设置管理' '流量重置管理' '一键导出/导入配置'
-        '安装依赖（更新）脚本' '卸载脚本' '通知管理' '系统自检/修复'
-        'TC 冲突处理/自动恢复' '在线 IP / 并发连接限制（测试中）'
-        '查看操作 / IP Guard 日志' '依赖检测 / 安装 / 卸载')
-    for index in 0 2 4 6; do
-        if [ "$columns" -ge 60 ]; then
-            left="${labels[index]}"; right="${labels[index+1]}"
-            width=$(menu_text_width "$left"); gap=$((32-4-width))
-            printf '%b%2d.%b %s%*s%b%2d.%b %s\n' "$BLUE" "$((index+1))" "$NC" "$left" "$gap" '' \
-                "$BLUE" "$((index+2))" "$NC" "$right"
-        else
-            menu_item "$((index+1))" "${labels[index]}" "$columns"
-            menu_item "$((index+2))" "${labels[index+1]}" "$columns"
-        fi
-    done
-    for index in 8 9 10 11; do menu_item "$((index+1))" "${labels[index]}" "$columns"; done
-    menu_item 0 退出 "$columns"
-}
-
-show_main_menu() {
-    while true; do
-        if [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
-
-    local active_ports=($(get_active_ports))
-    local port_count=${#active_ports[@]}
-    local daily_total=$(get_daily_total_traffic)
-
-    echo -e "${BLUE}=== 端口流量狗 v$SCRIPT_VERSION ===${NC}"
-    echo
-
-    echo -e "${GREEN}状态: 监控中${NC} | ${BLUE}守护端口: ${port_count}个${NC} | ${YELLOW}端口总流量: $daily_total${NC}"
-    local machine_traffic
-    machine_traffic=$(machine_traffic_summary)
-    if [ -n "$machine_traffic" ]; then
-        echo -e "${BLUE}整机流量:${NC} $machine_traffic ${YELLOW}(只读参考)${NC}"
-    fi
-    echo -e "${BLUE}TC 状态:${NC} $(dog_tc_status_label) | ${BLUE}自动恢复:${NC} $(tc_auto_recovery_state)"
-    echo "────────────────────────────────────────────────────────"
-
-    if [ $port_count -gt 0 ]; then
-        format_port_list "display"
-    else
-        echo -e "${YELLOW}暂无监控端口${NC}"
-    fi
-
-    echo "────────────────────────────────────────────────────────"
-
-    show_main_menu_options
-    echo
-    read -r -p "请选择操作 [0-12]: " choice || return 0
-
-        case $choice in
-            1) manage_port_monitoring; return ;;
-            2) manage_traffic_limits; return ;;
-            3) manage_traffic_reset; return ;;
-            4) manage_configuration; return ;;
-            5) install_update_script; return ;;
-            6) uninstall_script; return ;;
-            7) manage_notifications; return ;;
-            8) system_check_and_repair || true ;;
-            9) manage_tc_recovery; return ;;
-            10) manage_ip_guard; return ;;
-            11) show_operation_logs; read -r -p "按回车返回..."; ;;
-            12) dependency_menu ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效选择，请输入0-12${NC}"; sleep 1 ;;
-        esac
-    done
-}
-
-manage_port_monitoring() {
-    echo -e "${BLUE}=== 端口监控管理 ===${NC}"
-    echo "1. 添加端口监控"
-    echo "2. 删除端口监控"
-    echo "0. 返回主菜单"
-    echo
-    read -p "请选择操作 [0-2]: " choice
-
-    case $choice in
-        1) add_port_monitoring ;;
-        2) remove_port_monitoring ;;
-        0) show_main_menu ;;
-        *) echo -e "${RED}无效选择${NC}"; sleep 1; manage_port_monitoring ;;
-    esac
-}
-
-add_port_monitoring() {
-    echo -e "${BLUE}=== 添加端口监控 ===${NC}"
-    echo
-
-    echo -e "${GREEN}当前系统端口使用情况:${NC}"
-    printf "%-15s %-9s\n" "程序名" "端口"
-    echo "────────────────────────────────────────────────────────"
-
-    # 解析ss输出，聚合同程序的端口
-    declare -A program_ports=()
-    while read line; do
-        if [[ "$line" =~ LISTEN|UNCONN ]]; then
-            local_addr=$(echo "$line" | awk '{print $5}')
-            port=$(echo "$local_addr" | grep -o ':[0-9]*$' | cut -d':' -f2)
-            program=$(echo "$line" | awk '{print $7}' | cut -d'"' -f2 2>/dev/null || echo "")
-
-            if [ -n "$port" ] && [ -n "$program" ] && [ "$program" != "-" ]; then
-                if [ -z "${program_ports[$program]:-}" ]; then
-                    program_ports[$program]="$port"
-                else
-                    # 避免重复端口
-                    if [[ ! "${program_ports[$program]}" =~ (^|.*\|)$port(\||$) ]]; then
-                        program_ports[$program]="${program_ports[$program]}|$port"
-                    fi
-                fi
-            fi
-        fi
-    done < <(ss -tulnp 2>/dev/null || true)
-
-    if [ ${#program_ports[@]} -gt 0 ]; then
-        for program in $(printf '%s\n' "${!program_ports[@]}" | sort); do
-            ports="${program_ports[$program]}"
-            printf "%-10s | %-9s\n" "$program" "$ports"
-        done
-    else
-        echo "无活跃端口"
-    fi
-
-    echo "────────────────────────────────────────────────────────"
-    echo
-
-    echo -e "${YELLOW}输入格式：${NC}"
-    echo -e "  多个端口用 ${GREEN};${NC} 分隔，各成一个独立监控项"
-    echo -e "  同一个监控项内可用 ${GREEN},${NC} 组合多个端口，它们共享同一套统计/配额/限速/重置"
-    echo -e "  端口段用 ${GREEN}-${NC} 表示"
-    echo -e "  例：${GREEN}80,443${NC} 表示一个监控项；${GREEN}80,443;8080${NC} 表示一个共享项加一个独立项"
-    read -p "请输入要监控的端口: " port_input
-
-    local PORTS=()
-    if ! parse_monitor_units "$port_input" PORTS; then
-        sleep 2
-        add_port_monitoring
-        return
-    fi
-    local valid_ports=()
-
-    for port in "${PORTS[@]}"; do
-        if jq -e ".ports.\"$port\"" "$CONFIG_FILE" >/dev/null 2>&1; then
-            echo -e "${YELLOW}端口 $port 已在监控列表中，跳过${NC}"
-            continue
-        fi
-
-        local overlap_port=""
-        local configured_port
-        while IFS= read -r configured_port; do
-            if port_specs_overlap "$port" "$configured_port"; then
-                overlap_port="$configured_port"
-                break
-            fi
-        done < <(jq -r '.ports // {} | keys[]' "$CONFIG_FILE" 2>/dev/null || true)
-        if [ -z "$overlap_port" ]; then
-            for configured_port in "${valid_ports[@]}"; do
-                if port_specs_overlap "$port" "$configured_port"; then
-                    overlap_port="$configured_port"
-                    break
-                fi
-            done
-        fi
-        if [ -n "$overlap_port" ]; then
-            echo -e "${YELLOW}端口 $port 与已选或已配置的 $overlap_port 重叠，跳过以避免重复计量${NC}"
-            continue
-        fi
-
-        valid_ports+=("$port")
-    done
-
-    if [ ${#valid_ports[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可添加${NC}"
-        sleep 2
-        manage_port_monitoring
-        return
-    fi
-
-    echo
-    echo -e "${GREEN}说明:${NC}"
-    echo "1. 双向流量统计"
-    echo "   沿用上游规则，总流量 = 入站×2 + 出站×2"
-    echo
-    echo "2. 单向流量统计"
-    echo "   双向规则减半，总流量 = 入站 + 出站"
-    echo
-    echo "请选择统计模式:"
-    echo "1. 双向流量统计"
-    echo "2. 单向流量统计"
-    read -p "请选择(回车默认1) [1-2]: " billing_choice
-
-    local billing_mode="double"
-    case $billing_choice in
-        1|"") billing_mode="double" ;;
-        2) billing_mode="single" ;;
-        *) billing_mode="double" ;;
-    esac
-
-    echo
-    local port_list
-    port_list=$(IFS=','; echo "${valid_ports[*]}")
-    while true; do
-        echo "为端口 $port_list 设置流量配额（总量控制）:"
-        echo "请输入配额值（0为无限制）（要带单位MB/GB/T）:"
-        echo "(多端口分别配额使用逗号,分隔)(只输入一个值，应用到所有端口):"
-        read -p "流量配额(回车默认0): " quota_input
-
-        if [ -z "$quota_input" ]; then
-            quota_input="0"
-        fi
-
-        local QUOTAS=()
-        parse_comma_separated_input "$quota_input" QUOTAS
-
-        local all_valid=true
-        for quota in "${QUOTAS[@]}"; do
-            if [ "$quota" != "0" ] && ! validate_quota "$quota"; then
-                echo -e "${RED}配额格式错误: $quota，请使用如：100MB, 1GB, 2T${NC}"
-                all_valid=false
-                break
-            fi
-        done
-
-        if [ "$all_valid" = false ]; then
-            echo "请重新输入配额值"
-            continue
-        fi
-
-        expand_single_value_to_array QUOTAS ${#valid_ports[@]}
-        if [ ${#QUOTAS[@]} -ne ${#valid_ports[@]} ]; then
-            echo -e "${RED}配额值数量与端口数量不匹配${NC}"
-            continue
-        fi
-
-        break
-    done
-
-    local reset_policy_config=""
-    local RESET_POLICY_CONFIGS=()
-    local separate_policy="false"
-    local has_limited_quota=false
-    local limited_quota_count=0
-    for quota in "${QUOTAS[@]}"; do
-        quota=$(echo "$quota" | tr -d ' ')
-        if [ "$quota" != "0" ] && [ -n "$quota" ]; then
-            has_limited_quota=true
-            limited_quota_count=$((limited_quota_count + 1))
-        fi
-    done
-
-    if [ "$has_limited_quota" = "true" ]; then
-        echo
-        echo "检测到已设置流量配额，请设置自动重置策略:"
-        if [ "$limited_quota_count" -gt 1 ]; then
-            read -p "是否为每个有限配额端口分别设置策略? [y/N]: " separate_choice
-            if [[ "$separate_choice" =~ ^[Yy]$ ]]; then
-                separate_policy="true"
-            fi
-        fi
-
-        if [ "$separate_policy" = "true" ]; then
-            for i in "${!valid_ports[@]}"; do
-                local quota=$(echo "${QUOTAS[$i]}" | tr -d ' ')
-                if [ "$quota" != "0" ] && [ -n "$quota" ]; then
-                    local port="${valid_ports[$i]}"
-                    echo
-                    echo "设置端口 $port 的自动重置策略:"
-                    prompt_reset_policy 1
-                    RESET_POLICY_CONFIGS[$i]="$RESET_POLICY_CONFIG"
-                fi
-            done
-        else
-            prompt_reset_policy 1
-            reset_policy_config="$RESET_POLICY_CONFIG"
-        fi
-    fi
-
-    local EXPIRY_DATES=()
-    while true; do
-        echo
-        echo -e "${BLUE}=== 服务到期日（可选） ===${NC}"
-        echo "到期前自动重置照常执行；到期日当天起封锁该端口的 TCP/UDP。"
-        echo "请输入 YYYY-MM-DD；回车或 0 表示永不到期。"
-        echo "多端口可用逗号分别设置，只输入一个值则应用到全部端口。"
-        read -p "服务到期日: " expiry_input
-        expiry_input="${expiry_input:-0}"
-        parse_comma_separated_input "$expiry_input" EXPIRY_DATES
-        expand_single_value_to_array EXPIRY_DATES ${#valid_ports[@]}
-        if [ ${#EXPIRY_DATES[@]} -ne ${#valid_ports[@]} ]; then
-            echo -e "${RED}到期日数量与端口数量不匹配${NC}"
-            continue
-        fi
-        local expiry_values_valid=true
-        local expiry_value
-        for expiry_value in "${EXPIRY_DATES[@]}"; do
-            expiry_value=$(echo "$expiry_value" | tr -d ' ')
-            if [ "$expiry_value" != "0" ] && ! is_valid_date "$expiry_value"; then
-                echo -e "${RED}到期日无效: $expiry_value，请使用 YYYY-MM-DD${NC}"
-                expiry_values_valid=false
-                break
-            fi
-        done
-        [ "$expiry_values_valid" = "true" ] && break
-    done
-
-    echo
-    echo -e "${BLUE}=== 规则备注配置 ===${NC}"
-    echo "请输入当前规则备注(可选，直接回车跳过):"
-    echo "(多端口排序分别备注使用逗号,分隔)(只输入一个值，应用到所有端口):"
-    read -p "备注: " remark_input
-
-    local REMARKS=()
-    if [ -n "$remark_input" ]; then
-        parse_comma_separated_input "$remark_input" REMARKS
-
-        expand_single_value_to_array REMARKS ${#valid_ports[@]}
-        if [ ${#REMARKS[@]} -ne ${#valid_ports[@]} ]; then
-            echo -e "${RED}备注数量与端口数量不匹配${NC}"
-            sleep 2
-            add_port_monitoring
-            return
-        fi
-    fi
-
-    local added_count=0
-    local added_ports=()
-    for i in "${!valid_ports[@]}"; do
-        local port="${valid_ports[$i]}"
-        local quota=$(echo "${QUOTAS[$i]}" | tr -d ' ')
-        local expiry_date=$(echo "${EXPIRY_DATES[$i]}" | tr -d ' ')
-        [ "$expiry_date" = "0" ] && expiry_date=""
-        local remark=""
-        if [ ${#REMARKS[@]} -gt $i ]; then
-            remark=$(echo "${REMARKS[$i]}" | tr -d ' ')
-        fi
-
-        local monthly_limit="unlimited"
-
-        if [ "$quota" != "0" ] && [ -n "$quota" ]; then
-            monthly_limit="$quota"
-        fi
-
-        local created_at
-        created_at=$(get_beijing_time -Iseconds)
-        local config_written=false
-        if [ "$monthly_limit" != "unlimited" ]; then
-            if update_config_file '.ports[$port] = {
-                   "name": $name,
-                   "enabled": true,
-                   "billing_mode": $billing,
-                   "bandwidth_limit": {
-                       "enabled": false,
-                       "rate": "unlimited"
-                   },
-                   "quota": {
-                       "enabled": true,
-                       "monthly_limit": $monthly,
-                       "reset_day": 1
-                   },
-                   "expiry_date": $expiry,
-                   "remark": $remark,
-                   "created_at": $created
-               } | if $expiry == "" then del(.ports[$port].expiry_date) else . end' \
-               --arg port "$port" \
-               --arg name "端口$port" \
-               --arg billing "$billing_mode" \
-               --arg monthly "$monthly_limit" \
-               --arg expiry "$expiry_date" \
-               --arg remark "$remark" \
-               --arg created "$created_at"; then
-                config_written=true
-            fi
-        else
-            if update_config_file '.ports[$port] = {
-                   "name": $name,
-                   "enabled": true,
-                   "billing_mode": $billing,
-                   "bandwidth_limit": {
-                       "enabled": false,
-                       "rate": "unlimited"
-                   },
-                   "quota": {
-                       "enabled": true,
-                       "monthly_limit": $monthly
-                   },
-                   "expiry_date": $expiry,
-                   "remark": $remark,
-                   "created_at": $created
-               } | if $expiry == "" then del(.ports[$port].expiry_date) else . end' \
-               --arg port "$port" \
-               --arg name "端口$port" \
-               --arg billing "$billing_mode" \
-               --arg monthly "$monthly_limit" \
-               --arg expiry "$expiry_date" \
-               --arg remark "$remark" \
-               --arg created "$created_at"; then
-                config_written=true
-            fi
-        fi
-
-        if [ "$config_written" != "true" ]; then
-            echo -e "${RED}端口 $port 配置写入失败，已跳过添加规则${NC}"
-            continue
-        fi
-
-        local port_add_ok=true
-        if ! add_nftables_rules "$port"; then
-            port_add_ok=false
-        fi
-        if [ "$monthly_limit" != "unlimited" ]; then
-            if [ "$port_add_ok" = "true" ] && ! apply_nftables_quota "$port" "$quota"; then
-                port_add_ok=false
-            fi
-            local port_reset_policy_config="$reset_policy_config"
-            if [ "$separate_policy" = "true" ]; then
-                port_reset_policy_config="${RESET_POLICY_CONFIGS[$i]:-}"
-            fi
-            if [ "$port_add_ok" = "true" ] && [ -n "$port_reset_policy_config" ] &&
-               ! apply_reset_policy_to_port "$port" "$port_reset_policy_config"; then
-                port_add_ok=false
-            fi
-        fi
-        if [ "$port_add_ok" = "true" ] && ! sync_port_expiry_state "$port"; then
-            port_add_ok=false
-        fi
-
-        if [ "$port_add_ok" != "true" ]; then
-            local rollback_ok=true
-            if ! begin_expiry_update; then
-                rollback_ok=false
-            elif ! remove_port_expiry_rules "$port" >/dev/null 2>&1; then
-                rollback_ok=false
-                finish_expiry_update
-            elif ! remove_nftables_quota "$port" >/dev/null 2>&1 ||
-                 ! remove_nftables_rules "$port" >/dev/null 2>&1; then
-                rollback_ok=false
-                # 配置仍在，恢复到期锁，下次自检可以补齐其他规则。
-                sync_port_expiry_state "$port" >/dev/null 2>&1 || true
-                finish_expiry_update
-            elif ! update_config_file 'del(.ports[$port])' --arg port "$port" >/dev/null 2>&1; then
-                rollback_ok=false
-                sync_port_expiry_state "$port" >/dev/null 2>&1 || true
-                finish_expiry_update
-            else
-                finish_expiry_update
-                remove_port_traffic_state "$port" >/dev/null 2>&1 || true
-            fi
-            if [ "$rollback_ok" = "true" ]; then
-                echo -e "${RED}端口 $port 监控规则应用失败，已回滚该端口配置与规则${NC}"
-            else
-                echo -e "${RED}端口 $port 监控规则应用失败且无法安全回滚，已保留配置；请立即运行 dog --self-check${NC}"
-            fi
-            continue
-        fi
-
-        update_traffic_snapshot_baseline "$port" >/dev/null 2>&1 || true
-
-        echo -e "${GREEN}端口 $port 监控添加成功${NC}"
-        added_count=$((added_count + 1))
-        added_ports+=("$port")
-    done
-
-    if [ "$added_count" -gt 0 ] && ! refresh_port_auto_reset_cron_from_config; then
-        echo -e "${RED}无法安装自动重置/服务到期定时任务，正在回滚本次新增端口。${NC}"
-        local added_port
-        local rollback_failed=false
-        for added_port in "${added_ports[@]}"; do
-            if ! begin_expiry_update; then
-                rollback_failed=true
-                continue
-            fi
-            if ! remove_port_expiry_rules "$added_port" >/dev/null 2>&1; then
-                rollback_failed=true
-                finish_expiry_update
-                continue
-            fi
-            if ! remove_nftables_quota "$added_port" >/dev/null 2>&1 ||
-               ! remove_nftables_rules "$added_port" >/dev/null 2>&1; then
-                rollback_failed=true
-                sync_port_expiry_state "$added_port" >/dev/null 2>&1 || true
-                finish_expiry_update
-                continue
-            fi
-            if ! update_config_file 'del(.ports[$port])' --arg port "$added_port" >/dev/null 2>&1; then
-                rollback_failed=true
-                sync_port_expiry_state "$added_port" >/dev/null 2>&1 || true
-                finish_expiry_update
-                continue
-            fi
-            finish_expiry_update
-            remove_port_traffic_state "$added_port" >/dev/null 2>&1 || true
-        done
-        refresh_port_auto_reset_cron_from_config >/dev/null 2>&1 || true
-        added_count=0
-        added_ports=()
-        if [ "$rollback_failed" = "true" ]; then
-            echo -e "${RED}回滚未完整成功，请立即运行 dog --self-check。${NC}"
-        else
-            echo -e "${YELLOW}本次新增端口已全部回滚，原配置保持不变。${NC}"
-        fi
-    fi
-    refresh_notification_cron_from_config || \
-        echo -e "${YELLOW}通知定时任务刷新失败，请运行 dog --self-check。${NC}"
-    setup_traffic_snapshot_cron || \
-        echo -e "${YELLOW}流量快照定时任务刷新失败，请运行 dog --self-check。${NC}"
-
-    echo
-    echo -e "${GREEN}成功添加 $added_count 个端口监控${NC}"
-
-    sleep 2
-    manage_port_monitoring
-}
-
-clear_port_conntrack_state() {
-    local port_spec="$1"
-    # 端口组：逐成员清理（成员本身可能还是端口段，递归下去即可）。
-    # 把 "80,443" 整个交给 conntrack 会被拒绝，等于没清，旧连接会继续占用限速额度。
-    if is_port_group "$port_spec"; then
-        local sel
-        while IFS= read -r sel; do
-            [ -n "$sel" ] && clear_port_conntrack_state "$sel"
-        done < <(port_selectors "$port_spec")
-        return 0
-    fi
-    local destination_port="$port_spec"
-    if is_port_range "$port_spec"; then
-        destination_port="${port_spec%%-*}:${port_spec##*-}"
-    fi
-    conntrack -D -p tcp --dport "$destination_port" 2>/dev/null || true
-    conntrack -D -p udp --dport "$destination_port" 2>/dev/null || true
-}
-
-remove_port_monitoring() {
-    echo -e "${BLUE}=== 删除端口监控 ===${NC}"
-    echo
-
-    local active_ports=($(get_active_ports))
-
-    if ! show_port_list; then
-        sleep 2
-        manage_port_monitoring
-        return
-    fi
-    echo
-
-    read -p "请选择要删除的端口（多端口使用逗号,分隔）: " choice_input
-
-    local valid_choices=()
-    local ports_to_delete=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-
-    for choice in "${valid_choices[@]}"; do
-        local port=${active_ports[$((choice-1))]}
-        ports_to_delete+=("$port")
-    done
-
-    if [ ${#ports_to_delete[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可删除${NC}"
-        sleep 2
-        remove_port_monitoring
-        return
-    fi
-
-    echo
-    echo "将删除以下端口的监控:"
-    for port in "${ports_to_delete[@]}"; do
-        echo "  端口 $port"
-    done
-    echo
-
-    read -p "确认删除这些端口的监控? [y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        local deleted_count=0
-        local deleted_ports=()
-        for port in "${ports_to_delete[@]}"; do
-            local saved_class_id
-            local saved_mark_id
-            saved_class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE")
-            saved_mark_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.mark_id // empty' "$CONFIG_FILE")
-            if ! save_traffic_data; then
-                echo -e "${RED}端口 $port 流量备份失败，已取消删除以避免数据丢失${NC}"
-                continue
-            fi
-            if ! begin_expiry_update; then
-                echo -e "${RED}端口 $port 到期规则正在被其他任务修改，已取消删除${NC}"
-                continue
-            fi
-            if ! remove_port_expiry_rules "$port"; then
-                finish_expiry_update
-                echo -e "${RED}端口 $port 到期封锁规则清理失败，已保留配置以避免遗留永久锁${NC}"
-                continue
-            fi
-            if ! update_config_file 'del(.ports[$port])' --arg port "$port"; then
-                local expiry_restore_ok=true
-                sync_port_expiry_state "$port" >/dev/null 2>&1 || expiry_restore_ok=false
-                finish_expiry_update
-                if [ "$expiry_restore_ok" = "true" ]; then
-                    echo -e "${RED}端口 $port 配置写入失败，原到期封锁规则已恢复${NC}"
-                else
-                    echo -e "${RED}端口 $port 配置删除失败且到期封锁恢复失败，请立即运行 dog --self-check${NC}"
-                fi
-                continue
-            fi
-            finish_expiry_update
-
-            remove_nftables_rules "$port"
-            remove_nftables_quota "$port"
-            if ! remove_tc_limit "$port" "$saved_class_id" "$saved_mark_id"; then
-                echo -e "${YELLOW}端口 $port 配置已删除，但 TC 清理不完整，请运行 dog --self-check${NC}"
-            fi
-            remove_port_traffic_state "$port" >/dev/null 2>&1 || true
-
-            # 清理历史记录
-            local history_file="$CONFIG_DIR/reset_history.log"
-            if [ -f "$history_file" ]; then
-                grep -v "|$port|" "$history_file" > "${history_file}.tmp" 2>/dev/null || true
-                mv "${history_file}.tmp" "$history_file" 2>/dev/null || true
-            fi
-
-            local notification_log="$CONFIG_DIR/logs/notification.log"
-            if [ -f "$notification_log" ]; then
-                grep -v "端口 $port " "$notification_log" > "${notification_log}.tmp" 2>/dev/null || true
-                mv "${notification_log}.tmp" "$notification_log" 2>/dev/null || true
-            fi
-
-            remove_port_auto_reset_cron "$port"
-
-            echo -e "${GREEN}端口 $port 监控及相关数据删除成功${NC}"
-            deleted_count=$((deleted_count + 1))
-            deleted_ports+=("$port")
-        done
-
-        if [ "$deleted_count" -gt 0 ] && ! reconcile_orphaned_runtime_objects; then
-            echo -e "${RED}端口配置已删除，但 nftables 遗留对象清理失败，请运行 dog --self-check${NC}"
-        fi
-
-        echo
-        echo -e "${GREEN}成功删除 $deleted_count 个端口监控${NC}"
-
-        if [ "$deleted_count" -gt 0 ]; then
-            # 清理连接跟踪：确保已删除端口的现有连接不再受限制。
-            echo "正在清理网络状态..."
-            for port in "${deleted_ports[@]}"; do
-                if is_port_range "$port"; then
-                    echo "清理端口段 $port 连接状态..."
-                else
-                    echo "清理端口 $port 连接状态..."
-                fi
-                clear_port_conntrack_state "$port"
-            done
-
-            echo -e "${GREEN}网络状态已清理，现有连接的限制应该已解除${NC}"
-            echo -e "${YELLOW}提示：新建连接将不受任何限制${NC}"
-        fi
-
-        local remaining_ports=($(get_active_ports))
-        if [ ${#remaining_ports[@]} -eq 0 ]; then
-            echo -e "${YELLOW}所有端口已删除，自动重置功能已停用${NC}"
-        fi
-        refresh_notification_cron_from_config
-        setup_traffic_snapshot_cron
-    else
-        echo "取消删除"
-    fi
-
-    sleep 2
-    manage_port_monitoring
-}
-
-add_nftables_rules() {
-    local port="$1"
-    local current_input=0
-    local current_output=0
-    if port_counter_objects_exist "$port"; then
-        read_nftables_counter_data "$port" || return 1
-        current_input="$NFT_COUNTER_INPUT"
-        current_output="$NFT_COUNTER_OUTPUT"
-    fi
-    local result=0
-    rebuild_port_counter_objects \
-        "$port" "$current_input" "$current_output" rebuild || result=$?
-    dog_log_event monitor_apply "$result" "port=$port"
-    return "$result"
-}
-
-remove_nftables_rules() {
-    local port="$1"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE") || return 1
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE") || return 1
-
-    # 统一走 get_port_counter_prefix：单端口 port_80_、端口段 port_80_443_、
-    # 端口组 port_g80_443_。清理路径曾各自内联拼接，端口组会拼出 port_80,443_
-    # 这种内核里根本不存在的名字，导致删端口组时计数器和规则全部残留。
-    local search_pattern
-    search_pattern="$(get_port_counter_prefix "$port")_"
-
-    # 使用handle删除法：逐个删除匹配的规则
-    local deleted_count=0
-    local table_state
-    while true; do
-        if ! table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null); then
-            log_notification "端口 $port 无法读取nftables表，已停止删除规则"
-            return 1
-        fi
-        local handle
-        handle=$(printf '%s\n' "$table_state" | \
-            grep -E "(tcp|udp).*(dport|sport).*$search_pattern" | \
-            head -n1 | \
-            sed -n 's/.*# handle \([0-9]\+\)$/\1/p' || true)
-
-        if [ -z "$handle" ]; then
-            break
-        fi
-
-        local delete_succeeded=false
-        for chain in input output forward; do
-            if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
-                deleted_count=$((deleted_count + 1))
-                delete_succeeded=true
-                break
-            fi
-        done
-        if [ "$delete_succeeded" != "true" ]; then
-            log_notification "端口 $port 无法删除nftables规则handle=$handle，已停止清理"
-            return 1
-        fi
-
-        if [ $deleted_count -ge 150 ]; then
-            log_notification "端口 $port nftables规则超过安全清理上限，已停止清理"
-            return 1
-        fi
-    done
-
-    # 删除计数器；对象不存在是幂等成功，删除失败或删除后仍存在则报错。
-    local counter_names=()
-    local counter_prefix
-    counter_prefix=$(get_port_counter_prefix "$port")
-    counter_names=("${counter_prefix}_in" "${counter_prefix}_out")
-    local counter_name
-    for counter_name in "${counter_names[@]}"; do
-        if printf '%s\n' "$table_state" |
-           grep -Eq "^[[:space:]]*counter[[:space:]]+$counter_name([[:space:]]|\\{)"; then
-            nft delete counter "$family" "$table_name" "$counter_name" 2>/dev/null || {
-                log_notification "端口 $port 无法删除nftables计数器: $counter_name"
-                return 1
-            }
-            table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null) || return 1
-            if printf '%s\n' "$table_state" |
-               grep -Eq "^[[:space:]]*counter[[:space:]]+$counter_name([[:space:]]|\\{)"; then
-                log_notification "端口 $port nftables计数器删除后仍然存在: $counter_name"
-                return 1
-            fi
-        fi
-    done
-}
-
-restore_previous_tc_limit() {
-    local port="$1"
-    local old_enabled="$2"
-    local old_rate="$3"
-    if [ "$old_enabled" = "true" ] && [ "$old_rate" != "unlimited" ]; then
-        local old_tc_limit
-        old_tc_limit=$(convert_bandwidth_to_tc "$old_rate")
-        [ -n "$old_tc_limit" ] && replace_tc_limit "$port" "$old_tc_limit" >/dev/null 2>&1
-    else
-        remove_tc_limit "$port" >/dev/null 2>&1
-    fi
-}
-
-set_port_bandwidth_limit() {
-    echo -e "${BLUE}设置端口带宽限制${NC}"
-    echo
-
-    local active_ports=($(get_active_ports))
-
-    if ! show_port_list; then
-        sleep 2
-        manage_traffic_limits
-        return
-    fi
-    echo
-
-    read -p "请选择要限制的端口（多端口使用逗号,分隔） [1-${#active_ports[@]}]: " choice_input
-
-    local valid_choices=()
-    local ports_to_limit=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-
-    for choice in "${valid_choices[@]}"; do
-        local port=${active_ports[$((choice-1))]}
-        ports_to_limit+=("$port")
-    done
-
-    if [ ${#ports_to_limit[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可设置限制${NC}"
-        sleep 2
-        set_port_bandwidth_limit
-        return
-    fi
-
-    echo
-    local port_list
-    port_list=$(IFS=','; echo "${ports_to_limit[*]}")
-    echo "为端口 $port_list 设置带宽限制（速率控制）:"
-    echo "请输入限制值（0为无限制）（要带单位Kbps/Mbps/Gbps）:"
-    echo "(多端口排序分别限制使用逗号,分隔)(只输入一个值，应用到所有端口):"
-    read -p "带宽限制: " limit_input
-
-    local LIMITS=()
-    parse_comma_separated_input "$limit_input" LIMITS
-
-    expand_single_value_to_array LIMITS ${#ports_to_limit[@]}
-    if [ ${#LIMITS[@]} -ne ${#ports_to_limit[@]} ]; then
-        echo -e "${RED}限制值数量与端口数量不匹配${NC}"
-        sleep 2
-        set_port_bandwidth_limit
-        return
-    fi
-
-    local success_count=0
-    for i in "${!ports_to_limit[@]}"; do
-        local port="${ports_to_limit[$i]}"
-        local limit=$(echo "${LIMITS[$i]}" | tr -d ' ')
-        local old_limit_enabled
-        old_limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        local old_rate_limit
-        old_rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-
-        if [ "$limit" = "0" ] || [ -z "$limit" ]; then
-            if ! remove_tc_limit "$port"; then
-                echo -e "${RED}端口 $port 带宽限制移除失败，配置未修改${NC}"
-                continue
-            fi
-            if ! update_config_file '
-                .ports[$port].bandwidth_limit.enabled = false |
-                .ports[$port].bandwidth_limit.rate = "unlimited"
-            ' --arg port "$port"; then
-                if ! restore_previous_tc_limit "$port" "$old_limit_enabled" "$old_rate_limit"; then
-                    echo -e "${RED}端口 $port 配置写入失败且原限速恢复失败，请运行 dog --self-check${NC}"
-                else
-                    echo -e "${RED}端口 $port 配置写入失败，原限速已恢复${NC}"
-                fi
-                continue
-            fi
-            echo -e "${GREEN}端口 $port 带宽限制已移除${NC}"
-            success_count=$((success_count + 1))
-            continue
-        fi
-
-        if ! validate_bandwidth "$limit"; then
-            echo -e "${RED}端口 $port 格式错误，请使用如：500Kbps, 100Mbps, 1Gbps${NC}"
-            continue
-        fi
-
-        # 转换为TC格式
-        local tc_limit=$(convert_bandwidth_to_tc "$limit")
-
-        if replace_tc_limit "$port" "$tc_limit"; then
-            if update_config_file '
-                .ports[$port].bandwidth_limit.enabled = true |
-                .ports[$port].bandwidth_limit.rate = $rate
-            ' --arg port "$port" --arg rate "$limit"; then
-                echo -e "${GREEN}端口 $port 带宽限制设置成功: $limit${NC}"
-                success_count=$((success_count + 1))
-            elif ! restore_previous_tc_limit "$port" "$old_limit_enabled" "$old_rate_limit"; then
-                echo -e "${RED}端口 $port 配置写入失败且原限速恢复失败，请运行 dog --self-check${NC}"
-            else
-                echo -e "${RED}端口 $port 配置写入失败，原限速已恢复${NC}"
-            fi
-        else
-            if restore_previous_tc_limit "$port" "$old_limit_enabled" "$old_rate_limit"; then
-                echo -e "${RED}端口 $port 带宽限制应用失败，原限速已恢复${NC}"
-            else
-                echo -e "${RED}端口 $port 带宽限制应用失败且原限速恢复失败，请运行 dog --self-check${NC}"
-            fi
-        fi
-    done
-
-    echo
-    echo -e "${GREEN}成功设置 $success_count 个端口的带宽限制${NC}"
-    sleep 3
-    manage_traffic_limits
-}
-
-restore_previous_quota_limit() {
-    local port="$1"
-    local old_enabled="$2"
-    local old_limit="$3"
-    if [ "$old_enabled" = "true" ] && [ "$old_limit" != "unlimited" ]; then
-        apply_nftables_quota "$port" "$old_limit" >/dev/null 2>&1
-    else
-        remove_nftables_quota "$port" >/dev/null 2>&1 || true
-        nftables_quota_is_absent "$port"
-    fi
-}
-
-set_port_quota_limit() {
-    echo -e "${BLUE}=== 设置端口流量配额 ===${NC}"
-    echo
-
-    local active_ports=($(get_active_ports))
-    if ! show_port_list; then
-        sleep 2
-        manage_traffic_limits
-        return
-    fi
-    echo
-
-    read -p "请选择要设置配额的端口（多端口使用逗号,分隔） [1-${#active_ports[@]}]: " choice_input
-
-    local valid_choices=()
-    local ports_to_quota=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-
-    for choice in "${valid_choices[@]}"; do
-        local port=${active_ports[$((choice-1))]}
-        ports_to_quota+=("$port")
-    done
-
-    if [ ${#ports_to_quota[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可设置配额${NC}"
-        sleep 2
-        set_port_quota_limit
-        return
-    fi
-
-    echo
-    local port_list
-    port_list=$(IFS=','; echo "${ports_to_quota[*]}")
-    while true; do
-        echo "为端口 $port_list 设置流量配额（总量控制）:"
-        echo "请输入配额值（0为无限制）（要带单位MB/GB/T）:"
-        echo "(多端口分别配额使用逗号,分隔)(只输入一个值，应用到所有端口):"
-        read -p "流量配额(回车默认0): " quota_input
-
-        if [ -z "$quota_input" ]; then
-            quota_input="0"
-        fi
-
-        local QUOTAS=()
-        parse_comma_separated_input "$quota_input" QUOTAS
-
-        local all_valid=true
-        for quota in "${QUOTAS[@]}"; do
-            if [ "$quota" != "0" ] && ! validate_quota "$quota"; then
-                echo -e "${RED}配额格式错误: $quota，请使用如：100MB, 1GB, 2T${NC}"
-                all_valid=false
-                break
-            fi
-        done
-
-        if [ "$all_valid" = false ]; then
-            echo "请重新输入配额值"
-            continue
-        fi
-
-        expand_single_value_to_array QUOTAS ${#ports_to_quota[@]}
-        if [ ${#QUOTAS[@]} -ne ${#ports_to_quota[@]} ]; then
-            echo -e "${RED}配额值数量与端口数量不匹配${NC}"
-            continue
-        fi
-
-        break
-    done
-
-    local reset_policy_config=""
-    local has_limited_quota=false
-    for quota in "${QUOTAS[@]}"; do
-        quota=$(echo "$quota" | tr -d ' ')
-        if [ "$quota" != "0" ] && [ -n "$quota" ]; then
-            has_limited_quota=true
-            break
-        fi
-    done
-
-    if [ "$has_limited_quota" = "true" ]; then
-        echo
-        read -p "是否同时修改自动重置策略? [y/N]: " change_reset_policy
-        if [[ "$change_reset_policy" =~ ^[Yy]$ ]]; then
-            prompt_reset_policy 1
-            reset_policy_config="$RESET_POLICY_CONFIG"
-        fi
-    fi
-
-    local success_count=0
-    for i in "${!ports_to_quota[@]}"; do
-        local port="${ports_to_quota[$i]}"
-        local quota=$(echo "${QUOTAS[$i]}" | tr -d ' ')
-        if ! begin_reset_update; then
-            echo -e "${RED}端口 $port 的重置任务正在运行，请稍后重试${NC}"
-            continue
-        fi
-        local current_monthly_limit
-        current_monthly_limit=$(jq -r --arg port "$port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE")
-        local current_quota_enabled
-        current_quota_enabled=$(jq -r --arg port "$port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE")
-
-        if [ "$quota" = "0" ] || [ -z "$quota" ]; then
-            remove_nftables_quota "$port"
-            if ! nftables_quota_is_absent "$port"; then
-                echo -e "${RED}端口 $port 流量配额清理失败，配置未修改${NC}"
-                finish_reset_update
-                continue
-            fi
-            # 设为无限额时删除自动重置策略并清除定时任务
-            if ! update_config_file '
-                .ports[$port].quota.enabled = true |
-                .ports[$port].quota.monthly_limit = "unlimited" |
-                del(.ports[$port].quota.reset_day) |
-                del(.ports[$port].quota.reset_policy)
-            ' --arg port "$port"; then
-                if ! restore_previous_quota_limit "$port" "$current_quota_enabled" "$current_monthly_limit"; then
-                    echo -e "${RED}端口 $port 配置写入失败且原配额恢复失败，请运行 dog --self-check${NC}"
-                else
-                    echo -e "${RED}端口 $port 配置写入失败，原配额已恢复${NC}"
-                fi
-                finish_reset_update
-                continue
-            fi
-            if remove_port_auto_reset_cron "$port"; then
-                echo -e "${GREEN}端口 $port 流量配额设置为无限制${NC}"
-                success_count=$((success_count + 1))
-            else
-                echo -e "${RED}端口 $port 已设为无限制，但定时任务刷新失败，请运行 dog --refresh-all-cron${NC}"
-            fi
-            finish_reset_update
-            continue
-        fi
-
-        if ! apply_nftables_quota "$port" "$quota"; then
-            if restore_previous_quota_limit "$port" "$current_quota_enabled" "$current_monthly_limit"; then
-                echo -e "${RED}端口 $port 流量配额应用失败，原配额已恢复${NC}"
-            else
-                echo -e "${RED}端口 $port 流量配额应用失败且原配额恢复失败，请运行 dog --self-check${NC}"
-            fi
-            finish_reset_update
-            continue
-        fi
-
-        local was_unlimited=false
-        [ "$current_monthly_limit" = "unlimited" ] && was_unlimited=true
-        if ! update_config_file '
-            .ports[$port].quota.enabled = true |
-            .ports[$port].quota.monthly_limit = $quota |
-            if $was_unlimited then .ports[$port].quota.reset_day = 1 else . end
-        ' --arg port "$port" --arg quota "$quota" --argjson was_unlimited "$was_unlimited"; then
-            if ! restore_previous_quota_limit "$port" "$current_quota_enabled" "$current_monthly_limit"; then
-                echo -e "${RED}端口 $port 配置写入失败且原配额恢复失败，请运行 dog --self-check${NC}"
-            else
-                echo -e "${RED}端口 $port 配置写入失败，原配额已恢复${NC}"
-            fi
-            finish_reset_update
-            continue
-        fi
-
-        local reset_policy_status=0
-        if [ -n "$reset_policy_config" ]; then
-            apply_reset_policy_to_port "$port" "$reset_policy_config" || reset_policy_status=$?
-        fi
-        local cron_status=0
-        setup_port_auto_reset_cron "$port" || cron_status=$?
-        finish_reset_update
-        if [ "$reset_policy_status" -eq 0 ] && [ "$cron_status" -eq 0 ]; then
-            echo -e "${GREEN}端口 $port 流量配额设置成功: $quota${NC}"
-        elif [ "$reset_policy_status" -ge 21 ] && [ "$reset_policy_status" -le 22 ]; then
-            echo -e "${YELLOW}端口 $port 配额已设置为 $quota，但立即清零或策略回滚未完整成功，请运行 dog --self-check${NC}"
-        elif [ "$reset_policy_status" -ne 0 ]; then
-            echo -e "${YELLOW}端口 $port 配额已设置为 $quota，但自动重置策略写入失败${NC}"
-        else
-            echo -e "${YELLOW}端口 $port 配额已设置为 $quota，但定时任务刷新失败，请运行 dog --refresh-all-cron${NC}"
-        fi
-        success_count=$((success_count + 1))
-    done
-
-    echo
-    echo -e "${GREEN}成功设置 $success_count 个端口的流量配额${NC}"
-    sleep 3
-    manage_traffic_limits
-}
-
-manage_traffic_limits() {
-    echo -e "${BLUE}=== 端口限制设置管理 ===${NC}"
-    echo "1. 设置端口带宽限制（速率控制）"
-    echo "2. 设置端口流量配额（总量控制）"
-    echo "3. 修改端口统计方式（双向/单向）"
-    echo "0. 返回主菜单"
-    echo
-    read -p "请选择操作 [0-3]: " choice
-
-    case $choice in
-        1) set_port_bandwidth_limit ;;
-        2) set_port_quota_limit ;;
-        3) change_port_billing_mode ;;
-        0) show_main_menu ;;
-        *) echo -e "${RED}无效选择${NC}"; sleep 1; manage_traffic_limits ;;
-    esac
-}
-
-# 修改端口计费模式（流量数据不丢失）
-change_port_billing_mode() {
-    echo -e "${BLUE}=== 修改端口统计方式 ===${NC}"
-    
-    local active_ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | sort -n)
-    if [ -z "$active_ports" ]; then
-        echo -e "${RED}没有正在监控的端口${NC}"
-        sleep 2
-        manage_traffic_limits
-        return
-    fi
-    
-    echo -e "${YELLOW}当前监控的端口列表：${NC}"
-    local port_list=()
-    local idx=1
-    for port in $active_ports; do
-        local current_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-        local mode_display=$([ "$current_mode" = "double" ] && echo "双向" || echo "单向")
-        echo -e "  $idx. 端口 $port - 当前模式: ${BLUE}${mode_display}${NC}"
-        port_list+=("$port")
-        ((idx++))
-    done
-    echo "  0. 返回上级菜单"
-    echo
-    
-    read -p "请选择要修改的端口 [0-$((idx-1))]: " port_choice
-    
-    if [ "$port_choice" = "0" ]; then
-        manage_traffic_limits
-        return
-    fi
-    
-    if ! [[ "$port_choice" =~ ^[0-9]+$ ]] || [ "$port_choice" -lt 1 ] || [ "$port_choice" -gt ${#port_list[@]} ]; then
-        echo -e "${RED}无效选择${NC}"
-        sleep 1
-        change_port_billing_mode
-        return
-    fi
-    
-    local target_port="${port_list[$((port_choice-1))]}"
-    local current_mode=$(jq -r ".ports.\"$target_port\".billing_mode // \"double\"" "$CONFIG_FILE")
-    local current_display=$([ "$current_mode" = "double" ] && echo "双向" || echo "单向")
-    local current_multiplier
-    current_multiplier=$(get_billing_rule_multiplier "$current_mode")
-    
-    echo
-    echo -e "端口 $target_port 当前统计方式: ${BLUE}$current_display${NC}"
-    echo
-    echo "1. 双向流量统计"
-    echo "2. 单向流量统计"
-    echo "0. 取消"
-    echo
-    read -p "请选择统计模式 [0-2]: " mode_choice
-    
-    local new_mode=""
-    case $mode_choice in
-        1) new_mode="double" ;;
-        2) new_mode="single" ;;
-        0|"") change_port_billing_mode; return ;;
-        *) echo -e "${RED}无效选择${NC}"; sleep 1; change_port_billing_mode; return ;;
-    esac
-    
-    local new_display=$([ "$new_mode" = "double" ] && echo "双向" || echo "单向")
-    local new_multiplier
-    new_multiplier=$(get_billing_rule_multiplier "$new_mode")
-
-    if [ "$new_mode" = "$current_mode" ]; then
-        echo -e "${GREEN}端口 $target_port 已是 $new_display 模式，无需修改${NC}"
-        sleep 1
-        change_port_billing_mode
-        return
-    fi
-    
-    echo
-    echo -e "${YELLOW}正在应用 $new_display 模式...${NC}"
-
-    if ! repair_port_traffic_rules "$target_port" >/dev/null 2>&1 ||
-       ! repair_port_quota_rules "$target_port" >/dev/null 2>&1; then
-        echo -e "${RED}当前规则状态异常且自动修复失败，已取消模式切换${NC}"
-        sleep 2
-        change_port_billing_mode
-        return
-    fi
-    
-    # 读取当前流量
-    if ! read_nftables_counter_data "$target_port"; then
-        echo -e "${RED}读取当前流量失败，已取消模式切换并保留现有规则${NC}"
-        sleep 2
-        change_port_billing_mode
-        return
-    fi
-    local saved_input="$NFT_COUNTER_INPUT"
-    local saved_output="$NFT_COUNTER_OUTPUT"
-    echo -e "  读取流量: 入站=$(format_bytes $saved_input), 出站=$(format_bytes $saved_output)"
-    local converted_input
-    converted_input=$(scale_counter_for_rule_multiplier "$saved_input" "$current_multiplier" "$new_multiplier")
-    local converted_output
-    converted_output=$(scale_counter_for_rule_multiplier "$saved_output" "$current_multiplier" "$new_multiplier")
-    
-    local mode_change_ok=true
-    if ! update_config_file \
-        '.ports[$port].billing_mode = $mode' \
-        --arg port "$target_port" \
-        --arg mode "$new_mode"; then
-        mode_change_ok=false
-    fi
-
-    if [ "$mode_change_ok" = "true" ] &&
-       ! rebuild_port_counter_objects \
-            "$target_port" "$converted_input" "$converted_output" rebuild; then
-        mode_change_ok=false
-    fi
-
-    if [ "$mode_change_ok" != "true" ]; then
-        update_config_file '.ports[$port].billing_mode = $mode' \
-            --arg port "$target_port" --arg mode "$current_mode" >/dev/null 2>&1 || true
-        local rollback_ok=true
-        rebuild_port_counter_objects \
-            "$target_port" "$saved_input" "$saved_output" rebuild \
-            >/dev/null 2>&1 || rollback_ok=false
-        if [ "$rollback_ok" = "true" ]; then
-            echo -e "${RED}模式切换失败，已恢复原模式和流量数据${NC}"
-        else
-            echo -e "${RED}模式切换失败且回滚不完整，请立即运行 dog --self-check${NC}"
-        fi
-        sleep 2
-        change_port_billing_mode
-        return
-    fi
-    scale_current_day_traffic_stats \
-        "$target_port" \
-        "$current_multiplier" "$new_multiplier" \
-        "$current_multiplier" "$new_multiplier" >/dev/null 2>&1 || true
-    update_traffic_snapshot_baseline "$target_port" >/dev/null 2>&1 || true
-    
-    echo -e "${GREEN}✓ 已应用 $new_display 模式，流量数据已保留${NC}"
-    sleep 2
-    
-    change_port_billing_mode
-}
-
-apply_nftables_quota() {
-    local port="$1"
-    local quota_limit="$2"
-    local table_name
-    local family
-    local billing_mode
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE")
-
-    local quota_bytes
-    quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-    if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
-        log_notification "端口 $port 配额值无效，已保留现有限额规则: $quota_limit"
-        return 1
-    fi
-    if ! port_counter_objects_exist "$port"; then
-        log_notification "端口 $port counter 对象缺失，已保留原有限额规则"
-        return 1
-    fi
-
-    if ! read_nftables_counter_data "$port"; then
-        log_notification "端口 $port counter 读取失败，已保留原有限额规则"
-        return 1
-    fi
-    local current_input="$NFT_COUNTER_INPUT"
-    local current_output="$NFT_COUNTER_OUTPUT"
-    local current_total
-    current_total=$(calculate_total_traffic "$current_input" "$current_output" "$billing_mode")
-
-    local quota_name
-    quota_name=$(get_port_quota_name "$port")
-    local rules_json
-    local quota_batch
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-quota-rules.XXXXXX") || return 1
-    quota_batch=$(mktemp "$CONFIG_DIR/.nft-quota-rebuild.XXXXXX") || {
-        rm -f "$rules_json"
-        return 1
-    }
-
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null ||
-       ! jq -r \
-            --arg family "$family" \
-            --arg table "$table_name" \
-            --arg quota "$quota_name" '
-            .nftables[] |
-            select(.rule != null and .rule.handle != null) |
-            .rule as $rule |
-            [
-                $rule.expr[]? | .quota? |
-                if type == "string" then .
-                elif type == "object" then (.name // empty)
-                else empty end
-            ] as $quotas |
-            select(any($quotas[]; . == $quota)) |
-            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
-        ' "$rules_json" > "$quota_batch"; then
-        rm -f "$rules_json" "$quota_batch"
-        return 1
-    fi
-
-    local listed_rule_count
-    listed_rule_count=$(wc -l < "$quota_batch" 2>/dev/null || echo 0)
-    if [ "$listed_rule_count" -ne "$(count_quota_rules "$port")" ]; then
-        rm -f "$rules_json" "$quota_batch"
-        return 1
-    fi
-    if jq -e --arg name "$quota_name" 'any(.nftables[]; .quota?.name? == $name)' \
-        "$rules_json" >/dev/null 2>&1; then
-        printf 'delete quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$quota_batch"
-    fi
-    printf 'add quota %s %s %s { over %s bytes used %s bytes }\n' \
-        "$family" "$table_name" "$quota_name" "$quota_bytes" "$current_total" >> "$quota_batch"
-    local multiplier
-    multiplier=$(get_billing_rule_multiplier "$billing_mode")
-    write_port_quota_rule_commands \
-        "$family" "$table_name" "$port" "$quota_name" "$multiplier" >> "$quota_batch"
-
-    if ! nft -f "$quota_batch" >/dev/null 2>&1; then
-        rm -f "$rules_json" "$quota_batch"
-        log_notification "端口 $port 配额事务应用失败，已保留原有限额规则"
-        dog_log_event quota_apply 1 "port=$port"
-        return 1
-    fi
-    rm -f "$rules_json" "$quota_batch"
-
-    local expected_rule_count
-    expected_rule_count=$(get_expected_quota_rule_count "$billing_mode" "$port")
-    local actual_rule_count
-    actual_rule_count=$(count_quota_rules "$port")
-    if ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 ||
-       [ "$actual_rule_count" -ne "$expected_rule_count" ] ||
-       ! nftables_quota_limit_matches "$port" "$quota_limit"; then
-        log_notification "端口 $port 配额规则创建不完整: rules=${actual_rule_count}/${expected_rule_count}"
-        return 1
-    fi
-    dog_log_event quota_apply 0 "port=$port"
-}
-
-nftables_quota_is_absent() {
-    local port="$1"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local quota_name
-    quota_name=$(get_port_quota_name "$port")
-
-    [ "$(count_quota_rules "$port")" -eq 0 ] &&
-        ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1
-}
-
-# 删除nftables配额限制 - 使用handle删除法
-remove_nftables_quota() {
-    local port="$1"
-    local table_name
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE") || return 1
-    local family
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE") || return 1
-
-    # 统一走 get_port_quota_name：单端口 port_80_quota、端口段 port_80_443_quota、
-    # 端口组 port_g80_443_quota。端口组沿用内联拼接会拼出不存在的名字，配额删不掉。
-    local quota_name
-    quota_name=$(get_port_quota_name "$port")
-
-    # 循环删除所有包含配额名称的规则 - 每次只获取一个handle
-    local deleted_count=0
-    local table_state
-    while true; do
-        if ! table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null); then
-            log_notification "端口 $port 无法读取nftables表，已停止删除配额"
-            return 1
-        fi
-        # 每次只获取第一个匹配的配额规则handle
-        local handle
-        handle=$(printf '%s\n' "$table_state" | \
-            grep "quota name \"$quota_name\"" | \
-            head -n1 | \
-            sed -n 's/.*# handle \([0-9]\+\)$/\1/p' || true)
-
-        if [ -z "$handle" ]; then
-            break
-        fi
-
-        local delete_succeeded=false
-        for chain in input output forward; do
-            if nft delete rule "$family" "$table_name" "$chain" handle "$handle" 2>/dev/null; then
-                deleted_count=$((deleted_count + 1))
-                delete_succeeded=true
-                break
-            fi
-        done
-        if [ "$delete_succeeded" != "true" ]; then
-            log_notification "端口 $port 无法删除nftables配额规则handle=$handle，已停止清理"
-            return 1
-        fi
-
-        if [ $deleted_count -ge 150 ]; then
-            log_notification "端口 $port nftables配额规则超过安全清理上限，已停止清理"
-            return 1
-        fi
-    done
-
-    if printf '%s\n' "$table_state" |
-       grep -Eq "^[[:space:]]*quota[[:space:]]+$quota_name([[:space:]]|\\{)"; then
-        nft delete quota "$family" "$table_name" "$quota_name" 2>/dev/null || {
-            log_notification "端口 $port 无法删除nftables配额对象: $quota_name"
-            return 1
-        }
-        table_state=$(nft -a list table "$family" "$table_name" 2>/dev/null) || return 1
-        if printf '%s\n' "$table_state" |
-           grep -Eq "^[[:space:]]*quota[[:space:]]+$quota_name([[:space:]]|\\{)"; then
-            log_notification "端口 $port nftables配额对象删除后仍然存在: $quota_name"
-            return 1
-        fi
-    fi
 }
 
 get_tc_root_owner_file() {
@@ -7727,88 +3367,6 @@ tc_root_is_managed() {
     trafficcop_unified_state_rate "$interface" >/dev/null 2>&1
 }
 
-adopt_legacy_tc_root_if_safe() {
-    local interface="$1"
-    local legacy_qdisc_line
-    legacy_qdisc_line=$(tc_root_qdisc_line "$interface") || return 1
-    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$legacy_qdisc_line" || return 1
-    grep -Eq ' default (0x)?30([[:space:]]|$)' <<< "$legacy_qdisc_line" || return 1
-    tc_root_is_managed "$interface" && return 0
-
-    local configured_class_ids=()
-    local configured_class_ports=()
-    local missing_class_id_ports=()
-    local active_ports=()
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    local port
-    for port in "${active_ports[@]}"; do
-        local limit_enabled
-        local rate_limit
-        local class_id
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
-        class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE")
-        if ! tc_port_class_id_valid "$class_id" >/dev/null 2>&1; then
-            if is_port_group "$port"; then
-                # 端口组没有 1.4.x 时代的 legacy class id。拿不到可信 class id 时不能把它
-                # 计入"已配置"集合：后面要求内核里的 class 与过滤器必须全部命中该集合，
-                # 多算一个会误认领别人的 HTB，少算一个只是保守拒绝认领。
-                continue
-            fi
-            class_id=$(generate_legacy_tc_class_id "$port")
-            tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
-            missing_class_id_ports+=("$port")
-        fi
-        configured_class_ids+=("$class_id")
-        configured_class_ports+=("$port")
-    done
-    [ ${#configured_class_ids[@]} -gt 0 ] || return 1
-
-    local class_state
-    class_state=$(tc class show dev "$interface" 2>/dev/null) || return 1
-    grep -Eq '^class htb 1:1 root([[:space:]]|$)' <<< "$class_state" || return 1
-    local actual_class_ids=()
-    mapfile -t actual_class_ids < <(printf '%s\n' "$class_state" |
-        awk '$1 == "class" && $2 == "htb" {print $3}')
-    local actual_class_id
-    for actual_class_id in "${actual_class_ids[@]}"; do
-        if [ "$actual_class_id" = "1:1" ] || [ "$actual_class_id" = "1:30" ]; then
-            continue
-        fi
-        [[ " ${configured_class_ids[*]} " == *" $actual_class_id "* ]] || return 1
-    done
-
-    local filter_state
-    filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 1
-    local configured_class_id
-    for configured_class_id in "${configured_class_ids[@]}"; do
-        [[ " ${actual_class_ids[*]} " == *" $configured_class_id "* ]] || return 1
-        grep -Eq "(flowid|classid)[[:space:]]+$configured_class_id([[:space:]]|$)" <<< "$filter_state" || return 1
-    done
-    local filter_class_ids=()
-    mapfile -t filter_class_ids < <(printf '%s\n' "$filter_state" |
-        grep -Eo '(flowid|classid)[[:space:]]+1:[0-9a-fA-F]+' |
-        awk '{print $2}' | sort -u)
-    for actual_class_id in "${filter_class_ids[@]}"; do
-        [[ " ${configured_class_ids[*]} " == *" $actual_class_id "* ]] || return 1
-    done
-
-    mark_tc_root_owned "$interface" || return 1
-    local missing_port
-    for missing_port in "${missing_class_id_ports[@]}"; do
-        local index
-        for index in "${!configured_class_ports[@]}"; do
-            [ "${configured_class_ports[$index]}" = "$missing_port" ] || continue
-            if ! save_tc_class_id "$missing_port" "${configured_class_ids[$index]}"; then
-                rm -f "$(get_tc_root_owner_file)"
-                return 1
-            fi
-            break
-        done
-    done
-}
-
 tc_root_qdisc_is_replaceable() {
     local qdisc_state="$1"
     local qdisc_type
@@ -7823,9 +3381,6 @@ tc_root_qdisc_is_replaceable() {
         *) return 1 ;;
     esac
 }
-
-ENSURE_TC_ROOT_CREATED=false
-ENSURE_TC_ROOT_MIGRATED=false
 
 desired_tc_parent_rate() {
     local interface="$1"
@@ -7918,7 +3473,7 @@ ensure_owned_tc_hierarchy_locked() {
     normalize_tc_rate_to_bps "$parent_rate" >/dev/null 2>&1 || return 1
 
     if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state"; then
-        if ! tc_root_is_managed "$interface" && ! adopt_legacy_tc_root_if_safe "$interface"; then
+        if ! tc_root_is_managed "$interface"; then
             tc_root_owner_marker_matches "$interface" && rm -f "$(get_tc_root_owner_file)"
             log_notification "检测到不属于Dog/TrafficCop统一协议的HTB根队列，已拒绝接管: $interface"
             return 1
@@ -8002,7 +3557,7 @@ cleanup_ingress_shaping_if_unused_locked() {
 
     # 物理网卡的统一 HTB 已经不在了（卸载流程会先删它），说明整条层级正在拆除，
     # 此时 ifb0 上的端口类只是残留，应当一并清掉；否则仍按"有消费者就不动"处理。
-    if tc qdisc show dev "$interface" 2>/dev/null | grep -q '^qdisc htb 1:'; then
+    if grep -q '^qdisc htb 1:' <<< "$(tc qdisc show dev "$interface" 2>/dev/null)"; then
         # 1:1 与 1:30 是统一层级的基础分类；其他分类表示端口入向限速仍在使用。
         local class_output
         class_output=$(tc class show dev "$dev" 2>/dev/null) || return 1
@@ -8085,16 +3640,6 @@ cleanup_owned_tc_root_if_unused() {
     return "$result"
 }
 
-get_tc_ipv6_filter_handle() {
-    local port="$1"
-    local offset="$2"
-    printf '0x%x\n' $((port * 4 + offset))
-}
-
-# ── 入向整形（ifb0） ──────────────────────────────────────────────
-# ifb0 的合法性从属物理网卡：它不写独立归属文件，物理网卡认领成功它才算自己的。
-# 这样 eth0 的 tc-root-qdisc.owner 内容不变，TrafficCop 侧的读取契约不受影响。
-
 ensure_ifb_device_locked() {
     if ! ip link show "$TC_IFB_DEVICE" >/dev/null 2>&1; then
         modprobe ifb numifbs=0 2>/dev/null || true
@@ -8102,7 +3647,7 @@ ensure_ifb_device_locked() {
     fi
     ip link set "$TC_IFB_DEVICE" up 2>/dev/null || true
     # ifb 是 NOARP 虚拟设备，operstate 恒为 UNKNOWN，只能判 UP flag
-    ip link show "$TC_IFB_DEVICE" 2>/dev/null | grep -q "<.*UP.*>"
+    grep -q "<.*UP.*>" <<< "$(ip link show "$TC_IFB_DEVICE" 2>/dev/null)"
 }
 
 ensure_ifb_hierarchy_locked() {
@@ -8175,413 +3720,7 @@ ensure_ingress_redirect_locked() {
     done
 }
 
-apply_ingress_shaping_locked() {
-    local port="$1"
-    local total_limit="$2"
-    local interface
-    interface=$(get_default_interface 2>/dev/null) || return 1
-    local dev="$TC_IFB_DEVICE"
-    # 显式初始化为空串：bash 的动态作用域会让 ensure_ifb_hierarchy_locked /
-    # ensure_ingress_redirect_locked 看到本函数的局部变量，而这两步在 class_id
-    # 赋值之前执行。若这里留成"已声明未赋值"，set -u 下被调方任何一句
-    # ${class_id} 都会变成"未绑定的变量"直接中断（tests/regression.sh 的 tc 桩即如此）。
-    local class_id=""
-    local base_rate
-    local burst_bytes
-    local burst_size
-
-    ensure_ifb_hierarchy_locked "$interface" || return 1
-    ensure_ingress_redirect_locked "$interface" || return 1
-
-    class_id=$(generate_tc_class_id "$port") || {
-        log_notification "端口 $port 无法分配入向TC class ID"
-        return 1
-    }
-
-    # 拆除顺序必须是 filter -> leaf -> class：任何一环还引用着 class 都会 HTB class in use
-    remove_ingress_shaping_locked "$port" "$class_id" >/dev/null 2>&1 || true
-
-    base_rate=$(parse_tc_rate_to_kbps "$total_limit")
-    burst_bytes=$(calculate_tc_burst "$base_rate")
-    burst_size=$(format_tc_burst "$burst_bytes")
-
-    if ! tc class replace dev "$dev" parent 1:1 classid "$class_id" htb \
-        rate "$TC_PORT_CLASS_RATE" ceil "$total_limit" burst "$burst_size" 2>/dev/null; then
-        log_notification "端口 $port 无法创建入向TC分类: $class_id"
-        return 1
-    fi
-
-    # ingress 在 nft input/forward 之前，不能依赖出向 nft 写入的 packet mark。
-    # 固定 8 个优先级区分双栈、TCP/UDP、源/目标；handle 唯一标识 class 与组内成员。
-    local selectors=() selector index=0 offset proto family port_key pref handle minor
-    mapfile -t selectors < <(port_selectors "$port")
-    minor=$(tc_class_id_minor "$class_id") || return 1
-    for selector in "${selectors[@]}"; do
-        index=$((index + 1))
-        handle=$(printf '0x%x' "$(( (minor << 16) | index ))")
-        for offset in 0 1 2 3 4 5 6 7; do
-            pref=$((100 + offset))
-            family=ip; [ "$offset" -lt 4 ] || family=ipv6
-            proto=tcp; [ "$((offset % 4))" -lt 2 ] || proto=udp
-            port_key=src_port; [ "$((offset % 2))" -eq 0 ] || port_key=dst_port
-            if ! tc filter add dev "$dev" protocol "$family" parent 1:0 pref "$pref" \
-                handle "$handle" flower ip_proto "$proto" "$port_key" "$selector" classid "$class_id" 2>/dev/null; then
-                remove_ingress_shaping_locked "$port" "$class_id" >/dev/null 2>&1 || true
-                log_notification "监控项 $port 无法创建完整入向TC过滤器"
-                return 1
-            fi
-        done
-    done
-    return 0
-}
-
-remove_ingress_shaping_locked() {
-    local port="$1"
-    local class_id="${2:-}"
-    local dev="$TC_IFB_DEVICE"
-
-    ip link show "$dev" >/dev/null 2>&1 || return 0
-
-    if [ -z "$class_id" ]; then
-        class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    fi
-    tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || class_id=""
-    if [ -n "$class_id" ]; then
-        local selectors=() index=0 selector offset family handle minor
-        minor=$(tc_class_id_minor "$class_id") || return 1
-        mapfile -t selectors < <(port_selectors "$port")
-        for selector in "${selectors[@]}"; do
-            index=$((index + 1))
-            handle=$(printf '0x%x' "$(( (minor << 16) | index ))")
-            for offset in 0 1 2 3 4 5 6 7; do
-                family=ip; [ "$offset" -lt 4 ] || family=ipv6
-                tc filter del dev "$dev" protocol "$family" parent 1:0 pref "$((100 + offset))" \
-                    handle "$handle" flower 2>/dev/null || true
-            done
-        done
-    fi
-
-    if uses_mark_based_tc_limit "$port"; then
-        local mark_id
-        local mark_hex
-        local mark_handle
-        mark_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.mark_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        [ -n "$mark_id" ] || mark_id=$(generate_port_range_mark "$port")
-        mark_hex=$(printf '0x%x' "$mark_id")
-        mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
-        tc filter del dev "$dev" protocol all parent 1:0 prio 1 handle "$mark_handle" fw 2>/dev/null || true
-        tc filter del dev "$dev" protocol all parent 1:0 prio 1 handle "$mark_hex" fw 2>/dev/null || true
-        tc filter del dev "$dev" protocol ip parent 1:0 prio 1 handle "$mark_hex" fw 2>/dev/null || true
-    else
-        local filter_prio=$((port % 1000 + 1))
-        tc filter del dev "$dev" protocol ip parent 1:0 prio "$filter_prio" u32 \
-            match ip protocol 6 0xff match ip sport "$port" 0xffff 2>/dev/null || true
-        tc filter del dev "$dev" protocol ip parent 1:0 prio "$filter_prio" u32 \
-            match ip protocol 6 0xff match ip dport "$port" 0xffff 2>/dev/null || true
-        tc filter del dev "$dev" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
-            match ip protocol 17 0xff match ip sport "$port" 0xffff 2>/dev/null || true
-        tc filter del dev "$dev" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
-            match ip protocol 17 0xff match ip dport "$port" 0xffff 2>/dev/null || true
-        local ipv6_offset
-        for ipv6_offset in 0 1 2 3; do
-            tc filter del dev "$dev" protocol ipv6 parent 1:0 prio 2 \
-                handle "$(get_tc_ipv6_filter_handle "$port" "$ipv6_offset")" flower 2>/dev/null || true
-        done
-    fi
-
-    if [ -n "$class_id" ]; then
-        tc class del dev "$dev" classid "$class_id" 2>/dev/null || true
-    fi
-    return 0
-}
-
-apply_tc_limit_locked() {
-    local port=$1
-    local total_limit=$2
-    local interface=$(get_default_interface)
-
-    if [ -z "$interface" ]; then
-        log_notification "端口 $port 无法确定默认网卡，已跳过带宽限制"
-        return 1
-    fi
-
-    ensure_owned_tc_hierarchy_locked "$interface" || return 1
-    local created_root="$ENSURE_TC_ROOT_CREATED"
-    local class_state
-
-    local class_id
-    if ! class_id=$(generate_tc_class_id "$port"); then
-        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused_locked "$interface"
-        log_notification "端口 $port 无法分配TC class ID，已跳过带宽限制"
-        return 1
-    fi
-    local legacy_class_id
-    legacy_class_id=$(generate_legacy_tc_class_id "$port")
-    # 计算burst参数以优化性能
-    local base_rate=$(parse_tc_rate_to_kbps "$total_limit")
-    local burst_bytes=$(calculate_tc_burst "$base_rate")
-    local burst_size=$(format_tc_burst "$burst_bytes")
-
-    if ! tc class replace dev "$interface" parent 1:1 classid "$class_id" htb \
-        rate "$TC_PORT_CLASS_RATE" ceil "$total_limit" burst "$burst_size" 2>/dev/null; then
-        [ "$created_root" = "true" ] && cleanup_owned_tc_root_if_unused_locked "$interface"
-        log_notification "端口 $port 无法创建TC限速分类: $class_id"
-        return 1
-    fi
-
-    if uses_mark_based_tc_limit "$port"; then
-        # 端口段/端口组：使用fw分类器根据标记分类
-        local mark_id
-        if ! mark_id=$(get_or_create_port_range_mark "$port" "$class_id") ||
-           ! add_port_range_mark_rules "$port" "$mark_id"; then
-            tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
-            remove_port_range_mark_rules "$port" >/dev/null 2>&1 || true
-            log_notification "端口段 $port 无法创建唯一标记规则"
-            return 1
-        fi
-        local mark_handle
-        mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
-        if ! tc filter add dev "$interface" protocol all parent 1:0 prio 1 \
-            handle "$mark_handle" fw flowid "$class_id" 2>/dev/null; then
-            tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
-            remove_port_range_mark_rules "$port" >/dev/null 2>&1 || true
-            log_notification "端口段 $port 无法创建TC过滤器"
-            return 1
-        fi
-
-    else
-        # 单端口：使用u32精确匹配，避免优先级冲突
-        local filter_prio=$((port % 1000 + 1))
-
-        # TCP协议过滤器
-        if ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
-            match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
-            match ip protocol 6 0xff match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
-            match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ip parent 1:0 prio "$((filter_prio + 1000))" u32 \
-            match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null; then
-            remove_tc_limit_locked "$port" >/dev/null 2>&1 || true
-            log_notification "端口 $port 无法创建完整TC过滤器"
-            return 1
-        fi
-
-        local ipv6_tcp_sport_handle
-        local ipv6_tcp_dport_handle
-        local ipv6_udp_sport_handle
-        local ipv6_udp_dport_handle
-        ipv6_tcp_sport_handle=$(get_tc_ipv6_filter_handle "$port" 0)
-        ipv6_tcp_dport_handle=$(get_tc_ipv6_filter_handle "$port" 1)
-        ipv6_udp_sport_handle=$(get_tc_ipv6_filter_handle "$port" 2)
-        ipv6_udp_dport_handle=$(get_tc_ipv6_filter_handle "$port" 3)
-        if ! tc filter add dev "$interface" protocol ipv6 parent 1:0 prio 2 \
-            handle "$ipv6_tcp_sport_handle" flower ip_proto tcp src_port "$port" flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ipv6 parent 1:0 prio 2 \
-            handle "$ipv6_tcp_dport_handle" flower ip_proto tcp dst_port "$port" flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ipv6 parent 1:0 prio 2 \
-            handle "$ipv6_udp_sport_handle" flower ip_proto udp src_port "$port" flowid "$class_id" 2>/dev/null ||
-           ! tc filter add dev "$interface" protocol ipv6 parent 1:0 prio 2 \
-            handle "$ipv6_udp_dport_handle" flower ip_proto udp dst_port "$port" flowid "$class_id" 2>/dev/null; then
-            remove_tc_limit_locked "$port" >/dev/null 2>&1 || true
-            log_notification "端口 $port 无法创建完整IPv6 TC过滤器"
-            return 1
-        fi
-    fi
-
-    if ! class_state=$(tc class show dev "$interface" 2>/dev/null); then
-        remove_tc_limit_locked "$port" "$class_id" >/dev/null 2>&1 || true
-        log_notification "端口 $port 无法核验TC限速分类: $class_id"
-        return 1
-    fi
-    if ! grep -Fq "class htb $class_id " <<< "$class_state"; then
-        remove_tc_limit_locked "$port" "$class_id" >/dev/null 2>&1 || true
-        log_notification "端口 $port TC限速分类创建后未找到: $class_id"
-        return 1
-    fi
-    if [ -n "$legacy_class_id" ] && [ "$legacy_class_id" != "$class_id" ]; then
-        tc class del dev "$interface" classid "$legacy_class_id" 2>/dev/null || true
-    fi
-    if uses_mark_based_tc_limit "$port"; then
-        local verify_mark_id
-        verify_mark_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.mark_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        [ -n "$verify_mark_id" ] || return 1
-        port_range_mark_rules_complete "$port" "$verify_mark_id" || return 1
-    fi
-
-    # 出向就位后补入向整形：tc 只能整形出向，入向必须先经 ifb 重定向再整形。
-    apply_ingress_shaping_locked "$port" "$total_limit" || return 1
-    return 0
-}
-
-apply_tc_limit() {
-    local result=0
-    local interface
-    interface=$(get_default_interface 2>/dev/null || true)
-    begin_tc_update || return 1
-    apply_tc_limit_locked "$@" || result=$?
-    if [ "$result" -ne 0 ] && [ -n "$interface" ]; then
-        rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
-    fi
-    finish_tc_update
-    dog_log_event tc_apply "$result" "port=${1:-}" "rate=${2:-}"
-    return "$result"
-}
-
-replace_tc_limit() {
-    local port="$1"
-    local total_limit="$2"
-    local result=0
-    local interface
-    interface=$(get_default_interface 2>/dev/null || true)
-    begin_tc_update || return 1
-    remove_tc_limit_locked "$port" >/dev/null 2>&1 || result=$?
-    if [ "$result" -eq 0 ]; then
-        apply_tc_limit_locked "$port" "$total_limit" || result=$?
-    fi
-    if [ "$result" -ne 0 ] && [ -n "$interface" ]; then
-        rollback_legacy_trafficcop_tbf "$interface" >/dev/null 2>&1 || true
-    fi
-    finish_tc_update
-    dog_log_event tc_replace "$result" "port=$port" "rate=$total_limit"
-    return "$result"
-}
-
 # 删除TC带宽限制
-remove_tc_limit_locked() {
-    local port=$1
-    local interface=$(get_default_interface)
-    local class_id="${2:-}"
-    local supplied_mark_id="${3:-}"
-
-    [ -n "$interface" ] || return 1
-    local qdisc_state
-    local initial_class_state
-    local initial_filter_state
-    if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
-       ! initial_class_state=$(tc class show dev "$interface" 2>/dev/null) ||
-       ! initial_filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
-        log_notification "端口 $port 无法读取完整TC状态，已拒绝删除TC对象: $interface"
-        return 1
-    fi
-    if grep -Eq '^qdisc htb 1:' <<< "$qdisc_state" &&
-       ! tc_root_is_managed "$interface" &&
-       ! adopt_legacy_tc_root_if_safe "$interface"; then
-        log_notification "端口 $port 检测到不属于Dog/TrafficCop统一协议的HTB，已拒绝删除TC对象: $interface"
-        return 1
-    fi
-
-    if [ -z "$class_id" ]; then
-        class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    fi
-    tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || class_id=""
-    local legacy_class_id
-    legacy_class_id=$(generate_legacy_tc_class_id "$port")
-
-    if uses_mark_based_tc_limit "$port"; then
-        # 端口段/端口组：删除基于标记的过滤器
-        local mark_id
-        mark_id="$supplied_mark_id"
-        if [ -z "$mark_id" ]; then
-            mark_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.mark_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        fi
-        local legacy_mark_id
-        legacy_mark_id=$(generate_port_range_mark "$port")
-        [ -n "$mark_id" ] || mark_id="$legacy_mark_id"
-        local mark_hex=$(printf '0x%x' "$mark_id")
-
-        local mark_handle
-        mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
-        tc filter del dev "$interface" protocol all parent 1:0 prio 1 handle "$mark_handle" fw 2>/dev/null || true
-        # 十六进制handle删除
-        tc filter del dev $interface protocol all parent 1:0 prio 1 handle $mark_hex fw 2>/dev/null || true
-        tc filter del dev $interface protocol all parent 1:0 prio 1 handle $mark_id fw 2>/dev/null || true
-        tc filter del dev $interface protocol ip parent 1:0 prio 1 handle $mark_hex fw 2>/dev/null || true
-        # 备选：十进制handle删除
-        tc filter del dev $interface protocol ip parent 1:0 prio 1 handle $mark_id fw 2>/dev/null || true
-        if [ "$legacy_mark_id" != "$mark_id" ]; then
-            local legacy_mark_hex
-            legacy_mark_hex=$(printf '0x%x' "$legacy_mark_id")
-            tc filter del dev "$interface" protocol all parent 1:0 prio 1 handle "$legacy_mark_hex" fw 2>/dev/null || true
-            tc filter del dev "$interface" protocol all parent 1:0 prio 1 handle "$legacy_mark_id" fw 2>/dev/null || true
-            tc filter del dev "$interface" protocol ip parent 1:0 prio 1 handle "$legacy_mark_hex" fw 2>/dev/null || true
-            tc filter del dev "$interface" protocol ip parent 1:0 prio 1 handle "$legacy_mark_id" fw 2>/dev/null || true
-        fi
-        remove_port_range_mark_rules "$port" >/dev/null 2>&1 || true
-        # mark 元数据须留到入向旧格式规则也完成清理后才删除。
-    else
-        # 单端口：删除u32精确匹配过滤器
-        local filter_prio=$((port % 1000 + 1))
-
-        tc filter del dev $interface protocol ip parent 1:0 prio $filter_prio u32 \
-            match ip protocol 6 0xff match ip sport $port 0xffff 2>/dev/null || true
-        tc filter del dev $interface protocol ip parent 1:0 prio $filter_prio u32 \
-            match ip protocol 6 0xff match ip dport $port 0xffff 2>/dev/null || true
-
-        tc filter del dev $interface protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
-            match ip protocol 17 0xff match ip sport $port 0xffff 2>/dev/null || true
-        tc filter del dev $interface protocol ip parent 1:0 prio $((filter_prio + 1000)) u32 \
-            match ip protocol 17 0xff match ip dport $port 0xffff 2>/dev/null || true
-
-        local ipv6_offset
-        for ipv6_offset in 0 1 2 3; do
-            tc filter del dev "$interface" protocol ipv6 parent 1:0 prio 2 \
-                handle "$(get_tc_ipv6_filter_handle "$port" "$ipv6_offset")" flower 2>/dev/null || true
-        done
-    fi
-
-    if [ -n "$class_id" ]; then
-        tc class del dev $interface classid $class_id 2>/dev/null || true
-    fi
-    if [ -n "$legacy_class_id" ] && [ "$legacy_class_id" != "$class_id" ]; then
-        tc class del dev $interface classid $legacy_class_id 2>/dev/null || true
-    fi
-    # 顺序要紧：必须先清掉本端口在 ifb0 上的入向整形对象，再让下面的 cleanup 判定 ifb0 是否还有消费者。
-    # cleanup_ingress_shaping_if_unused_locked 的判据是「ifb0 上除 1:1/1:30 外是否还有类」，
-    # 若拖到最后才删，这一步会看到自己的类而误判为「还有人在用」，于是删掉最后一个限速端口后
-    # ifb0（连同 eth0 的 ingress qdisc 与两条 mirred 重定向）会残留。
-    remove_ingress_shaping_locked "$port" "$class_id" >/dev/null 2>&1 || true
-    if uses_mark_based_tc_limit "$port"; then
-        update_config_file 'del(.ports[$port].bandwidth_limit.mark_id)' --arg port "$port" >/dev/null 2>&1 || return 1
-    fi
-    cleanup_owned_tc_root_if_unused_locked "$interface"
-
-    local cleanup_ok=true
-    if [ -n "$class_id" ]; then
-        local class_exists_status=0
-        tc_class_id_exists "$class_id" || class_exists_status=$?
-        [ "$class_exists_status" -eq 1 ] || cleanup_ok=false
-    fi
-    if [ -n "$class_id" ]; then
-        local filter_state
-        if ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
-            cleanup_ok=false
-        elif grep -Eq "(flowid|classid)[[:space:]]+$class_id([[:space:]]|$)" <<< "$filter_state"; then
-            cleanup_ok=false
-        fi
-    fi
-    if uses_mark_based_tc_limit "$port"; then
-        local remaining_comment
-        local nft_state
-        remaining_comment=$(get_port_range_mark_comment "$port")
-        if ! nft_state=$(nft -a list table "$(jq -r '.nftables.family' "$CONFIG_FILE")" \
-            "$(jq -r '.nftables.table_name' "$CONFIG_FILE")" 2>/dev/null); then
-            cleanup_ok=false
-        elif grep -Fq "comment \"$remaining_comment\"" <<< "$nft_state"; then
-            cleanup_ok=false
-        fi
-    fi
-    [ "$cleanup_ok" = "true" ]
-}
-
-remove_tc_limit() {
-    local result=0
-    begin_tc_update || return 1
-    remove_tc_limit_locked "$@" || result=$?
-    finish_tc_update
-    dog_log_event tc_clear "$result" "port=${1:-}"
-    return "$result"
-}
 
 normalize_tc_rate_to_bps() {
     local rate
@@ -8627,202 +3766,10 @@ tc_class_rate_matches() {
     [ "$actual_rate_bps" -eq "$expected_bps" ] && [ "$actual_ceil_bps" -eq "$expected_ceil_bps" ]
 }
 
-tc_single_port_filters_complete() {
-    local interface="$1"
-    local port="$2"
-    local class_id="$3"
-    local filter_prio=$((port % 1000 + 1))
-    local sport_hex
-    local dport_hex
-    sport_hex=$(printf '%x' "$((port << 16))")
-    dport_hex=$(printf '%x' "$port")
-
-    local filter_json
-    filter_json=$(tc -j filter show dev "$interface" parent 1:0 2>/dev/null) || return 1
-    jq -e \
-        --arg class_id "$class_id" \
-        --arg sport_hex "$sport_hex" \
-        --arg dport_hex "$dport_hex" \
-        --argjson port "$port" \
-        --argjson tcp_pref "$filter_prio" \
-        --argjson udp_pref "$((filter_prio + 1000))" '
-        def normhex:
-            tostring | ascii_downcase | sub("^0x"; "") | sub("^0+"; "") |
-            if . == "" then "0" else . end;
-        def u32_count($pref; $value; $mask):
-            [.[] | select(
-                .protocol == "ip" and .kind == "u32" and .pref == $pref and
-                .options.flowid == $class_id and
-                ((.options.match.value // "") | normhex) == ($value | normhex) and
-                ((.options.match.mask // "") | normhex) == ($mask | normhex) and
-                (.options.match.off // -1) == 20
-            )] | length;
-        def flower_count($proto; $key):
-            [.[] | select(
-                .protocol == "ipv6" and .kind == "flower" and
-                .options.classid == $class_id and
-                .options.keys.ip_proto == $proto and
-                .options.keys[$key] == $port
-            )] | length;
-        u32_count($tcp_pref; $sport_hex; "ffff0000") == 1 and
-        u32_count($tcp_pref; $dport_hex; "ffff") == 1 and
-        u32_count($udp_pref; $sport_hex; "ffff0000") == 1 and
-        u32_count($udp_pref; $dport_hex; "ffff") == 1 and
-        flower_count("tcp"; "src_port") == 1 and
-        flower_count("tcp"; "dst_port") == 1 and
-        flower_count("udp"; "src_port") == 1 and
-        flower_count("udp"; "dst_port") == 1
-    ' <<< "$filter_json" >/dev/null
-}
-
-tc_port_range_filter_complete() {
-    local interface="$1"
-    local class_id="$2"
-    local mark_id="$3"
-    local mark_handle
-    mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
-    local filter_state
-    filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null) || return 1
-    [ "$(printf '%s\n' "$filter_state" |
-        grep -F "handle $mark_handle" |
-        grep -Fc "classid $class_id")" -eq 1 ]
-}
-
-ingress_port_filters_complete() {
-    local port="$1" class_id="$2" state selectors minor
-    minor=$(tc_class_id_minor "$class_id") || return 1
-    state=$(tc -j filter show dev "$TC_IFB_DEVICE" parent 1:0 2>/dev/null) || return 1
-    selectors=$(port_selectors "$port" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
-    jq -e --arg class_id "$class_id" --argjson minor "$minor" --argjson selectors "$selectors" '
-        . as $filters |
-        [range(0; $selectors | length) as $i |
-         ($selectors[$i] | split("-") | map(tonumber)) as $bounds |
-         range(0; 8) as $o |
-         {pref:(100+$o), handle:($minor*65536+$i+1),
-          family:(if $o < 4 then "ip" else "ipv6" end),
-          proto:(if $o%4 < 2 then "tcp" else "udp" end),
-          field:(if $o%2 == 0 then "src_port" else "dst_port" end),
-          value:(if ($bounds | length) == 1 then $bounds[0]
-                 else {start:$bounds[0],end:$bounds[1]} end)}] as $expected |
-        ($expected | length) > 0 and
-        all($expected[]; . as $want |
-            [$filters[] | select(.kind == "flower" and .protocol == $want.family and
-             .pref == $want.pref and .options.handle == $want.handle and
-             .options.classid == $class_id and .options.keys.ip_proto == $want.proto and
-             .options.keys[$want.field] == $want.value)] | length == 1) and
-        ([$filters[] | select(.kind == "flower" and .options.classid == $class_id)] | length)
-            == ($expected | length)
-    ' <<< "$state" >/dev/null
-}
-
 # 入向整形链路是否完整：ifb0 存在、ingress 重定向在位、端口类与过滤器齐全。
 # class_id 与 expected_rate 与出向同源，保证两侧限速一致。
-ingress_limit_runtime_complete() {
-    local port="$1"
-    local class_id="$2"
-    local expected_rate="$3"
-    local dev="$TC_IFB_DEVICE"
-    local interface
-    interface=$(get_default_interface 2>/dev/null) || return 1
-
-    ip link show "$dev" >/dev/null 2>&1 || return 1
-    local qdisc_state parent_rate
-    qdisc_state=$(tc qdisc show dev "$dev" 2>/dev/null) || return 1
-    grep -q '^qdisc htb 1:' <<< "$qdisc_state" || return 1
-    ingress_redirect_runtime_complete "$interface" || return 1
-    parent_rate=$(desired_tc_parent_rate "$interface") || return 1
-    tc_class_rate_matches "$dev" 1:1 "$parent_rate" || return 1
-    tc_class_rate_matches "$dev" 1:30 "$TC_DEFAULT_CLASS_RATE" "$parent_rate" || return 1
-
-    tc_class_rate_matches "$dev" "$class_id" "$TC_PORT_CLASS_RATE" "$expected_rate" || return 1
-
-    ingress_port_filters_complete "$port" "$class_id"
-}
-
-tc_limit_runtime_rules_complete() {
-    local port="$1"
-    local interface
-    local class_id
-    interface=$(get_default_interface)
-    class_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    [ -n "$interface" ] && tc_port_class_id_valid "$class_id" >/dev/null 2>&1 || return 1
-    local expected_parent_rate
-    expected_parent_rate=$(desired_tc_parent_rate "$interface") || return 1
-    tc_class_rate_matches "$interface" "1:1" "$expected_parent_rate" || return 1
-    tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$expected_parent_rate" || return 1
-
-    local rate_limit
-    local expected_rate
-    rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-    expected_rate=$(convert_bandwidth_to_tc "$rate_limit")
-    [ -n "$expected_rate" ] || return 1
-    tc_class_rate_matches "$interface" "$class_id" "$TC_PORT_CLASS_RATE" "$expected_rate" || return 1
-
-    if uses_mark_based_tc_limit "$port"; then
-        local mark_id
-        local minor
-        local expected_mark
-        mark_id=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.mark_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        minor=$(tc_class_id_minor "$class_id") || return 1
-        expected_mark=$((0x50000000 | (minor << 12)))
-        [[ "$mark_id" =~ ^[0-9]+$ ]] && [ "$mark_id" -eq "$expected_mark" ] || return 1
-        tc_port_range_filter_complete "$interface" "$class_id" "$mark_id" || return 1
-
-        port_range_mark_rules_complete "$port" "$mark_id" || return 1
-    else
-        tc_single_port_filters_complete "$interface" "$port" "$class_id" || return 1
-    fi
-
-    # 入向整形（ifb0）：从旧版升级上来时 eth0 侧本来就是完整的，若不核对入向，
-    # 自检会一直报"规则完整"，ifb0 永远建不起来，入向限速静默失效。
-    ingress_limit_runtime_complete "$port" "$class_id" "$expected_rate" || return 1
-}
-
-tc_limit_runtime_complete() {
-    local port="$1"
-    local interface
-    interface=$(get_default_interface)
-    [ -n "$interface" ] && tc_root_is_owned "$interface" || return 1
-    tc_limit_runtime_rules_complete "$port"
-}
 
 # 返回值：0=存在且完整；1=存在但失效/状态不可解释；2=当前不需要 TC。
-dog_tc_runtime_complete_all() {
-    local interface="$1"
-    local expected=false
-    local ntc_rate=""
-    local ntc_status=0
-
-    ntc_rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || ntc_status=$?
-    case "$ntc_status" in
-        0)
-            expected=true
-            tc_root_is_managed "$interface" || return 1
-            tc_class_rate_matches "$interface" "1:1" "$ntc_rate" "$ntc_rate" || return 1
-            tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate" || return 1
-            ;;
-        1|4|5) ;;
-        *)
-            [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && return 1
-            ;;
-    esac
-
-    local active_ports=()
-    local port
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    for port in "${active_ports[@]}"; do
-        local limit_enabled
-        local rate_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
-        expected=true
-        tc_limit_runtime_complete "$port" || return 1
-    done
-
-    [ "$expected" = "true" ] && return 0
-    return 2
-}
 
 dog_tc_status() {
     local interface
@@ -8839,10 +3786,9 @@ dog_tc_status() {
     local runtime_status=0
     local qdisc_state
     local class_state
-    local filter_state
     if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
        ! class_state=$(tc class show dev "$interface" 2>/dev/null) ||
-       ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+       ! tc filter show dev "$interface" parent 1:0 >/dev/null 2>&1; then
         finish_tc_update
         echo "TC_STATUS=ERROR INTERFACE=$interface REASON=status-read-failed"
         return 1
@@ -8890,7 +3836,7 @@ recover_tc_runtime() {
             ;;
     esac
 
-    validate_config_file "$CONFIG_FILE" >/dev/null || {
+    validate_config_file "$CONFIG_FILE" 2>/dev/null || {
         echo "Dog 配置无效，拒绝修改 TC。" >&2
         return 1
     }
@@ -8907,10 +3853,9 @@ recover_tc_runtime() {
 
     local qdisc_state
     local class_state
-    local filter_state
     if ! qdisc_state=$(tc qdisc show dev "$interface" 2>/dev/null) ||
        ! class_state=$(tc class show dev "$interface" 2>/dev/null) ||
-       ! filter_state=$(tc filter show dev "$interface" parent 1:0 2>/dev/null); then
+       ! tc filter show dev "$interface" parent 1:0 >/dev/null 2>&1; then
         finish_tc_update
         echo "无法读取完整 TC 状态，未修改 qdisc。" >&2
         return 1
@@ -8952,25 +3897,13 @@ recover_tc_runtime() {
 
     local tc_ports=()
     local tc_limits=()
-    local active_ports=()
-    local port
-    mapfile -t active_ports < <(get_active_ports 2>/dev/null || true)
-    for port in "${active_ports[@]}"; do
-        local limit_enabled
-        local rate_limit
-        local tc_limit
-        limit_enabled=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-        rate_limit=$(jq -r --arg port "$port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-        [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] || continue
-        tc_limit=$(convert_bandwidth_to_tc "$rate_limit")
-        [ -n "$tc_limit" ] || {
-            finish_tc_update
-            echo "端口 $port 的带宽配置无效，未删除当前 qdisc。" >&2
-            return 1
-        }
-        tc_ports+=("$port")
+    local id tc_limit
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        tc_limit=$(monitor_tc_rate "$id") || continue
+        tc_ports+=("$id")
         tc_limits+=("$tc_limit")
-    done
+    done < <(monitor_ids)
 
     if ! tc_root_qdisc_is_replaceable "$qdisc_state" &&
        ! tc qdisc del dev "$interface" root 2>/dev/null; then
@@ -8984,7 +3917,7 @@ recover_tc_runtime() {
     local tc_index
     if [ ${#tc_ports[@]} -gt 0 ]; then
         for tc_index in "${!tc_ports[@]}"; do
-            if ! apply_tc_limit_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}"; then
+            if ! tc_apply_monitor_locked "${tc_ports[$tc_index]}" "${tc_limits[$tc_index]}"; then
                 rebuild_ok=false
                 break
             fi
@@ -9015,2591 +3948,813 @@ recover_tc_runtime() {
     fi
 }
 
-manage_traffic_reset() {
-    echo -e "${BLUE}流量重置管理${NC}"
-    echo "1. 自动重置策略设置"
-    echo "2. 服务到期日设置"
-    echo "3. 立即重置"
-    echo "0. 返回主菜单"
-    echo
-    read -p "请选择操作 [0-3]: " choice
+# ── 按监控项的带宽限制 ────────────────────────────────────────────
+# 出向：nft 的 ptd_<id>_mark 链给命中端口的包打 mark（只占高 20 位，保留低 12 位），
+#       物理网卡上一条 fw 过滤器按 mark 把包归入该项的 HTB 子类。端口增删只改 nft 映射，TC 不动。
+# 入向：ingress 先于 nft，拿不到 mark；ifb0 上按成员端口用 flower 精确匹配（每成员 8 条：
+#       IPv4/IPv6 × TCP/UDP × 源/目的），端口增删时只重建该项的入向过滤器。
+# class minor = 0x4000 + 监控项编号，mark = 0x50000000 | (minor << 12)，均为确定值，无需哈希。
 
-    case $choice in
-        1) set_reset_day ;;
-        2) set_port_expiry_date ;;
-        3) immediate_reset ;;
-        0) show_main_menu ;;
-        *) echo -e "${RED}无效选择，请输入0-3${NC}"; sleep 1; manage_traffic_reset ;;
+tc_minor_for() {
+    local n="${1#m}"
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 49151 ] || return 1
+    echo $((0x4000 + n))
+}
+
+tc_class_for() {
+    local minor
+    minor=$(tc_minor_for "$1") || return 1
+    printf '1:%x\n' "$minor"
+}
+
+tc_mark_for() {
+    local minor
+    minor=$(tc_minor_for "$1") || return 1
+    echo $(( TC_MARK_BASE | (minor << 12) ))
+}
+
+# 监控项的 tc 速率（如 100mbit）；未启用限速返回 1。
+monitor_tc_rate() {
+    local id="$1" rate
+    [ "$(mget "$id" .bandwidth_limit.enabled false)" = "true" ] || return 1
+    rate=$(mget "$id" .bandwidth_limit.rate unlimited)
+    [ "$rate" != "unlimited" ] || return 1
+    echo "$rate"
+}
+
+# 已安装的 TrafficCop Lite 是否理解 Dog 2.0 的类清单（tc-interop.json）。
+# 未安装 NTC 视为兼容；旧版 NTC 会按 1.5.x 的 .ports 反推 Dog 的类，必须先升级。
+tc_ntc_compatible() {
+    local monitor="$TRAFFICCOP_MONITOR_SCRIPT"
+    [ -e "$monitor" ] || return 0
+    grep -qF "$TC_CLASS_MANIFEST_SCHEMA" "$monitor" 2>/dev/null
+}
+
+tc_require_ntc_compatible() {
+    tc_ntc_compatible && return 0
+    dog_error "检测到旧版 TrafficCop Lite：它无法识别 Dog 2.0 的限速类，同时运行会互相误判。请先把 TrafficCop Lite 升级到 1.2.0 或更高版本，再设置带宽限制。"
+    return 1
+}
+
+# 写入供 NTC 读取的类清单（原子替换，root 0644）。
+# $1（可选）：要排除的监控项 ID——删除/合并时在持锁移除 TC 对象后、改配置前调用。
+tc_write_interop() {
+    local exclude="${1:-}" iface id rate classes="[]"
+    iface=$(get_default_interface 2>/dev/null || echo "")
+    while IFS= read -r id; do
+        [ -n "$id" ] && [ "$id" != "$exclude" ] || continue
+        rate=$(monitor_tc_rate "$id") || continue
+        classes=$(jq -c --arg id "$id" --arg c "$(tc_class_for "$id")" --arg r "$rate" \
+            --argjson m "$(tc_mark_for "$id")" --argjson n "$(jq 'length' <<< "$(jq -c --arg id "$id" '.monitors[$id].ports' "$CONFIG_FILE")")" \
+            '. + [{id: $id, class_id: $c, rate: $r, mark: $m, mark_mask: 4294963200,
+                   egress: "fw", ingress: "flower", ingress_filters: ($n * 8)}]' <<< "$classes")
+    done < <(monitor_ids)
+    jq -n --arg s "$TC_CLASS_MANIFEST_SCHEMA" --arg v "$SCRIPT_VERSION" --arg i "$iface" \
+          --arg at "$(date -u +%FT%TZ)" --argjson c "$classes" \
+        '{schema: $s, dog_version: $v, interface: $i, updated_at: $at, classes: $c}' |
+        atomic_write "$TC_INTEROP_FILE" 644
+}
+
+tc_class_args() {
+    local rate="$1" kbps burst
+    kbps=$(parse_tc_rate_to_kbps "$rate")
+    burst=$(format_tc_burst "$(calculate_tc_burst "$kbps")")
+    printf 'rate %s ceil %s burst %s' "$TC_PORT_CLASS_RATE" "$rate" "$burst"
+}
+
+# 删除 ifb0 上指向该类的全部 flower 过滤器（不依赖成员数，端口变化后也能清干净）。
+tc_remove_ingress_filters_locked() {
+    local id="$1" class json
+    class=$(tc_class_for "$id") || return 1
+    ip link show "$TC_IFB_DEVICE" >/dev/null 2>&1 || return 0
+    json=$(tc -j filter show dev "$TC_IFB_DEVICE" parent 1:0 2>/dev/null) || return 0
+    jq -r --arg c "$class" '.[] | select(.options.handle? != null and (.options.classid? // .options.flowid? // "") == $c) |
+        "\(.protocol) \(.pref) \(.options.handle)"' <<< "$json" 2>/dev/null |
+    while read -r proto pref handle; do
+        tc filter del dev "$TC_IFB_DEVICE" parent 1:0 protocol "$proto" pref "$pref" handle "$handle" flower 2>/dev/null || true
+    done
+}
+
+tc_apply_ingress_locked() {
+    local id="$1" rate="$2" iface="$3" class minor ports index=0 port offset pref family proto key handle
+    class=$(tc_class_for "$id"); minor=$(tc_minor_for "$id")
+    ensure_ifb_hierarchy_locked "$iface" || return 1
+    ensure_ingress_redirect_locked "$iface" || return 1
+    tc_remove_ingress_filters_locked "$id"
+    # shellcheck disable=SC2046
+    tc class replace dev "$TC_IFB_DEVICE" parent 1:1 classid "$class" htb $(tc_class_args "$rate") || return 1
+    mapfile -t ports < <(monitor_ports "$id")
+    for port in "${ports[@]}"; do
+        index=$((index + 1))
+        handle=$(printf '0x%x' $(( (minor << 16) | index )))
+        for offset in 0 1 2 3 4 5 6 7; do
+            pref=$((100 + offset))
+            family=ip; [ "$offset" -lt 4 ] || family=ipv6
+            proto=tcp; [ $((offset % 4)) -lt 2 ] || proto=udp
+            key=src_port; [ $((offset % 2)) -eq 0 ] || key=dst_port
+            tc filter add dev "$TC_IFB_DEVICE" protocol "$family" parent 1:0 pref "$pref" \
+                handle "$handle" flower ip_proto "$proto" "$key" "$port" classid "$class" || {
+                tc_remove_ingress_filters_locked "$id"
+                return 1
+            }
+        done
+    done
+}
+
+tc_egress_filter_handle() {
+    printf '0x%x/0x%x' "$(tc_mark_for "$1")" "$TC_MARK_MASK"
+}
+
+# 施加/更新一个监控项的限速（调用方持有 TC 锁与 Dog 锁）。
+tc_apply_monitor_locked() {
+    local id="$1" rate="$2" iface class mark
+    iface=$(get_default_interface) || return 1
+    ensure_owned_tc_hierarchy_locked "$iface" || return 1
+    class=$(tc_class_for "$id") || return 1
+    mark=$(tc_mark_for "$id")
+    # shellcheck disable=SC2046
+    tc class replace dev "$iface" parent 1:1 classid "$class" htb $(tc_class_args "$rate") || {
+        log_notification "监控项 $id 无法创建 TC 分类 $class"; return 1; }
+    tc filter del dev "$iface" parent 1:0 protocol all prio 1 handle "$(tc_egress_filter_handle "$id")" fw 2>/dev/null || true
+    tc filter add dev "$iface" parent 1:0 protocol all prio 1 handle "$(tc_egress_filter_handle "$id")" fw flowid "$class" || {
+        log_notification "监控项 $id 无法创建出向 fw 过滤器"; return 1; }
+    config_update '.monitors[$id].bandwidth_limit.class_id = $c | .monitors[$id].bandwidth_limit.mark_id = $m' \
+        --arg id "$id" --arg c "$class" --argjson m "$mark" || return 1
+    nft_sync_monitor "$id" || return 1
+    tc_apply_ingress_locked "$id" "$rate" "$iface" || { log_notification "监控项 $id 入向限速创建失败"; return 1; }
+    tc_monitor_complete "$id" "$iface"
+}
+
+# 撤销一个监控项的 TC 对象（不改配置开关；调用方持有 TC 锁）。
+tc_remove_monitor_locked() {
+    local id="$1" iface class
+    iface=$(get_default_interface 2>/dev/null) || return 0
+    class=$(tc_class_for "$id") || return 1
+    tc_remove_ingress_filters_locked "$id"
+    tc class del dev "$TC_IFB_DEVICE" classid "$class" 2>/dev/null || true
+    tc filter del dev "$iface" parent 1:0 protocol all prio 1 handle "$(tc_egress_filter_handle "$id")" fw 2>/dev/null || true
+    tc class del dev "$iface" classid "$class" 2>/dev/null || true
+    cleanup_owned_tc_root_if_unused_locked "$iface" || true
+    ! tc class show dev "$iface" 2>/dev/null | awk -v c="$class" '$3 == c {f=1} END {exit !f}'
+}
+
+# 删除 2.0 号段（1:4001-1:ffff）里没有对应限速监控项的孤儿类及其过滤器（调用方持有 TC 锁）。
+# 孤儿类会让 NTC 判定“存在无法证明归属的 Dog 类”而拒绝操作，必须由 Dog 自己清掉。
+tc_remove_orphan_classes_locked() {
+    local iface="$1" dev class minor id removed=0
+    for dev in "$iface" "$TC_IFB_DEVICE"; do
+        ip link show "$dev" >/dev/null 2>&1 || continue
+        while read -r class; do
+            [[ "$class" =~ ^1:([0-9a-f]+)$ ]] || continue
+            minor=$((16#${BASH_REMATCH[1]}))
+            [ "$minor" -ge $((0x4001)) ] && [ "$minor" -le $((0xffff)) ] || continue
+            id="m$((minor - 0x4000))"
+            monitor_exists "$id" && monitor_tc_rate "$id" >/dev/null && continue
+            if [ "$dev" = "$TC_IFB_DEVICE" ]; then
+                tc_remove_ingress_filters_locked "$id"
+            else
+                tc filter del dev "$dev" parent 1:0 protocol all prio 1 handle "$(tc_egress_filter_handle "$id")" fw 2>/dev/null || true
+            fi
+            tc class del dev "$dev" classid "$class" 2>/dev/null && removed=$((removed + 1))
+        done < <(tc class show dev "$dev" 2>/dev/null | awk '$1 == "class" && $2 == "htb" && $5 == "1:1" { print $3 }')
+    done
+    [ "$removed" -eq 0 ] || log_notification "已清理 $removed 个无对应监控项的 TC 分类"
+    return 0
+}
+
+# 一个监控项的 TC 运行状态是否完整。
+tc_monitor_complete() {
+    local id="$1" iface="${2:-}" rate class handle want have
+    rate=$(monitor_tc_rate "$id") || return 0
+    [ -n "$iface" ] || iface=$(get_default_interface 2>/dev/null) || return 1
+    class=$(tc_class_for "$id")
+    tc_class_rate_matches "$iface" "$class" "$TC_PORT_CLASS_RATE" "$rate" || return 1
+    tc_class_rate_matches "$TC_IFB_DEVICE" "$class" "$TC_PORT_CLASS_RATE" "$rate" || return 1
+    handle=$(printf '0x%x' "$(tc_mark_for "$id")")
+    grep -Eq "handle ${handle}/0xfffff000 classid ${class}( |$)" <<< "$(tc filter show dev "$iface" parent 1:0 2>/dev/null)" || return 1
+    want=$(( $(monitor_ports "$id" | wc -l) * 8 ))
+    have=$(tc -j filter show dev "$TC_IFB_DEVICE" parent 1:0 2>/dev/null |
+        jq --arg c "$class" '[.[] | select(.options.handle? != null and (.options.classid? // .options.flowid? // "") == $c)] | length' 2>/dev/null || echo 0)
+    [ "$have" -eq "$want" ]
+}
+
+# 0=全部完整，1=有冲突或缺失，2=Dog/NTC 都没有 TC 需求。
+dog_tc_runtime_complete_all() {
+    local interface="$1" expected=false ntc_rate="" ntc_status=0 id
+    ntc_rate=$(trafficcop_unified_state_rate "$interface" 2>/dev/null) || ntc_status=$?
+    case "$ntc_status" in
+        0)
+            expected=true
+            tc_root_is_managed "$interface" || return 1
+            tc_class_rate_matches "$interface" "1:1" "$ntc_rate" "$ntc_rate" || return 1
+            tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate" || return 1
+            ;;
+        1|4|5) ;;
+        *) [ -e "$TRAFFICCOP_TC_STATE_FILE" ] && return 1 ;;
     esac
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        monitor_tc_rate "$id" >/dev/null || continue
+        expected=true
+        tc_monitor_complete "$id" "$interface" || return 1
+    done < <(monitor_ids)
+    [ "$expected" = "true" ] && return 0
+    return 2
 }
 
-set_reset_day() {
-    echo -e "${BLUE}=== 自动重置策略设置 ===${NC}"
-    echo
+# 端口变化后刷新入向过滤器（出向随 nft 映射自动生效）。
+tc_refresh_monitor_ports() {
+    local id="$1" rate iface rc=0
+    rate=$(monitor_tc_rate "$id") || return 0
+    iface=$(get_default_interface) || return 1
+    begin_tc_update || return 1
+    tc_apply_ingress_locked "$id" "$rate" "$iface" || rc=1
+    finish_tc_update
+    return "$rc"
+}
 
-    local active_ports=($(get_active_ports))
-
-    if ! show_port_list; then
-        sleep 2
-        manage_traffic_reset
-        return
+# 设置或取消限速：rate 为 tc 速率（100mbit）或 0。
+tc_set_monitor_limit() {
+    local id="$1" rate="$2" rc=0 prev_enabled prev_rate
+    if [ "$rate" != "0" ]; then
+        tc_require_ntc_compatible || return 1
     fi
-    echo
-
-    read -p "请选择要设置重置日期的端口（多端口使用逗号,分隔） [1-${#active_ports[@]}]: " choice_input
-
-    local valid_choices=()
-    local ports_to_set=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-
-    for choice in "${valid_choices[@]}"; do
-        local port=${active_ports[$((choice-1))]}
-        ports_to_set+=("$port")
-    done
-
-    if [ ${#ports_to_set[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可设置${NC}"
-        sleep 2
-        set_reset_day
-        return
-    fi
-
-    echo
-    local port_list
-    port_list=$(IFS=','; echo "${ports_to_set[*]}")
-    echo "为端口 $port_list 设置自动重置策略:"
-    local reset_policy_config=""
-    local RESET_POLICY_CONFIGS=()
-    local separate_policy="false"
-
-    if [ ${#ports_to_set[@]} -gt 1 ]; then
-        read -p "是否为每个端口分别设置策略? [y/N]: " separate_choice
-        if [[ "$separate_choice" =~ ^[Yy]$ ]]; then
-            separate_policy="true"
-        fi
-    fi
-
-    if [ "$separate_policy" = "true" ]; then
-        for port in "${ports_to_set[@]}"; do
-            echo
-            echo "设置端口 $port 的自动重置策略:"
-            prompt_reset_policy 1
-            RESET_POLICY_CONFIGS+=("$RESET_POLICY_CONFIG")
-        done
+    dog_lock || return 75
+    prev_enabled=$(mget "$id" .bandwidth_limit.enabled false)
+    prev_rate=$(mget "$id" .bandwidth_limit.rate unlimited)
+    begin_tc_update || { dog_unlock; return 1; }
+    if [ "$rate" = "0" ]; then
+        config_update '.monitors[$id].bandwidth_limit = {enabled: false, rate: "unlimited"}' --arg id "$id" || rc=1
+        [ "$rc" -eq 0 ] && { tc_remove_monitor_locked "$id" || rc=1; }
+        [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
+        dog_log_event tc_clear "$rc" "id=$id"
     else
-        prompt_reset_policy 1
-        reset_policy_config="$RESET_POLICY_CONFIG"
-    fi
-
-    local success_count=0
-    for i in "${!ports_to_set[@]}"; do
-        local port="${ports_to_set[$i]}"
-        local current_policy_config="$reset_policy_config"
-        if [ "$separate_policy" = "true" ]; then
-            current_policy_config="${RESET_POLICY_CONFIGS[$i]}"
+        config_update '.monitors[$id].bandwidth_limit.enabled = true | .monitors[$id].bandwidth_limit.rate = $r' \
+            --arg id "$id" --arg r "$rate" || rc=1
+        if [ "$rc" -eq 0 ] && ! tc_apply_monitor_locked "$id" "$rate"; then
+            rc=1
+            # 回滚到原设置，避免配置声称已限速而内核没有对应对象。
+            tc_remove_monitor_locked "$id" >/dev/null 2>&1 || true
+            config_update '.monitors[$id].bandwidth_limit.enabled = ($e == "true") | .monitors[$id].bandwidth_limit.rate = $r' \
+                --arg id "$id" --arg e "$prev_enabled" --arg r "$prev_rate" >/dev/null 2>&1 || true
+            nft_sync_monitor "$id" >/dev/null 2>&1 || true
+            if [ "$prev_enabled" = "true" ] && [ "$prev_rate" != "unlimited" ]; then
+                tc_apply_monitor_locked "$id" "$prev_rate" >/dev/null 2>&1 || true
+            fi
         fi
-        local policy_type
-        policy_type=$(printf '%s' "$current_policy_config" | jq -r '.type')
+        dog_log_event tc_apply "$rc" "id=$id" "rate=$rate"
+    fi
+    # 清单在释放共享 TC 锁之前写入：NTC 持锁读取时，内核对象与清单一致。
+    tc_write_interop || true
+    finish_tc_update
+    dog_unlock
+    return "$rc"
+}
 
-        if [ "$policy_type" = "none" ]; then
-            if ! apply_reset_policy_to_port "$port" "$current_policy_config"; then
-                echo -e "${RED}端口 $port 自动重置配置写入失败，原配置已保留${NC}"
-                continue
-            fi
-            if remove_port_auto_reset_cron "$port"; then
-                echo -e "${GREEN}端口 $port 已取消自动重置${NC}"
-            else
-                echo -e "${RED}端口 $port 已取消自动重置，但定时任务刷新失败，请运行 dog --refresh-all-cron${NC}"
-                continue
-            fi
+# 按配置恢复全部限速（缺失或不完整的才重建）。
+tc_restore_all() {
+    local id rate iface rc=0 any=false
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        monitor_tc_rate "$id" >/dev/null && { any=true; break; }
+    done < <(monitor_ids)
+    iface=$(get_default_interface 2>/dev/null) || iface=""
+    if [ "$any" != "true" ]; then
+        if [ -n "$iface" ] && begin_tc_update; then
+            tc_remove_orphan_classes_locked "$iface"
+            tc_write_interop || true
+            finish_tc_update
         else
-            # 无流量配额的端口不需要自动重置
-            local monthly_limit=$(get_quota_limit "$port")
-            if [ "$monthly_limit" = "unlimited" ]; then
-                echo -e "${YELLOW}端口 $port 未设置流量配额，请先通过「端口限制设置管理→设置端口流量配额」设置配额后再设置自动重置策略${NC}"
-                continue
-            fi
-            local policy_apply_status=0
-            apply_reset_policy_to_port "$port" "$current_policy_config" || policy_apply_status=$?
-            if [ "$policy_apply_status" -ne 0 ]; then
-                case "$policy_apply_status" in
-                    20)
-                        echo -e "${RED}端口 $port 今日立即清零失败，原重置策略已恢复${NC}"
-                        ;;
-                    21)
-                        if setup_port_auto_reset_cron "$port" >/dev/null 2>&1; then
-                            echo -e "${RED}端口 $port 的新策略已保存，但立即清零/日期推进未完整成功；定时任务将继续幂等修复${NC}"
-                        else
-                            echo -e "${RED}端口 $port 的新策略已保存，但立即处理和定时任务刷新均未完整成功；请运行 dog --self-check${NC}"
-                        fi
-                        ;;
-                    22)
-                        echo -e "${RED}端口 $port 立即清零失败且原策略回滚不完整，请立即运行 dog --self-check${NC}"
-                        ;;
-                    *)
-                        echo -e "${RED}端口 $port 自动重置策略写入失败，原配置已保留${NC}"
-                        ;;
-                esac
-                continue
-            fi
-            if ! setup_port_auto_reset_cron "$port"; then
-                echo -e "${RED}端口 $port 策略已保存，但定时任务刷新失败，请运行 dog --refresh-all-cron${NC}"
-                continue
-            fi
-            local next_reset_label
-            next_reset_label=$(get_port_next_reset_label "$port" 2>/dev/null || true)
-            echo -e "${GREEN}端口 $port 自动重置策略设置成功${NC}${next_reset_label:+: $next_reset_label}"
+            tc_write_interop || true
         fi
-
-        success_count=$((success_count + 1))
-    done
-
-    echo
-    echo -e "${GREEN}成功设置 $success_count 个端口的自动重置策略${NC}"
-
-    sleep 2
-    manage_traffic_reset
-}
-
-set_port_expiry_date() {
-    echo -e "${BLUE}=== 服务到期日设置 ===${NC}"
-    echo "到期前原自动重置策略照常执行；北京时间到期日当天起封锁 TCP/UDP。"
-    echo
-
-    local active_ports=($(get_active_ports))
-    if ! show_port_list; then
-        sleep 2
-        manage_traffic_reset
-        return
-    fi
-    echo
-
-    read -p "请选择要设置到期日的端口（多端口使用逗号,分隔） [1-${#active_ports[@]}]: " choice_input
-    local valid_choices=()
-    local ports_to_set=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-    local choice
-    for choice in "${valid_choices[@]}"; do
-        ports_to_set+=("${active_ports[$((choice-1))]}")
-    done
-    if [ ${#ports_to_set[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可设置${NC}"
-        sleep 2
-        set_port_expiry_date
-        return
-    fi
-
-    local expiry_date
-    read -p "请输入服务到期日 YYYY-MM-DD（输入 0 取消到期）: " expiry_date
-    if [ "$expiry_date" != "0" ] && ! is_valid_date "$expiry_date"; then
-        echo -e "${RED}到期日无效，必须使用真实日期 YYYY-MM-DD${NC}"
-        sleep 2
-        set_port_expiry_date
-        return
-    fi
-    if [ "$expiry_date" != "0" ] && date_le "$expiry_date" "$(get_current_date)"; then
-        echo -e "${YELLOW}该日期已到，将立即封锁所选端口。${NC}"
-        local confirm_expired
-        read -p "确认继续? [y/N]: " confirm_expired
-        if [[ ! "$confirm_expired" =~ ^[Yy]$ ]]; then
-            echo "已取消"
-            sleep 1
-            manage_traffic_reset
-            return
-        fi
-    fi
-
-    local success_count=0
-    local failed_count=0
-    local successful_ports=()
-    declare -A previous_expiry_configs=()
-    if ! begin_expiry_update; then
-        echo -e "${RED}服务到期规则正在被其他任务修改，请稍后重试${NC}"
-        sleep 2
-        manage_traffic_reset
-        return
-    fi
-    local port
-    for port in "${ports_to_set[@]}"; do
-        local previous_expiry_state
-        previous_expiry_state=$(jq -c --arg port "$port" '
-            .ports[$port] |
-            if has("expiry_date") then {exists:true,value:.expiry_date}
-            else {exists:false} end
-        ' "$CONFIG_FILE") || {
-            failed_count=$((failed_count + 1))
-            continue
-        }
-        previous_expiry_configs["$port"]="$previous_expiry_state"
-        if [ "$expiry_date" = "0" ]; then
-            if ! update_config_file 'del(.ports[$port].expiry_date)' --arg port "$port"; then
-                failed_count=$((failed_count + 1))
-                continue
-            fi
-        elif ! update_config_file '.ports[$port].expiry_date = $date' \
-            --arg port "$port" --arg date "$expiry_date"; then
-            failed_count=$((failed_count + 1))
-            continue
-        fi
-
-        if sync_port_expiry_state "$port"; then
-            if [ "$expiry_date" = "0" ]; then
-                echo -e "${GREEN}端口 $port 已取消服务到期日${NC}"
-            elif port_is_expired "$port"; then
-                echo -e "${GREEN}端口 $port 已按到期日 $expiry_date 封锁${NC}"
-            else
-                echo -e "${GREEN}端口 $port 服务到期日已设置为 $expiry_date${NC}"
-            fi
-            success_count=$((success_count + 1))
-            successful_ports+=("$port")
-        else
-            local rollback_ok=true
-            update_config_file '
-                if $previous.exists then .ports[$port].expiry_date = $previous.value
-                else del(.ports[$port].expiry_date) end
-            ' --arg port "$port" --argjson previous "$previous_expiry_state" >/dev/null 2>&1 || rollback_ok=false
-            if [ "$rollback_ok" = "true" ]; then
-                sync_port_expiry_state "$port" >/dev/null 2>&1 || rollback_ok=false
-            fi
-            if [ "$rollback_ok" = "true" ]; then
-                echo -e "${RED}端口 $port 到期规则应用失败，已恢复原配置与运行规则${NC}"
-            else
-                echo -e "${RED}端口 $port 到期规则应用失败且回滚不完整，请立即运行 dog --self-check${NC}"
-            fi
-            failed_count=$((failed_count + 1))
-        fi
-    done
-    if [ "$success_count" -gt 0 ] && ! refresh_port_auto_reset_cron_from_config; then
-        echo -e "${RED}到期定时任务写入失败，正在回滚本次成功项。${NC}"
-        local cron_rollback_ok=true
-        for port in "${successful_ports[@]}"; do
-            update_config_file '
-                if $previous.exists then .ports[$port].expiry_date = $previous.value
-                else del(.ports[$port].expiry_date) end
-            ' \
-                --arg port "$port" --argjson previous "${previous_expiry_configs[$port]}" \
-                >/dev/null 2>&1 || cron_rollback_ok=false
-            sync_port_expiry_state "$port" >/dev/null 2>&1 || cron_rollback_ok=false
-        done
-        refresh_port_auto_reset_cron_from_config >/dev/null 2>&1 || cron_rollback_ok=false
-        failed_count=$((failed_count + success_count))
-        success_count=0
-        if [ "$cron_rollback_ok" = "true" ]; then
-            echo -e "${YELLOW}本次到期日变更已回滚，原配置与运行规则已恢复。${NC}"
-        else
-            echo -e "${RED}到期日变更回滚不完整，请立即运行 dog --self-check。${NC}"
-        fi
-    fi
-    finish_expiry_update
-
-    echo
-    echo -e "${GREEN}成功设置 $success_count 个端口${NC}"
-    if [ "$failed_count" -gt 0 ]; then
-        echo -e "${RED}失败 $failed_count 个端口${NC}"
-    fi
-    sleep 2
-    manage_traffic_reset
-}
-
-immediate_reset() {
-    echo -e "${BLUE}=== 立即重置 ===${NC}"
-    echo
-
-    local active_ports=($(get_active_ports))
-
-    if ! show_port_list; then
-        sleep 2
-        manage_traffic_reset
-        return
-    fi
-    echo
-
-    read -p "请选择要立即重置的端口（多端口使用逗号,分隔） [1-${#active_ports[@]}]: " choice_input
-
-    # 处理多选择输入
-    local valid_choices=()
-    local ports_to_reset=()
-    parse_multi_choice_input "$choice_input" "${#active_ports[@]}" valid_choices
-
-    for choice in "${valid_choices[@]}"; do
-        local port=${active_ports[$((choice-1))]}
-        ports_to_reset+=("$port")
-    done
-
-    if [ ${#ports_to_reset[@]} -eq 0 ]; then
-        echo -e "${RED}没有有效的端口可重置${NC}"
-        sleep 2
-        immediate_reset
-        return
-    fi
-
-    record_traffic_snapshot >/dev/null 2>&1 || true
-
-    # 显示要重置的端口及其当前流量
-    echo
-    echo "将重置以下端口的流量统计:"
-    local total_all_traffic=0
-    for port in "${ports_to_reset[@]}"; do
-        if ! read_nftables_counter_data "$port"; then
-            echo -e "${RED}端口 $port 流量读取失败，已取消本次重置${NC}"
-            sleep 2
-            manage_traffic_reset
-            return
-        fi
-        local input_bytes="$NFT_COUNTER_INPUT"
-        local output_bytes="$NFT_COUNTER_OUTPUT"
-        local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
-        local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
-        local total_formatted=$(format_bytes $total_bytes)
-
-        echo "  端口 $port: $total_formatted"
-        total_all_traffic=$((total_all_traffic + total_bytes))
-    done
-
-    echo
-    echo "总计流量: $(format_bytes $total_all_traffic)"
-    echo -e "${YELLOW}警告：重置后流量统计将清零，此操作不可撤销！${NC}"
-    read -p "确认重置选定端口的流量统计? [y/N]: " confirm
-
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if ! begin_reset_update; then
-            echo -e "${RED}流量重置任务正在运行，请稍后重试${NC}"
-            sleep 2
-            manage_traffic_reset
-            return
-        fi
-
-        local reset_count=0
-        local failed_count=0
-        for port in "${ports_to_reset[@]}"; do
-            # 获取当前流量用于记录
-            if ! record_traffic_snapshot >/dev/null 2>&1 ||
-               ! read_nftables_counter_data "$port"; then
-                echo -e "${RED}端口 $port 流量读取失败，未执行清零${NC}"
-                failed_count=$((failed_count + 1))
-                continue
-            fi
-            local input_bytes="$NFT_COUNTER_INPUT"
-            local output_bytes="$NFT_COUNTER_OUTPUT"
-            local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"single\"" "$CONFIG_FILE")
-            local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
-
-            if reset_port_nftables_counters "$port"; then
-                if record_reset_history "$port" "$total_bytes"; then
-                    echo -e "${GREEN}端口 $port 流量统计重置成功${NC}"
-                else
-                    echo -e "${YELLOW}端口 $port 已清零，但重置历史写入失败${NC}"
-                fi
-                reset_count=$((reset_count + 1))
-            else
-                echo -e "${RED}端口 $port 流量统计重置失败，原重置策略未改变${NC}"
-                failed_count=$((failed_count + 1))
-            fi
-        done
-        finish_reset_update
-
-        echo
-        echo -e "${GREEN}成功重置 $reset_count 个端口的流量统计${NC}"
-        if [ "$failed_count" -gt 0 ]; then
-            echo -e "${RED}失败 $failed_count 个端口，请运行 dog --self-check 检查规则${NC}"
-        fi
-        echo "重置前总流量: $(format_bytes $total_all_traffic)"
-    else
-        echo "取消重置"
-    fi
-
-    sleep 3
-    manage_traffic_reset
-}
-
-# 在已持有重置锁时重置指定端口。
-perform_auto_reset_port() {
-    local port="$1"
-    local due_date="${2:-}"
-    local policy_instance_id="${3:-}"
-
-    if ! record_traffic_snapshot >/dev/null 2>&1 ||
-       ! read_nftables_counter_data "$port"; then
-        log_notification "端口 $port 自动重置失败：无法可靠读取当前流量，未执行清零"
-        return 1
-    fi
-    local input_bytes="$NFT_COUNTER_INPUT"
-    local output_bytes="$NFT_COUNTER_OUTPUT"
-    local billing_mode=$(jq -r ".ports.\"$port\".billing_mode // \"double\"" "$CONFIG_FILE")
-    local total_bytes=$(calculate_total_traffic "$input_bytes" "$output_bytes" "$billing_mode")
-
-    if ! reset_port_nftables_counters "$port"; then
-        log_notification "端口 $port 自动重置失败，counter/quota 未全部清零，将保留应重置日期等待重试"
-        return 1
-    fi
-    if ! record_reset_history "$port" "$total_bytes" "$due_date" "$policy_instance_id"; then
-        log_notification "端口 $port 自动重置已完成，但写入重置历史失败"
-        return 2
-    fi
-
-    log_notification "端口 $port 自动重置完成，重置前流量: $(format_bytes $total_bytes)"
-
-    echo "端口 $port 自动重置完成"
-}
-
-# 自动重置指定端口的流量
-auto_reset_port() {
-    local port="$1"
-    if ! begin_reset_update; then
-        log_notification "端口 $port 自动重置跳过：已有重置任务正在运行"
-        return 1
-    fi
-    if [ ! -f "$CONFIG_FILE" ]; then
-        finish_reset_update
         return 0
     fi
-    if ! validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then
-        finish_reset_update
-        return 1
-    fi
-
-    local result=0
-    perform_auto_reset_port "$port" || result=$?
-    finish_reset_update
-    return "$result"
+    tc_ntc_compatible || { tc_require_ntc_compatible; return 1; }
+    [ -n "$iface" ] || return 1
+    begin_tc_update || return 1
+    tc_remove_orphan_classes_locked "$iface"
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        rate=$(monitor_tc_rate "$id") || continue
+        tc_monitor_complete "$id" "$iface" && continue
+        tc_apply_monitor_locked "$id" "$rate" || rc=1
+    done < <(monitor_ids)
+    tc_write_interop || true
+    finish_tc_update
+    return "$rc"
 }
 
-check_reset_port_due() {
-    local port="$1"
-    if ! begin_reset_update; then
-        log_notification "端口 $port 重置日检查跳过：已有重置任务正在运行"
+validate_ip_guard_script_file() {
+    local candidate="$1"
+    [ -s "$candidate" ] &&
+        grep -Fq '# PORT_TRAFFIC_DOG_IP_GUARD' "$candidate" 2>/dev/null &&
+        bash -n "$candidate" >/dev/null 2>&1
+}
+
+install_ip_guard_script_file() {
+    local source_file="$1"
+    local temp_file
+    mkdir -p "$CONFIG_DIR" || return 1
+    temp_file=$(mktemp "$CONFIG_DIR/.port-ip-guard.sh.XXXXXX") || return 1
+    if ! install -m 755 "$source_file" "$temp_file" ||
+       ! mv -f "$temp_file" "$IP_GUARD_SCRIPT_PATH"; then
+        rm -f "$temp_file"
         return 1
     fi
-    if [ ! -f "$CONFIG_FILE" ]; then
-        finish_reset_update
+}
+
+get_ip_guard_service_state() {
+    if [ ! -e "$IP_GUARD_SERVICE_FILE" ]; then
+        echo "absent"
         return 0
     fi
-    if ! validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then
-        finish_reset_update
-        return 1
-    fi
-    if ! port_has_auto_reset_policy "$port"; then
-        finish_reset_update
-        return 0
-    fi
+    command -v "$IP_GUARD_SYSTEMCTL" >/dev/null 2>&1 || return 1
 
-    local today
-    today=$(get_current_date)
-    local next_reset_date
-    local ensure_status=0
-    next_reset_date=$(ensure_port_next_reset_date "$port" 2>/dev/null) || ensure_status=$?
-
-    if [ "$ensure_status" -ne 0 ] || [ -z "$next_reset_date" ] || ! is_valid_date "$next_reset_date"; then
-        finish_reset_update
-        return 10
-    fi
-
-    local policy_instance_id
-    policy_instance_id=$(jq -r --arg port "$port" \
-        '.ports[$port].quota.reset_policy.instance_id // empty' "$CONFIG_FILE" 2>/dev/null) || {
-        finish_reset_update
-        return 10
-    }
-
-    local result=0
-    if date_le "$next_reset_date" "$today"; then
-        local history_status=0
-        reset_history_has_due "$port" "$next_reset_date" "$policy_instance_id" || history_status=$?
-        if [ "$history_status" -eq 0 ]; then
-            # 上次已清零但配置日期推进失败时，只补推进日期，禁止重复清零。
-            advance_port_next_reset_date "$port" "$today" || result=12
-        elif [ "$history_status" -gt 1 ]; then
-            log_notification "端口 $port 重置历史无法读取，为避免重复清零已停止本次重置"
-            result=13
-        else
-            local reset_status=0
-            perform_auto_reset_port "$port" "$next_reset_date" "$policy_instance_id" || reset_status=$?
-            case "$reset_status" in
-                0)
-                    advance_port_next_reset_date "$port" "$today" || result=11
-                    ;;
-                2)
-                    # counter 已经清零；优先推进策略，禁止把它当作“未执行”而回滚。
-                    if advance_port_next_reset_date "$port" "$today"; then
-                        result=14
-                    else
-                        result=15
-                    fi
-                    ;;
-                *) result=10 ;;
-            esac
-        fi
-    fi
-    finish_reset_update
-    return "$result"
-}
-
-check_scheduled_resets() {
-    begin_reset_update || return 1
-    if [ ! -f "$CONFIG_FILE" ]; then
-        finish_reset_update
-        return 0
-    fi
-    if ! validate_config_file "$CONFIG_FILE" >/dev/null; then
-        finish_reset_update
-        return 1
-    fi
-    local active_ports=()
-    local ports_output
-    ports_output=$(get_active_ports 2>/dev/null) || {
-        finish_reset_update
-        return 1
-    }
-    if [ -n "$ports_output" ]; then
-        mapfile -t active_ports <<< "$ports_output"
-    fi
-    local failed=false
-    local port
-    for port in "${active_ports[@]}"; do
-        check_reset_port_due "$port" >/dev/null 2>&1 || failed=true
-    done
-    finish_reset_update
-    [ "$failed" = "false" ]
-}
-
-check_port_expirations() {
-    begin_expiry_update || return 1
-    if [ ! -f "$CONFIG_FILE" ]; then
-        finish_expiry_update
-        return 0
-    fi
-    if ! validate_config_file "$CONFIG_FILE" >/dev/null || ! init_nftables; then
-        finish_expiry_update
-        return 1
-    fi
-
-    local active_ports=()
-    local ports_output
-    ports_output=$(get_active_ports 2>/dev/null) || {
-        finish_expiry_update
-        return 1
-    }
-    if [ -n "$ports_output" ]; then
-        mapfile -t active_ports <<< "$ports_output"
-    fi
-    local failed=false
-    reconcile_orphaned_expiry_rules >/dev/null 2>&1 || failed=true
-    local port
-    for port in "${active_ports[@]}"; do
-        sync_port_expiry_state "$port" >/dev/null 2>&1 || failed=true
-    done
-    finish_expiry_update
-    [ "$failed" = "false" ]
-}
-
-write_port_counter_rule_commands() {
-    local family="$1"
-    local table_name="$2"
-    local port="$3"
-    local input_counter="$4"
-    local output_counter="$5"
-    local multiplier="$6"
-    local copy
-    local protocol
-    local selector
-    # 端口组的每个成员都要有自己的一组规则，但它们共用同一个 counter，
-    # 因此统计与配额是按整个监控项汇总的。
-    while IFS= read -r selector; do
-        [ -n "$selector" ] || continue
-        for ((copy=0; copy<multiplier; copy++)); do
-            for protocol in tcp udp; do
-                printf 'insert rule %s %s input %s dport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$input_counter"
-                printf 'insert rule %s %s forward %s dport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$input_counter"
-                printf 'insert rule %s %s output %s sport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$output_counter"
-                printf 'insert rule %s %s forward %s sport %s counter name "%s"\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$output_counter"
-            done
-        done
-    done < <(port_selectors "$port")
-}
-
-write_port_quota_rule_commands() {
-    local family="$1"
-    local table_name="$2"
-    local port="$3"
-    local quota_name="$4"
-    local multiplier="$5"
-    local copy
-    local protocol
-    local selector
-    # 同计数器规则：端口组的每个成员各自一组配额规则，配额对象只有一个。
-    while IFS= read -r selector; do
-        [ -n "$selector" ] || continue
-        for ((copy=0; copy<multiplier; copy++)); do
-            for protocol in tcp udp; do
-                printf 'insert rule %s %s input %s dport %s quota name "%s" drop\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$quota_name"
-                printf 'insert rule %s %s forward %s dport %s quota name "%s" drop\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$quota_name"
-                printf 'insert rule %s %s output %s sport %s quota name "%s" drop\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$quota_name"
-                printf 'insert rule %s %s forward %s sport %s quota name "%s" drop\n' \
-                    "$family" "$table_name" "$protocol" "$selector" "$quota_name"
-            done
-        done
-    done < <(port_selectors "$port")
-}
-
-# 在单个 nft 事务中重建目标端口。旧 true/reset 参数也通过重建配额对象完成清零。
-rebuild_port_counter_objects() {
-    local port="$1"
-    local target_input="${2:-0}"
-    local target_output="${3:-0}"
-    local quota_action="${4:-false}"
-    [[ "$target_input" =~ ^[0-9]+$ ]] || return 1
-    [[ "$target_output" =~ ^[0-9]+$ ]] || return 1
-    case "$quota_action" in
-        false) quota_action="keep" ;;
-        true|reset) quota_action="rebuild" ;;
-        keep|rebuild) ;;
+    local active_state
+    active_state=$("$IP_GUARD_SYSTEMCTL" show "$IP_GUARD_SERVICE" \
+        --property=ActiveState --value 2>/dev/null) || return 1
+    case "$active_state" in
+        active|activating|reloading|deactivating) echo "active" ;;
+        inactive|failed) echo "inactive" ;;
         *) return 1 ;;
     esac
+}
 
-    local table_name
-    local family
-    local billing_mode
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    billing_mode=$(jq -r --arg port "$port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE")
-
-    local object_prefix
-    object_prefix=$(get_port_counter_prefix "$port")
-    local input_counter="${object_prefix}_in"
-    local output_counter="${object_prefix}_out"
-    local quota_name="${object_prefix}_quota"
-    local rules_json
-    local rebuild_batch
-    rules_json=$(mktemp "$CONFIG_DIR/.nft-rules.XXXXXX") || return 1
-    rebuild_batch=$(mktemp "$CONFIG_DIR/.nft-rebuild.XXXXXX") || {
-        rm -f "$rules_json"
-        return 1
-    }
-
-    if ! nft -j -a list table "$family" "$table_name" > "$rules_json" 2>/dev/null; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-
-    local input_exists=false
-    local output_exists=false
-    local quota_exists=false
-    jq -e --arg name "$input_counter" 'any(.nftables[]; .counter?.name? == $name)' \
-        "$rules_json" >/dev/null 2>&1 && input_exists=true
-    jq -e --arg name "$output_counter" 'any(.nftables[]; .counter?.name? == $name)' \
-        "$rules_json" >/dev/null 2>&1 && output_exists=true
-    jq -e --arg name "$quota_name" 'any(.nftables[]; .quota?.name? == $name)' \
-        "$rules_json" >/dev/null 2>&1 && quota_exists=true
-    if ! jq -r \
-            --arg family "$family" \
-            --arg table "$table_name" \
-            --arg input "$input_counter" \
-            --arg output "$output_counter" \
-            --arg quota "$quota_name" \
-            --arg quota_action "$quota_action" '
-            .nftables[] |
-            select(.rule != null and .rule.handle != null) |
-            .rule as $rule |
-            [
-                $rule.expr[]? | .counter? |
-                if type == "string" then .
-                elif type == "object" then (.name // empty)
-                else empty end
-            ] as $counters |
-            [
-                $rule.expr[]? | .quota? |
-                if type == "string" then .
-                elif type == "object" then (.name // empty)
-                else empty end
-            ] as $quotas |
-            select(
-                any($counters[]; . == $input or . == $output) or
-                ($quota_action != "keep" and any($quotas[]; . == $quota))
-            ) |
-            "delete rule \($family) \($table) \($rule.chain) handle \($rule.handle)"
-        ' "$rules_json" > "$rebuild_batch"; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-
-    local listed_rule_count
-    local actual_rule_count
-    listed_rule_count=$(wc -l < "$rebuild_batch" 2>/dev/null || echo 0)
-    actual_rule_count=$(( $(count_counter_rules "$port" in) + $(count_counter_rules "$port" out) ))
-    if [ "$quota_action" != "keep" ]; then
-        actual_rule_count=$((actual_rule_count + $(count_quota_rules "$port")))
-    fi
-    if [ "$listed_rule_count" -ne "$actual_rule_count" ]; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-
-    [ "$input_exists" = "true" ] &&
-        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$input_counter" >> "$rebuild_batch"
-    [ "$output_exists" = "true" ] &&
-        printf 'delete counter %s %s %s\n' "$family" "$table_name" "$output_counter" >> "$rebuild_batch"
-    if [ "$quota_action" = "rebuild" ] && [ "$quota_exists" = "true" ]; then
-        printf 'delete quota %s %s %s\n' "$family" "$table_name" "$quota_name" >> "$rebuild_batch"
-    fi
-    printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
-        "$family" "$table_name" "$input_counter" "$target_input" >> "$rebuild_batch"
-    printf 'add counter %s %s %s { packets 0 bytes %s }\n' \
-        "$family" "$table_name" "$output_counter" "$target_output" >> "$rebuild_batch"
-
-    local multiplier
-    multiplier=$(get_billing_rule_multiplier "$billing_mode")
-    write_port_counter_rule_commands \
-        "$family" "$table_name" "$port" "$input_counter" "$output_counter" "$multiplier" \
-        >> "$rebuild_batch"
-
-    local quota_required=false
-    if [ "$quota_action" = "rebuild" ]; then
-        local quota_enabled
-        local quota_limit
-        local quota_bytes
-        quota_enabled=$(jq -r --arg port "$port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE")
-        quota_limit=$(jq -r --arg port "$port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE")
-        if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
-            quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-            if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
-                rm -f "$rules_json" "$rebuild_batch"
-                return 1
-            fi
-            quota_required=true
-            printf 'add quota %s %s %s { over %s bytes used %s bytes }\n' \
-                "$family" "$table_name" "$quota_name" "$quota_bytes" \
-                "$((target_input + target_output))" >> "$rebuild_batch"
+restart_ip_guard_after_update() {
+    validate_ip_guard_script_file "$IP_GUARD_SCRIPT_PATH" || return 1
+    command -v "$IP_GUARD_SYSTEMCTL" >/dev/null 2>&1 || return 1
+    "$IP_GUARD_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || return 1
+    "$IP_GUARD_SYSTEMCTL" restart "$IP_GUARD_SERVICE" >/dev/null 2>&1 || return 1
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if "$IP_GUARD_SYSTEMCTL" is-active --quiet "$IP_GUARD_SERVICE" >/dev/null 2>&1 &&
+           bash "$IP_GUARD_SCRIPT_PATH" --self-check >/dev/null 2>&1; then
+            return 0
         fi
-    fi
-    if [ "$quota_required" = "true" ]; then
-        write_port_quota_rule_commands \
-            "$family" "$table_name" "$port" "$quota_name" "$multiplier" >> "$rebuild_batch"
-    fi
-
-    if ! nft -f "$rebuild_batch" >/dev/null 2>&1; then
-        rm -f "$rules_json" "$rebuild_batch"
-        return 1
-    fi
-    rm -f "$rules_json" "$rebuild_batch"
-
-    local expected_count
-    expected_count=$(get_expected_counter_rule_count "$billing_mode" "$port")
-    port_counter_objects_exist "$port" &&
-        [ "$(count_counter_rules "$port" in)" -eq "$expected_count" ] &&
-        [ "$(count_counter_rules "$port" out)" -eq "$expected_count" ] || return 1
-    if [ "$quota_action" != "keep" ]; then
-        local expected_quota_count=0
-        [ "$quota_required" = "true" ] && expected_quota_count=$(get_expected_quota_rule_count "$billing_mode" "$port")
-        [ "$(count_quota_rules "$port")" -eq "$expected_quota_count" ] || return 1
-    fi
-    return 0
-}
-
-# 重置端口 nftables 计数器和配额。
-reset_port_nftables_counters() {
-    local port="$1"
-    local table_name
-    local family
-    table_name=$(jq -r '.nftables.table_name' "$CONFIG_FILE")
-    family=$(jq -r '.nftables.family' "$CONFIG_FILE")
-    local object_prefix
-    object_prefix=$(get_port_counter_prefix "$port")
-    local input_counter="${object_prefix}_in"
-    local output_counter="${object_prefix}_out"
-    local quota_name="${object_prefix}_quota"
-    local quota_required=false
-    if [ "$(get_quota_enabled "$port")" = "true" ] && [ "$(get_quota_limit "$port")" != "unlimited" ]; then
-        quota_required=true
-    fi
-
-    if ! nft list counter "$family" "$table_name" "$input_counter" >/dev/null 2>&1 ||
-       ! nft list counter "$family" "$table_name" "$output_counter" >/dev/null 2>&1; then
-        log_notification "端口 $port 重置失败：流量 counter 对象缺失"
-        return 1
-    fi
-    if [ "$quota_required" = "true" ] &&
-       ! nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1; then
-        log_notification "端口 $port 重置失败：quota 对象缺失"
-        return 1
-    fi
-
-    # 与快照和灾备恢复共用锁，保证旧备份不能在重置窗口内重新写回 counter。
-    acquire_traffic_stats_lock || return 1
-    local reset_ok=true
-    if ! rebuild_port_counter_objects "$port" 0 0 "$quota_required"; then
-        reset_ok=false
-    elif ! update_traffic_snapshot_baseline_locked "$port" "preserve_today"; then
-        # 宁可丢弃灾备文件并由下一次快照重建，也不能保留重置前的旧计数。
-        rm -f "$TRAFFIC_DATA_FILE"
-        log_notification "端口 $port 已完成内核计数重置，但重置后基线写入失败，已丢弃旧灾备计数"
-    fi
-    release_traffic_stats_lock
-
-    if [ "$reset_ok" != "true" ]; then
-        log_notification "端口 $port 重置失败：nftables counter 原子重建事务未提交"
-        return 1
-    fi
-
-    if [ "$quota_required" = "true" ]; then
-        nft list quota "$family" "$table_name" "$quota_name" >/dev/null 2>&1 || return 1
-    fi
-    dog_log_event traffic_reset 0 "port=$port"
-}
-
-record_reset_history() {
-    local port=$1
-    local traffic_bytes=$2
-    local due_date="${3:-}"
-    local policy_instance_id="${4:-}"
-    local timestamp=$(get_beijing_time +%s)
-    local history_file="$CONFIG_DIR/reset_history.log"
-
-    mkdir -p "$(dirname "$history_file")"
-
-    printf '%s|%s|%s|%s|%s\n' \
-        "$timestamp" "$port" "$traffic_bytes" "$due_date" "$policy_instance_id" >> "$history_file" || return 1
-
-    # 至少保留一轮全部端口的多份记录，避免大量端口同日重置时淘汰幂等标记。
-    local port_count=0
-    local history_limit=1000
-    port_count=$(jq -r '.ports | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    [[ "$port_count" =~ ^[0-9]+$ ]] || port_count=0
-    if [ $((port_count * 4 + 100)) -gt "$history_limit" ]; then
-        history_limit=$((port_count * 4 + 100))
-    fi
-    local history_count=0
-    history_count=$(wc -l < "$history_file" 2>/dev/null || echo 0)
-    if [[ "$history_count" =~ ^[0-9]+$ ]] && [ "$history_count" -gt "$history_limit" ]; then
-        local history_tmp="${history_file}.tmp.$$"
-        if tail -n "$history_limit" "$history_file" > "$history_tmp" 2>/dev/null; then
-            mv "$history_tmp" "$history_file" 2>/dev/null || rm -f "$history_tmp"
-        else
-            rm -f "$history_tmp"
-        fi
-    fi
-}
-
-reset_history_has_due() {
-    local port="$1"
-    local due_date="$2"
-    local policy_instance_id="${3:-}"
-    local history_file="$CONFIG_DIR/reset_history.log"
-    [ -f "$history_file" ] || return 1
-    if [ "$#" -lt 3 ]; then
-        policy_instance_id=$(jq -r --arg port "$port" \
-            '.ports[$port].quota.reset_policy.instance_id // empty' "$CONFIG_FILE" 2>/dev/null) || return 2
-    fi
-    local match=""
-    if [ -n "$policy_instance_id" ]; then
-        match=$(awk -F'|' -v port="$port" -v due="$due_date" -v instance="$policy_instance_id" \
-            '$2 == port && $4 == due && $5 == instance { print "match"; exit }' "$history_file") || return 2
-    else
-        # 兼容旧配置及旧四列历史。
-        match=$(awk -F'|' -v port="$port" -v due="$due_date" \
-            '$2 == port && $4 == due { print "match"; exit }' "$history_file") || return 2
-    fi
-    [ "$match" = "match" ]
-}
-
-manage_configuration() {
-    echo -e "${BLUE}=== 配置文件管理 ===${NC}"
-    echo
-    echo "请选择操作:"
-    echo "1. 导出配置包"
-    echo "2. 导入配置包"
-    echo "0. 返回上级菜单"
-    echo
-    read -p "请输入选择 [0-2]: " choice
-
-    case $choice in
-        1) export_config ;;
-        2) import_config ;;
-        0) show_main_menu ;;
-        *) echo -e "${RED}无效选择，请输入0-2${NC}"; sleep 1; manage_configuration ;;
-    esac
-}
-
-export_config() {
-    echo -e "${BLUE}=== 导出配置包 ===${NC}"
-    echo
-
-    # 检查配置目录是否存在
-    if [ ! -d "$CONFIG_DIR" ]; then
-        echo -e "${RED}错误：配置目录不存在${NC}"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 生成时间戳文件名
-    local timestamp=$(get_beijing_time +%Y%m%d-%H%M%S)
-    local backup_name="port-traffic-dog-config-${timestamp}.tar.gz"
-    local backup_path="/root/${backup_name}"
-
-    echo "正在导出配置包..."
-    echo "包含内容："
-    echo "  - 主配置文件 (config.json)"
-    echo "  - 端口监控数据"
-    echo "  - 通知配置"
-    echo "  - 日志文件"
-    echo
-
-    # 打包前刷新自然日统计和内核计数备份，失败时不生成伪成功的旧数据包。
-    if has_active_ports &&
-       { ! record_traffic_snapshot >/dev/null 2>&1 || ! save_traffic_data >/dev/null 2>&1; }; then
-        echo -e "${RED}配置包导出失败：无法刷新当前流量数据，请稍后重试${NC}"
-        read -p "按回车键返回..."
-        manage_configuration
-        return 1
-    fi
-
-    # 创建临时目录用于打包
-    local temp_dir
-    temp_dir=$(mktemp -d) || {
-        echo -e "${RED}配置包导出失败：无法创建临时目录${NC}"
-        read -p "按回车键返回..."
-        manage_configuration
-        return
-    }
-    local package_dir="$temp_dir/port-traffic-dog-config"
-    local archive_temp
-    archive_temp=$(mktemp "/root/.${backup_name}.XXXXXX") || {
-        rm -rf "$temp_dir"
-        echo -e "${RED}配置包导出失败：无法创建临时归档${NC}"
-        read -p "按回车键返回..."
-        manage_configuration
-        return
-    }
-    local export_ok=true
-
-    # 复制配置目录到临时位置
-    if ! cp -r "$CONFIG_DIR" "$package_dir"; then
-        export_ok=false
-    fi
-    if [ "$export_ok" = "true" ]; then
-        rm -rf "$package_dir/config.lock" "$package_dir/traffic_stats.lock" "$package_dir/reset.lock"
-    fi
-
-    # 生成端口流量狗配置包信息文件
-    if [ "$export_ok" = "true" ] && ! cat > "$package_dir/package_info.txt" << EOF
-===================
-导出时间: $(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-脚本版本: $SCRIPT_VERSION
-配置目录: $CONFIG_DIR
-导出主机: $(hostname)
-包含端口: $(jq -r '.ports | keys | join(", ")' "$CONFIG_FILE" 2>/dev/null || echo "无")
-EOF
-    then
-        export_ok=false
-    fi
-
-    # 打包配置
-    if [ "$export_ok" = "true" ] &&
-       tar -czf "$archive_temp" -C "$temp_dir" port-traffic-dog-config/ 2>/dev/null &&
-       tar -tzf "$archive_temp" >/dev/null 2>&1 &&
-       chmod 600 "$archive_temp" && mv "$archive_temp" "$backup_path"; then
-        export_ok=true
-    else
-        export_ok=false
-    fi
-
-    # 清理临时目录
-    rm -rf "$temp_dir"
-    rm -f "$archive_temp" 2>/dev/null || true
-
-    if [ "$export_ok" = "true" ]; then
-        local file_size=$(du -h "$backup_path" | cut -f1)
-        echo -e "${GREEN}配置包导出成功${NC}"
-        dog_log_event export_config 0
-        echo
-        echo "文件信息："
-        echo "  文件名: $backup_name"
-        echo "  路径: $backup_path"
-        echo "  大小: $file_size"
-    else
-        echo -e "${RED}配置包导出失败${NC}"
-        dog_log_event export_config 1
-    fi
-
-    echo
-    read -p "按回车键返回..."
-    manage_configuration
-}
-
-# 导入配置包
-import_config() {
-    echo -e "${BLUE}=== 导入配置包 ===${NC}"
-    echo
-
-    echo "请输入配置包路径 (支持绝对路径或相对路径):"
-    echo "例如: /root/port-traffic-dog-config-20241227-143022.tar.gz"
-    echo
-    read -p "配置包路径: " package_path
-
-    # 检查输入是否为空
-    if [ -z "$package_path" ]; then
-        echo -e "${RED}错误：路径不能为空${NC}"
-        sleep 2
-        import_config
-        return
-    fi
-
-    # 检查文件是否存在
-    if [ ! -f "$package_path" ]; then
-        echo -e "${RED}错误：配置包文件不存在${NC}"
-        echo "路径: $package_path"
-        sleep 2
-        import_config
-        return
-    fi
-    package_path=$(realpath "$package_path")
-
-    # 检查文件格式
-    if [[ ! "$package_path" =~ \.tar\.gz$ ]]; then
-        echo -e "${RED}错误：配置包必须是 .tar.gz 格式${NC}"
-        sleep 2
-        import_config
-        return
-    fi
-
-    echo
-    echo "正在验证配置包..."
-
-    # 创建临时目录用于解压验证
-    local temp_dir
-    if ! temp_dir=$(mktemp -d); then
-        echo -e "${RED}错误：无法创建配置包验证临时目录${NC}"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 解压到临时目录进行验证
-    if ! tar -tzf "$package_path" >/dev/null 2>&1; then
-        echo -e "${RED}错误：配置包文件损坏或格式错误${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-
-    if tar -tzf "$package_path" | awk '
-        /^\// || /(^|\/)\.\.(\/|$)/ || !/^port-traffic-dog-config(\/|$)/ { bad=1 }
-        END { exit bad ? 0 : 1 }
-    '; then
-        echo -e "${RED}错误：配置包包含不安全或异常路径${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-
-    if tar -tvzf "$package_path" | awk 'substr($1, 1, 1) !~ /^[-d]$/ { found=1 } END { exit found ? 0 : 1 }'; then
-        echo -e "${RED}错误：配置包只能包含普通文件和目录${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-
-    # 即使 tar 已写出部分文件，只要解压返回失败就不得进入锁和运行态修改阶段。
-    if ! tar -xzf "$package_path" -C "$temp_dir" 2>/dev/null; then
-        echo -e "${RED}错误：配置包解压失败，当前配置未作修改${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 验证配置包结构
-    local config_dir_name="port-traffic-dog-config"
-    if [ ! -d "$temp_dir/$config_dir_name" ]; then
-        echo -e "${RED}错误：配置包结构异常${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-
-    local extracted_config="$temp_dir/$config_dir_name"
-
-    # 检查必要文件
-    if [ ! -f "$extracted_config/config.json" ]; then
-        echo -e "${RED}错误：配置包中缺少 config.json 文件${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-    if ! jq empty "$extracted_config/config.json" >/dev/null 2>&1; then
-        echo -e "${RED}错误：配置包中的 config.json 不是有效 JSON${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-    if ! validate_config_file "$extracted_config/config.json"; then
-        echo -e "${RED}错误：配置包中的端口、配额、限速或重置策略无效${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        import_config
-        return
-    fi
-
-    # 显示端口流量狗配置包信息
-    echo -e "${GREEN}配置包验证通过${NC}"
-    echo
-
-    if [ -f "$extracted_config/package_info.txt" ]; then
-        echo -e "${GREEN}端口流量狗配置包信息：${NC}"
-        cat "$extracted_config/package_info.txt"
-        echo
-    fi
-
-    # 显示将要导入的端口
-    local import_ports=$(jq -r '.ports | keys | join(", ")' "$extracted_config/config.json" 2>/dev/null || echo "无")
-    echo "包含端口: $import_ports"
-    echo
-
-    # 确认导入
-    echo -e "${YELLOW}警告：导入配置将会：${NC}"
-    echo "  1. 停止当前所有端口监控"
-    echo "  2. 替换为新的配置"
-    echo "  3. 重新应用监控规则"
-    echo
-    read -p "确认导入配置包? [y/N]: " confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "取消导入"
-        rm -rf "$temp_dir"
         sleep 1
-        manage_configuration
-        return
-    fi
-
-    echo
-    echo "开始导入配置..."
-
-    if ! begin_expiry_update; then
-        echo -e "${RED}错误：到期规则正在被其他任务修改，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    if ! begin_reset_update; then
-        finish_expiry_update
-        echo -e "${RED}错误：流量重置任务正在修改配置，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    # 全局顺序固定为 TC -> cron -> traffic stats -> config；普通限速和 cron
-    # 路径也按此前缀取锁，避免维护事务与后台任务反向等待。
-    if ! begin_tc_update; then
-        finish_reset_update
-        finish_expiry_update
-        echo -e "${RED}错误：TC 层级正在被其他任务修改，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    if ! begin_cron_update; then
-        finish_tc_update
-        finish_reset_update
-        finish_expiry_update
-        echo -e "${RED}错误：root crontab 正在被其他 Dog 任务修改，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    if ! acquire_traffic_stats_lock; then
-        release_cron_update
-        finish_tc_update
-        finish_reset_update
-        finish_expiry_update
-        echo -e "${RED}错误：流量统计正在被其他任务更新，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    if ! acquire_config_lock; then
-        release_traffic_stats_lock
-        release_cron_update
-        finish_tc_update
-        finish_reset_update
-        finish_expiry_update
-        echo -e "${RED}错误：配置正在被其他任务修改，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 在停止旧规则前保存最新内核计数，供失败回滚使用。
-    record_traffic_snapshot >/dev/null 2>&1 || true
-    if has_active_ports && ! save_traffic_data; then
-        finish_full_maintenance_update
-        echo -e "${RED}错误：无法保存当前流量计数，已停止导入${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 1. 停止当前监控
-    echo "正在停止当前端口监控..."
-    local current_ports=()
-    mapfile -t current_ports < <(get_active_ports 2>/dev/null || true)
-    local old_cleanup_ok=true
-    for port in "${current_ports[@]}"; do
-        remove_port_expiry_rules "$port" 2>/dev/null || old_cleanup_ok=false
-        remove_nftables_quota "$port" 2>/dev/null || old_cleanup_ok=false
-        remove_nftables_rules "$port" 2>/dev/null || old_cleanup_ok=false
-        remove_tc_limit "$port" 2>/dev/null || old_cleanup_ok=false
-    done
-    if [ "$old_cleanup_ok" != "true" ]; then
-        local old_restore_ok=true
-        restore_runtime_state >/dev/null 2>&1 || old_restore_ok=false
-        refresh_all_cron_from_config >/dev/null 2>&1 || old_restore_ok=false
-        finish_full_maintenance_update
-        if [ "$old_restore_ok" = "true" ]; then
-            echo -e "${RED}错误：旧运行规则无法安全清理，已恢复原监控并停止导入${NC}"
-        else
-            echo -e "${RED}错误：旧运行规则清理失败且恢复不完整，请立即运行 dog --self-check${NC}"
-        fi
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    # 2. 替换配置；保留同文件系统备份，复制失败时可立即恢复。
-    echo "正在导入新配置..."
-    local previous_config_dir="${CONFIG_DIR}.import-backup.$$"
-    rm -rf "$previous_config_dir" 2>/dev/null || true
-    if [ -d "$CONFIG_DIR" ] && ! mv "$CONFIG_DIR" "$previous_config_dir"; then
-        restore_runtime_state >/dev/null 2>&1 || true
-        refresh_all_cron_from_config >/dev/null 2>&1 || true
-        finish_full_maintenance_update
-        echo -e "${RED}错误：无法备份当前配置，已停止导入并恢复原监控${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    if ! cp -r "$extracted_config" "$CONFIG_DIR"; then
-        rm -rf "$CONFIG_DIR" 2>/dev/null || true
-        if [ -d "$previous_config_dir" ]; then
-            mv "$previous_config_dir" "$CONFIG_DIR" 2>/dev/null || true
-            restore_runtime_state >/dev/null 2>&1 || true
-            refresh_all_cron_from_config >/dev/null 2>&1 || true
-        fi
-        finish_full_maintenance_update
-        echo -e "${RED}错误：复制新配置失败，已恢复原配置${NC}"
-        rm -rf "$temp_dir"
-        sleep 2
-        manage_configuration
-        return
-    fi
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-
-    # 3. 重新应用规则；任一步失败都回滚旧配置和旧运行状态。
-    echo "正在重新应用监控规则..."
-    local new_ports=()
-    mapfile -t new_ports < <(get_active_ports 2>/dev/null || true)
-    local import_ok=true
-    if ! validate_config_file "$CONFIG_FILE" >/dev/null ||
-       ! restore_runtime_state ||
-       ! refresh_all_cron_from_config; then
-        import_ok=false
-    fi
-
-    if [ "$import_ok" != "true" ]; then
-        local new_cleanup_ok=true
-        for port in "${new_ports[@]}"; do
-            remove_tc_limit "$port" >/dev/null 2>&1 || new_cleanup_ok=false
-            remove_port_expiry_rules "$port" >/dev/null 2>&1 || new_cleanup_ok=false
-            remove_nftables_quota "$port" >/dev/null 2>&1 || new_cleanup_ok=false
-            remove_nftables_rules "$port" >/dev/null 2>&1 || new_cleanup_ok=false
-        done
-        if [ "$new_cleanup_ok" != "true" ]; then
-            finish_full_maintenance_update
-            rm -rf "$temp_dir"
-            echo -e "${RED}配置导入失败，且新规则无法安全清理；已保留当前配置与旧备份 $previous_config_dir${NC}"
-            echo -e "${RED}请立即运行 dog --self-check，不要手动删除备份目录。${NC}"
-            sleep 2
-            manage_configuration
-            return
-        fi
-        rm -rf "$CONFIG_DIR" 2>/dev/null || true
-        local rollback_ok=true
-        if [ -d "$previous_config_dir" ]; then
-            mv "$previous_config_dir" "$CONFIG_DIR" || rollback_ok=false
-        else
-            rollback_ok=false
-        fi
-        if [ "$rollback_ok" = "true" ]; then
-            restore_runtime_state >/dev/null 2>&1 || rollback_ok=false
-            refresh_all_cron_from_config >/dev/null 2>&1 || rollback_ok=false
-        fi
-        rm -rf "$temp_dir"
-        finish_full_maintenance_update
-        if [ "$rollback_ok" = "true" ]; then
-            echo -e "${RED}配置导入失败，已恢复导入前的配置与监控状态${NC}"
-        else
-            echo -e "${RED}配置导入失败，自动回滚未完整成功；旧备份保留在 $previous_config_dir${NC}"
-        fi
-        dog_log_event import_config 1
-        sleep 2
-        manage_configuration
-        return
-    fi
-
-    rm -rf "$previous_config_dir" 2>/dev/null || true
-    rm -rf "$temp_dir"
-    finish_full_maintenance_update
-
-    echo "正在更新通知模块..."
-    download_notification_modules >/dev/null 2>&1 || true
-
-    echo
-    echo -e "${GREEN}配置导入完成${NC}"
-    dog_log_event import_config 0
-    echo
-    echo "导入结果："
-    echo "  导入端口数: ${#new_ports[@]} 个"
-    if [ ${#new_ports[@]} -gt 0 ]; then
-        echo "  端口列表: $(IFS=','; echo "${new_ports[*]}")"
-    fi
-    echo
-    echo -e "${YELLOW}提示：${NC}"
-    echo "  - 所有端口监控规则已重新应用"
-    echo "  - 通知配置已恢复"
-    echo "  - 历史数据已恢复"
-
-    echo
-    read -p "按回车键返回..."
-    manage_configuration
-}
-
-# 统一下载函数
-download_with_sources() {
-    local url=$1
-    local output_file=$2
-
-    if curl -fsSL --connect-timeout "$SHORT_CONNECT_TIMEOUT" --max-time "$SHORT_MAX_TIMEOUT" "$url" -o "$output_file" 2>/dev/null; then
-        if [ -s "$output_file" ]; then
-            echo -e "${GREEN}下载成功${NC}"
-            return 0
-        fi
-    fi
-
-    echo -e "${RED}下载失败${NC}"
-    return 1
-}
-
-get_script_version_from_file() {
-    local script_file="$1"
-    [ -f "$script_file" ] || return 1
-    awk -F'"' '/^readonly SCRIPT_VERSION="[0-9]+(\.[0-9]+)+"/ { print $2; exit }' "$script_file"
-}
-
-script_version_is_valid() {
-    [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
-}
-
-script_version_is_older() {
-    local candidate="$1"
-    local current="$2"
-    script_version_is_valid "$candidate" || return 2
-    script_version_is_valid "$current" || return 2
-
-    local candidate_parts=()
-    local current_parts=()
-    local IFS='.'
-    read -r -a candidate_parts <<< "$candidate"
-    read -r -a current_parts <<< "$current"
-
-    local index
-    for index in 0 1 2; do
-        local candidate_part=${candidate_parts[$index]:-0}
-        local current_part=${current_parts[$index]:-0}
-        if ((10#$candidate_part < 10#$current_part)); then
-            return 0
-        fi
-        if ((10#$candidate_part > 10#$current_part)); then
-            return 1
-        fi
     done
     return 1
 }
 
-# 下载通知模块
-download_notification_modules() {
-    local sync_mode="${1:-fill_missing}"
-    local notifications_dir="$CONFIG_DIR/notifications"
-    local temp_dir=$(mktemp -d)
+ensure_ip_guard_script() {
+    if validate_ip_guard_script_file "$IP_GUARD_SCRIPT_PATH"; then
+        chmod 755 "$IP_GUARD_SCRIPT_PATH" 2>/dev/null || true
+        return 0
+    fi
+
     local script_dir
-    script_dir=$(dirname "$(get_script_exec_path)")
+    local bundled_script
+    script_dir=$(dirname "$SCRIPT_PATH")
+    bundled_script="$script_dir/port-ip-guard.sh"
+    if validate_ip_guard_script_file "$bundled_script"; then
+        install_ip_guard_script_file "$bundled_script"
+        return $?
+    fi
 
-    mkdir -p "$notifications_dir"
+    local tmp rc=0
+    tmp=$(mktemp -d) || return 1
+    if download_url "$(release_asset_url SHA256SUMS)" "$tmp/SHA256SUMS" &&
+       release_download_verified port-ip-guard.sh "$tmp/port-ip-guard.sh" "$tmp/SHA256SUMS" &&
+       validate_ip_guard_script_file "$tmp/port-ip-guard.sh"; then
+        install_ip_guard_script_file "$tmp/port-ip-guard.sh" || rc=1
+    else
+        rc=1
+    fi
+    rm -rf "$tmp"
+    return "$rc"
+}
 
-    # 优先使用主脚本同目录下的通知模块
-    for local_module in "$script_dir"/telegram.sh "$script_dir"/wecom.sh; do
-        [ -f "$local_module" ] || continue
-
-        local module_name=$(basename "$local_module")
-        local target_file="$notifications_dir/$module_name"
-
-        if [ "$sync_mode" = "force" ] || [ ! -f "$target_file" ]; then
-            cp "$local_module" "$target_file"
-        fi
-    done
-
-    if [ "$sync_mode" != "force" ] && [ -f "$notifications_dir/telegram.sh" ] && [ -f "$notifications_dir/wecom.sh" ]; then
-        chmod +x "$notifications_dir"/*.sh 2>/dev/null || true
-        rm -rf "$temp_dir"
+manage_ip_guard() {
+    menu_clear
+    echo -e "${BLUE}=== 在线 IP / 并发连接限制（测试中） ===${NC}"
+    echo -e "${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
+    echo "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
+    echo "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
+    echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
+    echo
+    if ! dependency_install_missing false all; then
+        echo '依赖未就绪；可在主菜单“依赖管理”中安装。未启用新的防火墙限制。' >&2
+        read -r -p '按回车返回主菜单...' || return 0
         return 0
     fi
+    if ! ensure_ip_guard_script; then
+        echo -e "${RED}独立组件下载或校验失败，未修改防火墙。${NC}"
+    elif ! bash "$IP_GUARD_SCRIPT_PATH"; then
+        echo -e "${RED}在线 IP / 并发连接限制组件执行失败。${NC}"
+    fi
+    echo
+    pause
+}
 
-    # 下载解压后同步通知模块：默认只补齐缺失；force 模式覆盖同步
-    local archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"
-    if download_with_sources "$archive_url" "$temp_dir/repo.zip" &&
-       (cd "$temp_dir" && unzip -q repo.zip); then
-        local extracted_root=""
-        local d
-        for d in "$temp_dir"/*; do
-            [ -d "$d" ] || continue
-            if [ "$(basename "$d")" != "." ] && [ "$(basename "$d")" != ".." ]; then
-                extracted_root="$d"
-                break
-            fi
-        done
+# ── 状态报告与通知（Telegram / 企业微信，已内置，不再下载外部模块） ──
+# 关键约束：读数失败时绝不发送“空报告”。要么发送完整报告，要么发送带原因的告警并返回非零。
 
-        if [ -z "$extracted_root" ]; then
-            rm -rf "$temp_dir"
-            return 1
+readonly NOTIFY_RETRIES=2
+readonly NOTIFY_CONNECT_TIMEOUT=10
+readonly NOTIFY_MAX_TIME=30
+
+monitor_status_tags() {
+    local id="$1" tags="" remark mode limit label exp rate
+    remark=$(mget "$id" .remark "")
+    [ -n "$remark" ] && tags+="[备注:${remark}]"
+    mode=$(mget "$id" .billing_mode double)
+    limit=$(mget "$id" .quota.monthly_limit unlimited)
+    [ "$(mget "$id" .quota.enabled false)" = "true" ] || limit=unlimited
+    if [ "$limit" != "unlimited" ]; then
+        if [ "$mode" = "single" ]; then tags+="[单向${limit}]"; else tags+="[双向${limit}]"; fi
+    else
+        if [ "$mode" = "single" ]; then tags+="[单向计费]"; else tags+="[双向计费]"; fi
+    fi
+    label=$(monitor_reset_label "$id" 2>/dev/null) && tags+="[${label}]"
+    exp=$(monitor_expiry_label "$id" 2>/dev/null) && tags+="[${exp}]"
+    rate=$(monitor_tc_rate "$id" 2>/dev/null) && tags+="[限速:${rate}]"
+    printf '%s' "$tags"
+}
+
+build_usage_progress_bar() {
+    local percent="${1:-0}" width=20 filled i bar=""
+    [ "$percent" -gt 100 ] && percent=100
+    filled=$((percent * width / 100))
+    for ((i = 0; i < width; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi
+    done
+    printf '%s' "$bar"
+}
+
+# 生成状态报告正文。读数失败时输出告警正文并返回 2。
+build_status_report() {
+    local server="${1:-$(hostname)}" now values total=0 count=0 body="" id idx=0
+    local in_b out_b mult billed_in billed_out billed ports limit lbytes pct
+    now=$(beijing_date '+%Y-%m-%d %H:%M:%S')
+    count=$(monitor_ids | grep -c . || true)
+    if ! nft_available; then
+        printf '⚠️ 服务器: %s | ⏰ %s\n流量读取失败：找不到 nft 命令（PATH=%s）\n请登录服务器运行 dog --self-check\n' "$server" "$now" "$PATH"
+        return 2
+    fi
+    if ! nft_table_exists; then
+        printf '⚠️ 服务器: %s | ⏰ %s\n流量读取失败：nftables 表 %s 不存在（规则可能被清空或重启后未恢复）\n请运行 dog --repair\n' "$server" "$now" "$NFT_TABLE"
+        return 2
+    fi
+    values=$(nft_read_values)
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        if ! jq -e --arg id "$id" 'has($id)' <<< "$values" >/dev/null; then
+            printf '⚠️ 服务器: %s | ⏰ %s\n流量读取失败：监控项 %s 的计数器缺失\n请运行 dog --repair\n' "$server" "$now" "$id"
+            return 2
         fi
-
-        local remote_telegram=""
-        local remote_wecom=""
-        if [ -f "$extracted_root/notifications/telegram.sh" ]; then
-            remote_telegram="$extracted_root/notifications/telegram.sh"
-        elif [ -f "$extracted_root/telegram.sh" ]; then
-            remote_telegram="$extracted_root/telegram.sh"
+        idx=$((idx + 1))
+        read -r in_b out_b < <(jq -r --arg id "$id" '.[$id] | "\(.in) \(.out)"' <<< "$values")
+        mult=$(monitor_billing_multiplier "$id")
+        billed_in=$((in_b * mult)); billed_out=$((out_b * mult)); billed=$((billed_in + billed_out))
+        total=$((total + billed))
+        ports=$(monitor_ports_csv "$id")
+        [ -n "$body" ] && body+=$'\n\n'
+        body+="${idx}. [${id}]$(monitor_status_tags "$id") | 端口:${ports}"$'\n'
+        body+="总流量:$(format_bytes "$billed") | 入站(下载):$(format_bytes "$billed_in") | 出站(上传):$(format_bytes "$billed_out")"
+        limit=$(mget "$id" .quota.monthly_limit unlimited)
+        if [ "$(mget "$id" .quota.enabled false)" = "true" ] && [ "$limit" != "unlimited" ] &&
+           lbytes=$(parse_size_to_bytes "$limit") && [ "$lbytes" -gt 0 ]; then
+            pct=$((billed * 100 / lbytes))
+            body+=$'\n'"$(format_bytes "$billed")/${limit} | ${pct}%$([ "$pct" -ge 100 ] && echo ' (超限)') | $(monitor_cycle_range "$id")"
+            body+=$'\n'"[$(build_usage_progress_bar "$pct")]"
         fi
-        if [ -f "$extracted_root/notifications/wecom.sh" ]; then
-            remote_wecom="$extracted_root/notifications/wecom.sh"
-        elif [ -f "$extracted_root/wecom.sh" ]; then
-            remote_wecom="$extracted_root/wecom.sh"
-        fi
+    done < <(monitor_ids)
+    printf '🔗 服务器: %s | ⏰ %s\n' "$server" "$now"
+    printf '────────────────────────────────────────\n'
+    printf '状态: 监控中 | 监控项: %s个 | 周期总流量: %s\n' "$count" "$(format_bytes "$total")"
+    printf '────────────────────────────────────────\n'
+    printf '%s\n' "$body"
+}
 
-        local module_file
-        for module_file in "$remote_telegram" "$remote_wecom"; do
-            [ -n "$module_file" ] || continue
-            [ -f "$module_file" ] || continue
+# 按行截断到不超过 max_bytes 字节，不会切断多字节字符。
+truncate_lines_bytes() {
+    local max="$1"
+    LC_ALL=C awk -v max="$max" 'BEGIN { n = 0 }
+        { len = length($0) + 1 }
+        n + len > max { print "[消息过长，已截断]"; exit }
+        { print; n += len }'
+}
 
-            local module_name
-            module_name=$(basename "$module_file")
-            local target_file="$notifications_dir/$module_name"
+# ── Telegram ──
 
-            if [ "$sync_mode" = "force" ] || [ ! -f "$target_file" ]; then
-                cp "$module_file" "$target_file"
-            fi
-        done
+telegram_api_base() {
+    local route base
+    route=$(cfg '.notifications.telegram.api_route // "official"')
+    if [ "$route" != "custom" ]; then echo "https://api.telegram.org"; return 0; fi
+    base=$(cfg '.notifications.telegram.custom_api_base // ""' | tr -d ' ')
+    base="${base%/}"
+    [[ "$base" =~ ^https:// ]] || [[ "$base" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]] || return 1
+    echo "$base"
+}
 
-        if [ -f "$notifications_dir/telegram.sh" ] && [ -f "$notifications_dir/wecom.sh" ]; then
-            chmod +x "$notifications_dir"/*.sh 2>/dev/null || true
-            rm -rf "$temp_dir"
+telegram_send() {
+    local text="$1" token chat base url resp rc attempt=0 masked
+    token=$(cfg '.notifications.telegram.bot_token // ""')
+    chat=$(cfg '.notifications.telegram.chat_id // ""')
+    if [ -z "$token" ] || [ -z "$chat" ]; then log_notification "Telegram 配置不完整"; return 1; fi
+    base=$(telegram_api_base) || { log_notification "Telegram 自定义线路无效（必须是 https://，http 仅限本机回环）"; return 1; }
+    if [[ "$base" =~ /bot$ ]]; then url="${base}${token}/sendMessage"; else url="${base}/bot${token}/sendMessage"; fi
+    masked="${url//$token/${token:0:6}***}"
+    text=$(printf '%s\n' "$text" | truncate_lines_bytes 3900)
+    while [ "$attempt" -le "$NOTIFY_RETRIES" ]; do
+        rc=0
+        # URL（含 token）经 -K - 从标准输入传给 curl，不出现在进程参数里。
+        resp=$(printf 'url = "%s"\n' "$url" | curl -sS -K - --connect-timeout "$NOTIFY_CONNECT_TIMEOUT" \
+            --max-time "$NOTIFY_MAX_TIME" --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" 2>&1) || rc=$?
+        if [ "$rc" -eq 0 ] && jq -e '.ok == true' <<< "$resp" >/dev/null 2>&1; then
+            log_notification "Telegram 发送成功（$masked）"
             return 0
         fi
-    fi
-
-    rm -rf "$temp_dir"
+        local migrated
+        migrated=$(jq -r '.parameters.migrate_to_chat_id // empty' <<< "$resp" 2>/dev/null || true)
+        if [ -n "$migrated" ] && [ "$migrated" != "$chat" ]; then
+            chat="$migrated"
+            config_update '.notifications.telegram.chat_id = $c' --arg c "$migrated" || true
+            log_notification "Telegram 群已升级为超级群，chat_id 已更新为 $migrated"
+            continue
+        fi
+        log_notification "Telegram 发送失败（curl=$rc，$masked）：$(tr '\n' ' ' <<< "$resp" | cut -c1-200)"
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$NOTIFY_RETRIES" ] && sleep 2
+    done
     return 1
 }
 
-finalize_script_update() {
-    echo -e "${YELLOW}[1/3] 初始化并迁移现有配置...${NC}"
-    check_dependencies true all || return 1
-    if ! init_config; then
-        echo -e "${RED}新版本配置初始化失败${NC}"
-        return 1
-    fi
-    if ! install_tc_recovery_service_files; then
-        echo -e "${YELLOW}共享 TC 恢复入口安装失败；不影响现有监控，但自动恢复暂不可用。${NC}"
-    fi
+# ── 企业微信 ──
 
-    echo -e "${YELLOW}[2/3] 刷新定时任务...${NC}"
-    if ! refresh_all_cron_from_config; then
-        echo -e "${RED}新版本定时任务刷新失败${NC}"
-        return 1
-    fi
-
-    echo -e "${YELLOW}[3/3] 校验并恢复流量与限速状态...${NC}"
-    if ! restore_runtime_state; then
-        echo -e "${RED}新版本流量或限速状态恢复失败${NC}"
-        return 1
-    fi
-
-    echo -e "${GREEN}新版本维护步骤完成${NC}"
-}
-
-# 安装(更新)脚本
-install_update_script() {
-    local reload_after_update="${1:-true}"
-    local local_source="${2:-}"
-    local component
-    if [ -n "$local_source" ]; then
-        for component in port-traffic-dog.sh port-ip-guard.sh telegram.sh wecom.sh; do
-            if [ ! -f "$local_source/$component" ]; then
-                echo "本地安装包不完整: $component" >&2
-                return 1
-            fi
-        done
-    fi
-    echo -e "${BLUE}安装依赖(更新)脚本${NC}"
-    echo "────────────────────────────────────────────────────────"
-
-    echo -e "${YELLOW}正在检查系统依赖...${NC}"
-    check_dependencies true all || return 1
-    init_config || return 1
-    record_traffic_snapshot >/dev/null 2>&1 || true
-    if has_active_ports && ! save_traffic_data; then
-        echo -e "${RED}无法保存当前流量计数，已停止更新${NC}"
-        return 1
-    fi
-
-    echo -e "${YELLOW}正在下载最新版本...${NC}"
-
-    local temp_dir
-    temp_dir=$(mktemp -d) || return 1
-    local new_script=""
-    local archive="$temp_dir/repo.zip"
-    local extracted_root=""
-    local new_telegram=""
-    local new_wecom=""
-    local new_ip_guard=""
-    local archive_url="${MODULES_ARCHIVE_URL}?cache_bust=$(date +%s)"
-
-    if [ -n "$local_source" ]; then
-        if ! mkdir "$temp_dir/local-bundle" ||
-           ! cp "$local_source/port-traffic-dog.sh" "$local_source/port-ip-guard.sh" \
-                "$local_source/telegram.sh" "$local_source/wecom.sh" "$temp_dir/local-bundle/"; then
-            rm -rf "$temp_dir"
-            return 1
+wecom_send() {
+    local text="$1" hook payload resp rc attempt=0
+    hook=$(cfg '.notifications.wecom.webhook_url // ""')
+    [ -n "$hook" ] || { log_notification "企业微信 Webhook 未配置"; return 1; }
+    [[ "$hook" =~ ^https:// ]] || { log_notification "企业微信 Webhook 必须使用 https://"; return 1; }
+    text=$(printf '%s\n' "$text" | truncate_lines_bytes 2000)
+    payload=$(jq -cn --arg c "$text" '{msgtype: "text", text: {content: $c}}')
+    while [ "$attempt" -le "$NOTIFY_RETRIES" ]; do
+        rc=0
+        resp=$(printf 'url = "%s"\n' "$hook" | curl -sS -K - --connect-timeout "$NOTIFY_CONNECT_TIMEOUT" \
+            --max-time "$NOTIFY_MAX_TIME" -H 'Content-Type: application/json' -d "$payload" 2>&1) || rc=$?
+        if [ "$rc" -eq 0 ] && jq -e '.errcode == 0' <<< "$resp" >/dev/null 2>&1; then
+            log_notification "企业微信发送成功"
+            return 0
         fi
-    elif ! download_with_sources "$archive_url" "$archive" ||
-         ! (cd "$temp_dir" && unzip -q "$archive"); then
-        echo -e "${RED}下载或解压失败，已保留当前版本${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-
-    local directory
-    for directory in "$temp_dir"/*; do
-        [ -d "$directory" ] || continue
-        extracted_root="$directory"
-        break
+        log_notification "企业微信发送失败（curl=$rc）：$(tr '\n' ' ' <<< "$resp" | cut -c1-200)"
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$NOTIFY_RETRIES" ] && sleep 2
     done
-    if [ -n "$extracted_root" ]; then
-        [ -f "$extracted_root/port-traffic-dog.sh" ] &&
-            new_script="$extracted_root/port-traffic-dog.sh"
-        [ -f "$extracted_root/notifications/telegram.sh" ] &&
-            new_telegram="$extracted_root/notifications/telegram.sh"
-        [ -f "$extracted_root/telegram.sh" ] && new_telegram="$extracted_root/telegram.sh"
-        [ -f "$extracted_root/notifications/wecom.sh" ] &&
-            new_wecom="$extracted_root/notifications/wecom.sh"
-        [ -f "$extracted_root/wecom.sh" ] && new_wecom="$extracted_root/wecom.sh"
-        [ -f "$extracted_root/port-ip-guard.sh" ] &&
-            new_ip_guard="$extracted_root/port-ip-guard.sh"
-    fi
-
-    local downloaded_version=""
-    downloaded_version=$(get_script_version_from_file "$new_script" 2>/dev/null || true)
-
-    if [ ! -s "$new_script" ] || [ -z "$new_telegram" ] || [ -z "$new_wecom" ] ||
-       [ -z "$new_ip_guard" ] ||
-       ! script_version_is_valid "$downloaded_version" ||
-       ! grep -q "端口流量狗" "$new_script" 2>/dev/null ||
-       ! validate_ip_guard_script_file "$new_ip_guard" ||
-       ! bash -n "$new_script" || ! bash -n "$new_telegram" || ! bash -n "$new_wecom" ||
-       ! bash "$new_script" --validate-config "$CONFIG_FILE" >/dev/null; then
-        echo -e "${RED}下载文件、脚本语法或当前配置验证失败，已保留当前版本${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    if script_version_is_older "$downloaded_version" "$SCRIPT_VERSION"; then
-        echo -e "${RED}下载版本 v$downloaded_version 早于当前版本 v$SCRIPT_VERSION，已拒绝降级${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    local ip_guard_service_state
-    if ! ip_guard_service_state=$(get_ip_guard_service_state); then
-        echo -e "${RED}无法确认测试中来源 IP 限制服务的运行状态，已停止更新${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    local ip_guard_was_active=false
-    [ "$ip_guard_service_state" = "active" ] && ip_guard_was_active=true
-    echo -e "${BLUE}版本: v$SCRIPT_VERSION -> v$downloaded_version${NC}"
-
-    local backup_dir="$temp_dir/backup"
-    local notifications_dir="$CONFIG_DIR/notifications"
-    local shortcut_path="$SHORTCUT_PATH"
-    local had_installed_script=false
-    local had_shortcut=false
-    local had_config_dir=false
-    [ -f "$INSTALLED_SCRIPT_PATH" ] && had_installed_script=true
-    [ -f "$shortcut_path" ] && had_shortcut=true
-    [ -d "$CONFIG_DIR" ] && had_config_dir=true
-    if ! mkdir -p "$backup_dir" ||
-       { [ "$had_installed_script" = "true" ] &&
-         ! cp -a "$INSTALLED_SCRIPT_PATH" "$backup_dir/port-traffic-dog.sh"; } ||
-       { [ "$had_shortcut" = "true" ] &&
-         ! cp -a "$shortcut_path" "$backup_dir/dog"; } ||
-       { [ "$had_config_dir" = "true" ] &&
-         ! cp -a "$CONFIG_DIR" "$backup_dir/config"; }; then
-        echo -e "${RED}无法完整备份当前脚本或配置，已停止更新${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    if ! read_root_crontab_locked > "$backup_dir/root.crontab"; then
-        echo -e "${RED}无法备份 root crontab，已停止更新${NC}"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-
-    local update_ok=true
-    local failed_stage=""
-    mkdir -p "$notifications_dir"
-    if ! install -m 755 "$new_script" "${INSTALLED_SCRIPT_PATH}.new.$$" ||
-       ! mv "${INSTALLED_SCRIPT_PATH}.new.$$" "$INSTALLED_SCRIPT_PATH"; then
-        update_ok=false
-        failed_stage="安装主脚本"
-    elif ! install_ip_guard_script_file "$new_ip_guard"; then
-        update_ok=false
-        failed_stage="安装来源 IP 限制独立组件"
-    elif ! install -m 755 "$new_telegram" "$notifications_dir/telegram.sh" ||
-         ! install -m 755 "$new_wecom" "$notifications_dir/wecom.sh"; then
-        update_ok=false
-        failed_stage="安装通知模块"
-    elif ! create_shortcut_command >/dev/null; then
-        update_ok=false
-        failed_stage="重建 dog 快捷命令"
-    elif ! bash "$INSTALLED_SCRIPT_PATH" --finalize-update; then
-        update_ok=false
-        failed_stage="应用新版本配置与运行状态"
-    elif ! bash "$INSTALLED_SCRIPT_PATH" --version 2>/dev/null |
-         grep -Fq "v$downloaded_version"; then
-        update_ok=false
-        failed_stage="核验安装版本"
-    elif [ "$ip_guard_was_active" = "true" ] && ! restart_ip_guard_after_update; then
-        update_ok=false
-        failed_stage="重启并核验来源 IP 限制服务"
-    fi
-
-    if [ "$update_ok" != "true" ]; then
-        echo -e "${RED}更新失败阶段: ${failed_stage:-未知}${NC}"
-        if ! begin_expiry_update; then
-            echo -e "${RED}无法等待服务到期检查结束，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        if ! begin_reset_update; then
-            finish_expiry_update
-            echo -e "${RED}无法等待流量重置任务结束，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        if ! begin_tc_update; then
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法取得共享 TC 锁，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        if ! begin_cron_update; then
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法取得 Dog 自身的 root crontab 锁，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        if ! acquire_traffic_stats_lock; then
-            release_cron_update
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法等待流量统计写入结束，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        if ! acquire_config_lock; then
-            release_traffic_stats_lock
-            release_cron_update
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法等待配置写入结束，未执行破坏性回滚。更新前备份保留在: $backup_dir${NC}"
-            return 1
-        fi
-        local rollback_ok=true
-        local current_ports=()
-        mapfile -t current_ports < <(get_active_ports 2>/dev/null || true)
-        local current_port
-        for current_port in "${current_ports[@]}"; do
-            remove_tc_limit "$current_port" >/dev/null 2>&1 || true
-        done
-        local current_family
-        local current_table
-        current_family=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE" 2>/dev/null || echo inet)
-        current_table=$(jq -r '.nftables.table_name // "port_traffic_monitor"' "$CONFIG_FILE" 2>/dev/null || echo port_traffic_monitor)
-        nft delete table "$current_family" "$current_table" >/dev/null 2>&1 || true
-
-        rm -f "${INSTALLED_SCRIPT_PATH}.new.$$" "$INSTALLED_SCRIPT_PATH" "$shortcut_path"
-        rm -rf "$CONFIG_DIR"
-        if [ "$had_installed_script" = "true" ] && [ -f "$backup_dir/port-traffic-dog.sh" ]; then
-            cp -a "$backup_dir/port-traffic-dog.sh" "$INSTALLED_SCRIPT_PATH" || rollback_ok=false
-        elif [ "$had_installed_script" = "true" ]; then
-            rollback_ok=false
-        fi
-        if [ "$had_shortcut" = "true" ] && [ -f "$backup_dir/dog" ]; then
-            cp -a "$backup_dir/dog" "$shortcut_path" || rollback_ok=false
-        elif [ "$had_shortcut" = "true" ]; then
-            rollback_ok=false
-        fi
-        if [ "$had_config_dir" = "true" ] && [ -d "$backup_dir/config" ]; then
-            cp -a "$backup_dir/config" "$CONFIG_DIR" || rollback_ok=false
-        elif [ "$had_config_dir" = "true" ]; then
-            rollback_ok=false
-        fi
-        if begin_cron_update; then
-            crontab "$backup_dir/root.crontab" >/dev/null 2>&1 || rollback_ok=false
-            release_cron_update
-        else
-            rollback_ok=false
-        fi
-        finish_full_maintenance_update
-        if [ "$rollback_ok" = "true" ] && [ "$had_installed_script" = "true" ]; then
-            bash "$INSTALLED_SCRIPT_PATH" --restore-runtime >/dev/null 2>&1 || rollback_ok=false
-        fi
-        if [ "$ip_guard_was_active" = "true" ] &&
-           ! restart_ip_guard_after_update; then
-            rollback_ok=false
-        fi
-        if [ "$rollback_ok" = "true" ]; then
-            rm -rf "$temp_dir"
-            echo -e "${RED}更新后的维护步骤失败，已恢复更新前版本、配置和运行状态${NC}"
-            dog_log_event install_rollback 0
-        else
-            echo -e "${RED}更新失败且自动回滚未完整成功，请从备份目录手动恢复: $backup_dir${NC}"
-            dog_log_event install_rollback 1
-        fi
-        return 1
-    fi
-
-    rm -rf "$temp_dir"
-    echo -e "${GREEN}依赖检查、主脚本和通知模块更新完成${NC}"
-    dog_log_event install 0
-    if [ "$reload_after_update" = "true" ]; then
-        echo -e "${YELLOW}正在重新加载新版本...${NC}"
-        sleep 1
-        exec bash "$INSTALLED_SCRIPT_PATH"
-    fi
-    return 0
-}
-
-shortcut_command_is_valid() {
-    [ -f "$SHORTCUT_PATH" ] && [ ! -L "$SHORTCUT_PATH" ] && [ -x "$SHORTCUT_PATH" ] || return 1
-    cmp -s "$SHORTCUT_PATH" <(
-        printf '#!/bin/bash\nexec bash "%s" "$@"\n' "$INSTALLED_SCRIPT_PATH"
-    )
-}
-
-create_shortcut_command() {
-    if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ] && [ ! -f "$INSTALLED_SCRIPT_PATH" ]; then
-        mkdir -p "$(dirname "$INSTALLED_SCRIPT_PATH")" || return 1
-        cp "$SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH" || return 1
-        chmod 755 "$INSTALLED_SCRIPT_PATH" || return 1
-    elif [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        chmod 755 "$INSTALLED_SCRIPT_PATH" || return 1
-    else
-        return 1
-    fi
-
-    local shortcut_dir
-    local shortcut_temp
-    shortcut_dir=$(dirname "$SHORTCUT_PATH")
-    mkdir -p "$shortcut_dir" || return 1
-    shortcut_temp=$(mktemp "$shortcut_dir/.${SHORTCUT_COMMAND}.XXXXXX") || return 1
-    if ! cat > "$shortcut_temp" << EOF
-#!/bin/bash
-exec bash "$INSTALLED_SCRIPT_PATH" "\$@"
-EOF
-    then
-        rm -f "$shortcut_temp"
-        return 1
-    fi
-    if ! chmod 755 "$shortcut_temp" || ! mv -f "$shortcut_temp" "$SHORTCUT_PATH"; then
-        rm -f "$shortcut_temp"
-        return 1
-    fi
-    shortcut_command_is_valid || return 1
-    echo -e "${GREEN}快捷命令 '$SHORTCUT_COMMAND' 创建成功${NC}"
-}
-
-ensure_installation_files() {
-    local shortcut_path="$SHORTCUT_PATH"
-    if [ -f "$INSTALLED_SCRIPT_PATH" ] && [ -f "$shortcut_path" ]; then
-        install_tc_recovery_service_files >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    # 首次直接运行下载脚本时，保留原有的安装与快捷命令行为。
-    create_shortcut_command >/dev/null
-    download_notification_modules >/dev/null 2>&1 || true
-    install_tc_recovery_service_files >/dev/null 2>&1 || true
-}
-
-cleanup_owned_tc_root_without_config() {
-    local owner_file
-    local owner_interface=""
-    local ntc_uninstall_status=0
-    local cleanup_result=0
-
-    owner_file=$(get_tc_root_owner_file)
-    [ -r "$owner_file" ] || return 0
-    IFS='|' read -r owner_interface _ < "$owner_file" || true
-    [ -n "$owner_interface" ] || return 0
-
-    if ! begin_tc_update; then
-        log_notification "卸载时无法取得共享TC锁，已保留现有qdisc避免并发破坏"
-        return 1
-    fi
-
-    # 归属与 NTC 状态必须在共享锁内重新确认，避免检查后另一项目接管层级。
-    if tc_root_is_owned "$owner_interface"; then
-        trafficcop_unified_state_rate "$owner_interface" >/dev/null 2>&1 || ntc_uninstall_status=$?
-        if [ "$ntc_uninstall_status" -eq 0 ] ||
-           { [ -e "$TRAFFICCOP_TC_STATE_FILE" ] &&
-             [ "$ntc_uninstall_status" -ne 1 ] && [ "$ntc_uninstall_status" -ne 4 ] &&
-             [ "$ntc_uninstall_status" -ne 5 ]; }; then
-            rm -f "$owner_file"
-            log_notification "卸载Dog时保留TrafficCop正在使用的统一HTB: $owner_interface"
-        else
-            if tc qdisc del dev "$owner_interface" root handle 1: 2>/dev/null; then
-                cleanup_ingress_shaping_if_unused_locked "$owner_interface" >/dev/null 2>&1 || true
-                rm -f "$owner_file"
-            else
-                log_notification "卸载Dog时删除统一HTB失败，已保留归属标记: $owner_interface"
-                cleanup_result=1
-            fi
-        fi
-    fi
-
-    finish_tc_update
-    return "$cleanup_result"
-}
-
-rollback_interrupted_uninstall() {
-    local cron_backup="$1"
-    local message="$2"
-    local restart_ip_guard="${3:-false}"
-    local rollback_ok=true
-
-    if [ -f "$CONFIG_FILE" ]; then
-        restore_runtime_state >/dev/null 2>&1 || rollback_ok=false
-    fi
-    restore_root_crontab_from_file "$cron_backup" || rollback_ok=false
-    if [ "$restart_ip_guard" = "true" ] && command -v "$IP_GUARD_SYSTEMCTL" >/dev/null 2>&1 &&
-       [ -f "$IP_GUARD_SERVICE_FILE" ]; then
-        "$IP_GUARD_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || rollback_ok=false
-        "$IP_GUARD_SYSTEMCTL" restart "$IP_GUARD_SERVICE" >/dev/null 2>&1 || rollback_ok=false
-    fi
-    rm -f "$cron_backup"
-    finish_full_maintenance_update
-    echo -e "${RED}${message}${NC}"
-    if [ "$rollback_ok" != "true" ]; then
-        echo -e "${RED}自动恢复未完整成功，请立即检查 dog --self-check 与 root crontab。${NC}"
-    fi
     return 1
 }
 
-# 卸载脚本
-uninstall_script() {
-    # 第一个参数为 true 时跳过交互确认（由 --uninstall --yes 传入）
-    local assume_yes="${1:-false}"
-    echo -e "${BLUE}卸载脚本${NC}"
-    echo "────────────────────────────────────────────────────────"
-
-    echo -e "${YELLOW}将要删除以下内容:${NC}"
-    echo "  - 脚本文件: $INSTALLED_SCRIPT_PATH"
-    echo "  - 快捷命令: $SHORTCUT_PATH"
-    echo "  - 配置目录: $CONFIG_DIR"
-    echo "  - 所有nftables规则"
-    echo "  - 所有TC限制规则"
-    echo "  - 通知定时任务"
-    echo
-    echo -e "${RED}警告：此操作将完全删除端口流量狗及其所有数据！${NC}"
-    if [ "$assume_yes" = "true" ]; then
-        echo -e "${YELLOW}已指定 --yes，跳过确认${NC}"
-        confirm="y"
-    else
-        read -p "确认卸载? [y/N]: " confirm
-    fi
-
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}正在卸载...${NC}"
-
-        # 先阻止配置/规则写入，再在锁内清理未来 cron 入口；失败时恢复原 crontab。
-        if ! begin_expiry_update; then
-            echo -e "${RED}无法等待服务到期检查结束，已中止卸载且未删除运行规则。${NC}"
-            return 1
-        fi
-        if ! begin_reset_update; then
-            finish_expiry_update
-            echo -e "${RED}无法等待流量重置任务结束，已中止卸载且未删除运行规则。${NC}"
-            return 1
-        fi
-        if ! begin_tc_update; then
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法取得共享 TC 锁，已中止卸载且未删除运行规则。${NC}"
-            return 1
-        fi
-        if ! begin_cron_update; then
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法取得 Dog 自身的 root crontab 锁，已中止卸载。${NC}"
-            return 1
-        fi
-        if ! acquire_traffic_stats_lock; then
-            release_cron_update
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法等待流量统计写入结束，已中止卸载且未删除运行规则。${NC}"
-            return 1
-        fi
-        if ! acquire_config_lock; then
-            release_traffic_stats_lock
-            release_cron_update
-            finish_tc_update
-            finish_reset_update
-            finish_expiry_update
-            echo -e "${RED}无法等待配置写入结束，已中止卸载且未删除运行规则。${NC}"
-            return 1
-        fi
-        local uninstall_cron_backup
-        uninstall_cron_backup=$(mktemp) || {
-            finish_full_maintenance_update
-            echo -e "${RED}无法创建 crontab 备份，已中止卸载。${NC}"
-            return 1
-        }
-        # 读取失败时绝不能用已被重定向截断的临时文件回写 root crontab。
-        if ! read_current_crontab > "$uninstall_cron_backup"; then
-            rm -f "$uninstall_cron_backup"
-            finish_full_maintenance_update
-            echo -e "${RED}无法读取 root crontab，已中止卸载且未改写任何定时任务。${NC}"
-            return 1
-        fi
-        if ! remove_all_dog_cron_entries; then
-            rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                "无法可靠清理 root crontab，已中止卸载且未删除运行规则。" || true
-            return 1
-        fi
-
-        local config_valid=false
-        if [ -f "$CONFIG_FILE" ] && validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then
-            config_valid=true
-        elif [ -e "$CONFIG_FILE" ]; then
-            rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                "现有配置文件无效，无法证明应删除哪些运行规则；已恢复 crontab 并中止卸载。" || true
-            return 1
-        fi
-        local active_ports=()
-        if [ "$config_valid" = "true" ]; then
-            local uninstall_ports
-            if ! uninstall_ports=$(get_active_ports 2>/dev/null); then
-                rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                    "无法读取端口配置，已中止卸载且未删除运行规则。" || true
-                return 1
-            fi
-            if [ -n "$uninstall_ports" ]; then
-                mapfile -t active_ports <<< "$uninstall_ports"
-            fi
-        fi
-        local tc_cleanup_ok=true
-        local uninstall_interface=""
-        local tc_class_after=""
-        local tc_filter_after=""
-        if [ ${#active_ports[@]} -gt 0 ]; then
-            uninstall_interface=$(get_default_interface 2>/dev/null || true)
-            if [ -z "$uninstall_interface" ] ||
-               ! tc qdisc show dev "$uninstall_interface" >/dev/null 2>&1 ||
-               ! tc class show dev "$uninstall_interface" >/dev/null 2>&1 ||
-               ! tc filter show dev "$uninstall_interface" parent 1:0 >/dev/null 2>&1; then
-                tc_cleanup_ok=false
-            fi
-        fi
-        local port
-        if [ "$tc_cleanup_ok" = "true" ]; then
-            for port in "${active_ports[@]}"; do
-                remove_tc_limit_locked "$port" >/dev/null 2>&1 || tc_cleanup_ok=false
-            done
-        fi
-        if [ "$tc_cleanup_ok" = "true" ] && [ -n "$uninstall_interface" ]; then
-            tc qdisc show dev "$uninstall_interface" >/dev/null 2>&1 || tc_cleanup_ok=false
-            tc_class_after=$(tc class show dev "$uninstall_interface" 2>/dev/null) || tc_cleanup_ok=false
-            tc_filter_after=$(tc filter show dev "$uninstall_interface" parent 1:0 2>/dev/null) || tc_cleanup_ok=false
-        fi
-        if [ "$tc_cleanup_ok" = "true" ]; then
-            local class_id
-            local legacy_class_id
-            for port in "${active_ports[@]}"; do
-                class_id=$(jq -r --arg port "$port" \
-                    '.ports[$port].bandwidth_limit.class_id // empty' "$CONFIG_FILE" 2>/dev/null || true)
-                legacy_class_id=$(generate_legacy_tc_class_id "$port")
-                for class_id in "$class_id" "$legacy_class_id"; do
-                    [ -n "$class_id" ] || continue
-                    if printf '%s\n' "$tc_class_after" |
-                       grep -Eq "^class[[:space:]]+htb[[:space:]]+$class_id([[:space:]]|$)" ||
-                       printf '%s\n' "$tc_filter_after" |
-                       grep -Eq "(flowid|classid)[[:space:]]+$class_id([[:space:]]|$)"; then
-                        tc_cleanup_ok=false
-                    fi
-                done
-            done
-        fi
-        if [ "$tc_cleanup_ok" != "true" ]; then
-            rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                "无法可靠删除 Dog 的 TC 对象，已恢复运行状态并中止卸载。" || true
-            return 1
-        fi
-
-        local table_name="port_traffic_monitor"
-        local family="inet"
-        if [ "$config_valid" = "true" ]; then
-            table_name=$(jq -r '.nftables.table_name // "port_traffic_monitor"' "$CONFIG_FILE")
-            family=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE")
-        else
-            if ! cleanup_owned_tc_root_without_config; then
-                rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                    "无法确认或清理 Dog 所属的 TC 根层级，已恢复运行状态并中止卸载。" || true
-                return 1
-            fi
-        fi
-        local nft_table_status=0
-        nft_table_exists "$family" "$table_name" || nft_table_status=$?
-        case "$nft_table_status" in
-            0)
-                if [ "$config_valid" != "true" ] &&
-                   ! { nft_base_chain_contract_valid "$family" "$table_name" input input 0 &&
-                       nft_base_chain_contract_valid "$family" "$table_name" output output 0 &&
-                       nft_base_chain_contract_valid "$family" "$table_name" forward forward 0 &&
-                       nft_base_chain_contract_valid "$family" "$table_name" expiry_input input -30 &&
-                       nft_base_chain_contract_valid "$family" "$table_name" expiry_output output -30 &&
-                       nft_base_chain_contract_valid "$family" "$table_name" expiry_forward forward -30; }; then
-                    rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                        "配置缺失且现有同名 nftables 表不符合 Dog 契约，已保留该表并中止卸载。" || true
-                    return 1
-                fi
-                if ! nft delete table "$family" "$table_name" >/dev/null 2>&1; then
-                    rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                        "无法删除 Dog 的 nftables 表，已恢复运行状态并中止卸载。" || true
-                    return 1
-                fi
-                nft_table_exists "$family" "$table_name" && nft_table_status=0 || nft_table_status=$?
-                if [ "$nft_table_status" -ne 1 ]; then
-                    rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                        "无法核验 Dog 的 nftables 表已删除，已恢复运行状态并中止卸载。" || true
-                    return 1
-                fi
-                ;;
-            1) ;;
-            *)
-                rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                    "无法查询 Dog 的 nftables 表，已恢复运行状态并中止卸载。" || true
-                return 1
-                ;;
-        esac
-
-        if [ -f "$IP_GUARD_SCRIPT_PATH" ]; then
-            if ! bash "$IP_GUARD_SCRIPT_PATH" --uninstall --yes; then
-                rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                    "测试中的来源 IP 限制无法安全卸载，已恢复 Dog 运行状态并中止卸载。" true || true
-                return 1
-            fi
-        elif [ -e "$IP_GUARD_SERVICE_FILE" ]; then
-            rollback_interrupted_uninstall "$uninstall_cron_backup" \
-                "检测到来源 IP 限制服务，但独立脚本缺失；为避免遗留封锁已恢复 Dog 运行状态并中止卸载。" true || true
-            return 1
-        fi
-        rm -f "$uninstall_cron_backup"
-
-        # 菜单模式已注册退出保存钩子，卸载前关闭，避免删除后重新创建空配置目录。
-        trap - EXIT INT TERM
-        local uninstall_files_ok=true
-        rm -rf "$CONFIG_DIR" 2>/dev/null || uninstall_files_ok=false
-        rm -f "$SHORTCUT_PATH" 2>/dev/null || uninstall_files_ok=false
-        rm -f "$INSTALLED_SCRIPT_PATH" 2>/dev/null || uninstall_files_ok=false
-        cleanup_tc_recovery_files_if_unused || uninstall_files_ok=false
-        finish_full_maintenance_update
-
-        if [ "$uninstall_files_ok" != "true" ]; then
-            echo -e "${RED}Dog 运行规则已停止，但脚本、配置或共享恢复文件未能全部删除；卸载未完整完成。${NC}"
-            return 1
-        fi
-
-        echo -e "${GREEN}卸载完成！${NC}"
-        echo -e "${YELLOW}感谢使用端口流量狗！${NC}"
-        echo "系统依赖默认保留；新增包账本仍位于 $DEPENDENCY_STATE_DIR。"
-        echo '如需清理，使用下载的本脚本执行：bash port-traffic-dog.sh --dependencies remove'
-        exit 0
-    else
-        echo "取消卸载"
-        sleep 1
-        show_main_menu
-    fi
+channel_enabled() {
+    local c="$1"
+    [ "$(cfg ".notifications.${c}.enabled // false")" = "true" ]
 }
 
-manage_notifications() {
-    echo -e "${BLUE}=== 通知管理 ===${NC}"
-    echo "1. Telegram机器人通知"
-    echo "2. 邮箱通知 [敬请期待]"
-    echo "3. 企业wx 机器人通知"
-    echo "4. Telegram通信线路切换"
-    echo "5. 强制同步通知模块(覆盖本地)"
-    echo "0. 返回主菜单"
-    echo
-    read -p "请选择操作 [0-5]: " choice
+channel_status_enabled() {
+    local c="$1"
+    channel_enabled "$c" && [ "$(cfg ".notifications.${c}.status_notifications.enabled // false")" = "true" ]
+}
 
-    case $choice in
-        1) manage_telegram_notifications ;;
-        2)
-            echo -e "${YELLOW}预留的邮箱通知功能(画饼的)${NC}"
-            sleep 2
-            manage_notifications
-            ;;
-        3) manage_wecom_notifications ;;
-        4) manage_telegram_api_route ;;
-        5) force_sync_notification_modules ;;
-        0) show_main_menu ;;
-        *) echo -e "${RED}无效选择${NC}"; sleep 1; manage_notifications ;;
+channel_server_name() {
+    local n
+    n=$(cfg ".notifications.${1}.server_name // \"\"")
+    [ -n "$n" ] || n=$(hostname)
+    echo "$n"
+}
+
+# 发送状态报告到指定通道（telegram|wecom）。返回码：0 成功，1 发送失败，2 已发送读数告警。
+send_status_report() {
+    local channel="$1" report rc=0 send_rc=0
+    has_monitors || return 0
+    report=$(build_status_report "$(channel_server_name "$channel")") || rc=$?
+    case "$channel" in
+        telegram) telegram_send "$report" || send_rc=1 ;;
+        wecom) wecom_send "$report" || send_rc=1 ;;
+        *) return 1 ;;
     esac
-}
-
-force_sync_notification_modules() {
-    echo -e "${BLUE}=== 强制同步通知模块 ===${NC}"
-    echo -e "${YELLOW}此操作会覆盖当前通知模块(telegram.sh/wecom.sh)${NC}"
-    read -p "确认继续? [y/N]: " confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "已取消"
-        sleep 1
-        manage_notifications
-        return
+    if [ "$rc" -ne 0 ]; then
+        log_notification "$channel 状态报告读数失败，已发送告警：$(head -n 2 <<< "$report" | tail -n 1)"
+        return 2
     fi
-
-    echo -e "${YELLOW}正在强制同步通知模块...${NC}"
-    if download_notification_modules "force" >/dev/null 2>&1; then
-        echo -e "${GREEN}通知模块强制同步完成${NC}"
-    else
-        echo -e "${RED}通知模块同步失败，请检查网络后重试${NC}"
-    fi
-    sleep 2
-    manage_notifications
-}
-
-load_telegram_module() {
-    local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-    local local_telegram_script="$(dirname "$(get_script_exec_path)")/telegram.sh"
-
-    if [ -f "$telegram_script" ]; then
-        source "$telegram_script" 2>/dev/null || true
-    fi
-
-    # 运行目录模块缺能力时，回退加载主脚本同目录模块
-    if ! declare -F telegram_send_status_notification >/dev/null 2>&1; then
-        if [ -f "$local_telegram_script" ]; then
-            source "$local_telegram_script" 2>/dev/null || true
-
-            # 仅在缺失能力时补齐，避免覆盖用户自定义模块
-            if declare -F telegram_send_status_notification >/dev/null 2>&1; then
-                mkdir -p "$CONFIG_DIR/notifications"
-                cp "$local_telegram_script" "$telegram_script"
-                chmod +x "$telegram_script" 2>/dev/null || true
-            fi
-        fi
-    fi
-
-    declare -F telegram_send_status_notification >/dev/null 2>&1
-}
-
-manage_telegram_notifications() {
-    # 导出通知管理函数供模块使用
-    export_notification_functions
-
-    if load_telegram_module && declare -F telegram_configure >/dev/null 2>&1; then
-        telegram_configure
-        manage_notifications
-    else
-        echo -e "${RED}Telegram 通知模块不存在${NC}"
-        echo "请检查文件: $CONFIG_DIR/notifications/telegram.sh"
-        sleep 2
-        manage_notifications
-    fi
-}
-
-manage_telegram_api_route() {
-    load_telegram_module || true
-
-    if declare -F telegram_switch_api_route >/dev/null 2>&1; then
-        telegram_switch_api_route
-    else
-        telegram_switch_api_route_fallback
-    fi
-
-    manage_notifications
-}
-
-telegram_switch_api_route_fallback() {
-    local current_route=$(jq -r '.notifications.telegram.api_route // "official"' "$CONFIG_FILE" 2>/dev/null || echo "official")
-    local custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
-    custom_base=$(echo "$custom_base" | tr -d ' ')
-    custom_base="${custom_base%/}"
-
-    local current_route_display="官方"
-    if [ "$current_route" = "custom" ]; then
-        current_route_display="自定义"
-    fi
-
-    echo -e "${BLUE}=== Telegram通信线路切换 ===${NC}"
-    echo "当前线路: ${current_route_display}"
-    if [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
-        echo "当前自定义地址: ${custom_base}"
-    fi
-    echo
-    echo "1. 官方线路 (https://api.telegram.org)"
-    echo "2. 自定义线路"
-    echo "0. 返回"
-    echo
-    read -p "请选择 [0-2]: " route_choice
-
-    case "$route_choice" in
-        1)
-            update_config ".notifications.telegram.api_route = \"official\""
-            echo -e "${GREEN}已切换到官方线路${NC}"
-            ;;
-        2)
-            if [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
-                read -p "请输入自定义API基础地址 (回车沿用: ${custom_base}): " input_custom
-            else
-                read -p "请输入自定义API基础地址: " input_custom
-            fi
-            if [ -z "$input_custom" ] && [ -n "$custom_base" ] && [ "$custom_base" != "null" ]; then
-                input_custom="$custom_base"
-            fi
-            if [ -z "$input_custom" ]; then
-                echo -e "${RED}自定义API基础地址不能为空${NC}"
-                return 1
-            fi
-            input_custom=$(echo "$input_custom" | tr -d ' ')
-            input_custom="${input_custom%/}"
-            if [[ ! "$input_custom" =~ ^https:// ]] &&
-               [[ ! "$input_custom" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]]; then
-                echo -e "${RED}地址不安全：远程线路必须使用 HTTPS，HTTP 仅允许本机回环地址${NC}"
-                sleep 2
-                return 1
-            fi
-
-            if ! update_config_file \
-                '.notifications.telegram.custom_api_base = $base | .notifications.telegram.api_route = "custom"' \
-                --arg base "$input_custom"; then
-                echo -e "${RED}配置保存失败，请检查 $CONFIG_FILE${NC}"
-                return 1
-            fi
-
-            echo -e "${GREEN}已切换到自定义线路${NC}"
-            echo "当前地址: $input_custom"
-            ;;
-        0|"")
-            return 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${NC}"
-            ;;
-    esac
-
-    sleep 1
-}
-
-manage_wecom_notifications() {
-    local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
-
-    if [ -f "$wecom_script" ]; then
-        # 导出通知管理函数供模块使用
-        export_notification_functions
-        source "$wecom_script"
-        wecom_configure
-        manage_notifications
-    else
-        echo -e "${RED}企业wx 通知模块不存在${NC}"
-        echo "请检查文件: $wecom_script"
-        sleep 2
-        manage_notifications
-    fi
+    return "$send_rc"
 }
 
 notification_interval_cron_expression() {
     case "$1" in
-        "1m")  echo "* * * * *" ;;
-        "15m") echo "*/15 * * * *" ;;
-        "30m") echo "*/30 * * * *" ;;
-        "1h")  echo "0 * * * *" ;;
-        "2h")  echo "0 */2 * * *" ;;
-        "6h")  echo "0 */6 * * *" ;;
-        "12h") echo "0 */12 * * *" ;;
-        "24h") echo "0 0 * * *" ;;
+        1m) echo "* * * * *" ;;
+        15m) echo "*/15 * * * *" ;;
+        30m) echo "*/30 * * * *" ;;
+        1h) echo "0 * * * *" ;;
+        2h) echo "0 */2 * * *" ;;
+        6h) echo "0 */6 * * *" ;;
+        12h) echo "0 */12 * * *" ;;
+        24h) echo "0 0 * * *" ;;
         *) return 1 ;;
     esac
 }
 
-setup_telegram_notification_cron() {
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-
-    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_telegram_notification_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-
-    # 通道总开关和状态通知开关必须同时启用。
-    local telegram_channel_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE")
-    local telegram_status_enabled=$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE")
-    local active_ports_status=0
-    has_active_ports || active_ports_status=$?
-    if [ "$active_ports_status" -gt 1 ]; then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    if [ "$telegram_channel_enabled" = "true" ] && [ "$telegram_status_enabled" = "true" ] &&
-       [ "$active_ports_status" -eq 0 ]; then
-        local status_interval=$(jq -r '.notifications.telegram.status_notifications.interval' "$CONFIG_FILE")
-        local schedule
-        schedule=$(notification_interval_cron_expression "$status_interval") || {
-            rm -f "$temp_cron"
-            release_cron_update
-            return 1
-        }
-        echo "$schedule $script_path --send-telegram-status >/dev/null 2>&1  # 端口流量狗Telegram通知" >> "$temp_cron"
-    fi
-
-    finish_cron_update "$temp_cron"
-}
-
-setup_wecom_notification_cron() {
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_wecom_notification_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-
-    # 通道总开关和状态通知开关必须同时启用。
-    local wecom_channel_enabled=$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE")
-    local wecom_status_enabled=$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE")
-    local active_ports_status=0
-    has_active_ports || active_ports_status=$?
-    if [ "$active_ports_status" -gt 1 ]; then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    if [ "$wecom_channel_enabled" = "true" ] && [ "$wecom_status_enabled" = "true" ] &&
-       [ "$active_ports_status" -eq 0 ]; then
-        local wecom_interval=$(jq -r '.notifications.wecom.status_notifications.interval' "$CONFIG_FILE")
-        local schedule
-        schedule=$(notification_interval_cron_expression "$wecom_interval") || {
-            rm -f "$temp_cron"
-            release_cron_update
-            return 1
-        }
-        echo "$schedule $script_path --send-wecom-status >/dev/null 2>&1  # 端口流量狗企业wx 通知" >> "$temp_cron"
-    fi
-
-    finish_cron_update "$temp_cron"
-}
-
-# 通用间隔选择函数
 select_notification_interval() {
-    # 显示选择菜单到stderr，避免被变量捕获
-    echo "请选择状态通知发送间隔:" >&2
-    echo "1. 1分钟   2. 15分钟  3. 30分钟  4. 1小时" >&2
-    echo "5. 2小时   6. 6小时   7. 12小时  8. 24小时" >&2
-    read -p "请选择(回车默认1小时) [1-8]: " interval_choice >&2
-
-    # 默认1小时
-    local interval="1h"
-    case $interval_choice in
-        1) interval="1m" ;;
-        2) interval="15m" ;;
-        3) interval="30m" ;;
-        4|"") interval="1h" ;;
-        5) interval="2h" ;;
-        6) interval="6h" ;;
-        7) interval="12h" ;;
-        8) interval="24h" ;;
-        *) interval="1h" ;;
+    local choice
+    {
+        echo "推送周期：1) 1分钟  2) 15分钟  3) 30分钟  4) 1小时  5) 2小时  6) 6小时  7) 12小时  8) 24小时"
+    } >&2
+    read -r -p "请选择 [1-8，默认 4]: " choice
+    case "${choice:-4}" in
+        1) echo 1m ;; 2) echo 15m ;; 3) echo 30m ;; 4) echo 1h ;;
+        5) echo 2h ;; 6) echo 6h ;; 7) echo 12h ;; 8) echo 24h ;;
+        *) return 1 ;;
     esac
-
-    echo "$interval"
 }
 
-remove_telegram_notification_cron() {
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
+manage_notification_channel() {
+    local c="$1" title choice v interval
+    [ "$c" = telegram ] && title="Telegram" || title="企业微信"
+    while true; do
+        echo
+        echo -e "${BLUE}=== ${title} 通知 ===${NC}"
+        echo "状态：通道 $(channel_enabled "$c" && echo 开启 || echo 关闭) | 定时报告 $(channel_status_enabled "$c" && echo "开启（$(cfg ".notifications.${c}.status_notifications.interval // \"1h\"")）" || echo 关闭)"
+        if [ "$c" = telegram ]; then
+            echo "1. 设置 Bot Token 与 Chat ID"
+            echo "5. 切换 API 线路（当前：$(cfg '.notifications.telegram.api_route // "official"')）"
+        else
+            echo "1. 设置 Webhook 地址"
+        fi
+        echo "2. 设置服务器名称（当前：$(channel_server_name "$c")）"
+        echo "3. 开关定时报告并设置周期"
+        echo "4. 立即发送一次测试报告"
+        echo "6. 关闭此通道"
+        echo "0. 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1)
+                if [ "$c" = telegram ]; then
+                    read -r -p "Bot Token: " v
+                    [ -n "$v" ] || continue
+                    local chat
+                    read -r -p "Chat ID: " chat
+                    config_update '.notifications.telegram.bot_token = $t | .notifications.telegram.chat_id = $c | .notifications.telegram.enabled = true' \
+                        --arg t "$v" --arg c "$chat" && echo -e "${GREEN}已保存${NC}"
+                else
+                    read -r -p "Webhook 地址（https://qyapi.weixin.qq.com/...）: " v
+                    [[ "$v" =~ ^https:// ]] || { echo -e "${RED}必须是 https:// 地址${NC}"; continue; }
+                    config_update '.notifications.wecom.webhook_url = $u | .notifications.wecom.enabled = true' --arg u "$v" &&
+                        echo -e "${GREEN}已保存${NC}"
+                fi ;;
+            2)
+                read -r -p "服务器名称: " v
+                config_update ".notifications.${c}.server_name = \$n" --arg n "$v" ;;
+            3)
+                if channel_status_enabled "$c" && confirm "定时报告已开启，是否关闭"; then
+                    config_update ".notifications.${c}.status_notifications.enabled = false"
+                else
+                    interval=$(select_notification_interval) || { echo -e "${RED}无效选择${NC}"; continue; }
+                    config_update ".notifications.${c}.status_notifications = {enabled: true, interval: \$i}" --arg i "$interval"
+                fi
+                cron_sync || true ;;
+            4)
+                local rc=0
+                send_status_report "$c" || rc=$?
+                case "$rc" in
+                    0) echo -e "${GREEN}发送成功${NC}" ;;
+                    2) echo -e "${YELLOW}读数失败，已发送告警，请运行 dog --self-check${NC}" ;;
+                    *) echo -e "${RED}发送失败，详见 $NOTIFY_LOG_FILE${NC}" ;;
+                esac ;;
+            5)
+                [ "$c" = telegram ] || continue
+                echo "1) 官方 api.telegram.org  2) 自定义反代地址"
+                read -r -p "请选择: " v
+                if [ "$v" = 2 ]; then
+                    local base
+                    read -r -p "API 基础地址（https://example.com）: " base
+                    base="${base%/}"
+                    [[ "$base" =~ ^https:// ]] || [[ "$base" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]] ||
+                        { echo -e "${RED}远程地址必须使用 https://${NC}"; continue; }
+                    config_update '.notifications.telegram.api_route = "custom" | .notifications.telegram.custom_api_base = $b' --arg b "$base"
+                else
+                    config_update '.notifications.telegram.api_route = "official"'
+                fi ;;
+            6)
+                config_update ".notifications.${c}.enabled = false" && cron_sync || true ;;
+            0|"") return 0 ;;
+        esac
+    done
+}
+
+manage_notifications() {
+    local choice
+    while true; do
+        echo
+        echo -e "${BLUE}=== 通知管理 ===${NC}"
+        echo "1. Telegram"
+        echo "2. 企业微信"
+        echo "3. 查看通知日志"
+        echo "0. 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) manage_notification_channel telegram ;;
+            2) manage_notification_channel wecom ;;
+            3) tail -n 40 "$NOTIFY_LOG_FILE" 2>/dev/null || echo "暂无日志"; pause ;;
+            0|"") return 0 ;;
+        esac
+    done
+}
+
+# ── 定时任务 ──────────────────────────────────────────────────────
+# cron_sync 是唯一写入 Dog 定时任务的入口：先移除所有 Dog 行（含 1.5.x 旧格式），
+# 再按当前配置生成。不碰其他任务，也不增删 PATH= 行（脚本自身已固定 PATH）。
+#   * * * * *  --tick                每分钟：规则自检修复、到期封锁、周期重置、日统计、整机流量
+#   @reboot    --boot                开机恢复 nft 计数与配额
+#   <周期>     --send-status <通道>  状态报告（通道与定时报告均开启时）
+
+readonly DOG_CRON_TAG="# port-traffic-dog"
+
+read_root_crontab() {
+    local out rc=0
+    out=$(crontab -l 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        grep -qi "no crontab" <<< "$out" && return 0
+        echo "读取 root crontab 失败：$out" >&2
         return 1
     fi
-    printf '%s\n' "$current_cron" | filter_telegram_notification_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
+    printf '%s\n' "$out"
 }
 
-remove_wecom_notification_cron() {
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_wecom_notification_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
-}
-
-remove_all_port_auto_reset_cron() {
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_port_auto_reset_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
-}
-
-filter_all_dog_cron_entries() {
+# 过滤掉 Dog 自己的行（新旧格式）。
+filter_dog_cron_lines() {
     awk '
-        /# 端口流量狗Telegram通知/ { next }
-        /# 端口流量狗企业wx 通知/ { next }
-        /# 端口流量狗自动重置端口/ { next }
-        /# port-traffic-dog / { next }
+        /# port-traffic-dog/ { next }
+        /端口流量狗/ { next }
         /port-traffic-dog\.sh[[:space:]]+--/ { next }
         /\/usr\/local\/bin\/dog[[:space:]]+--/ { next }
         { print }
     '
 }
 
-# 与上面的过滤器同型：用 awk 而非 grep，保证“无匹配行”不产生非零退出码，
-# 这样调用方才能把真实的过滤失败与“过滤后为空”区分开。
-filter_port_auto_reset_cron_entries() {
-    awk '
-        /端口流量狗自动重置端口/ { next }
-        /# port-traffic-dog scheduled reset check/ { next }
-        /# port-traffic-dog expiry check/ { next }
-        /port-traffic-dog\.sh[[:space:]]+--reset-port([[:space:]]|$)/ { next }
-        /port-traffic-dog\.sh[[:space:]]+--check-reset-port([[:space:]]|$)/ { next }
-        /port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)/ { next }
-        /^[^@].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)/ { next }
-        { print }
-    '
+desired_dog_cron_lines() {
+    local exe c expr
+    has_monitors || return 0
+    exe=$(get_script_exec_path)
+    printf '* * * * * %s --tick >/dev/null 2>&1  %s tick\n' "$exe" "$DOG_CRON_TAG"
+    printf '@reboot %s --boot >/dev/null 2>&1  %s boot\n' "$exe" "$DOG_CRON_TAG"
+    for c in telegram wecom; do
+        channel_status_enabled "$c" || continue
+        expr=$(notification_interval_cron_expression "$(cfg ".notifications.${c}.status_notifications.interval // \"1h\"")") || continue
+        printf '%s %s --send-status %s >/dev/null 2>&1  %s %s\n' "$expr" "$exe" "$c" "$DOG_CRON_TAG" "$c"
+    done
 }
 
-filter_telegram_notification_cron_entries() {
-    awk '!/# 端口流量狗Telegram通知/'
-}
-
-filter_wecom_notification_cron_entries() {
-    awk '!/# 端口流量狗企业wx 通知/'
-}
-
-# PATH 行由 setup_cron_environment 单独重写，这里只剔除旧的 PATH 行。
-filter_cron_path_entries() {
-    awk '!/^PATH=/'
-}
-
-remove_all_dog_cron_entries() {
-    command -v crontab >/dev/null 2>&1 || return 0
-    local temp_cron
-    local current_cron
-    temp_cron=$(mktemp) || return 1
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
+cron_sync() {
+    command -v crontab >/dev/null 2>&1 || { dog_error "未找到 crontab 命令，定时任务无法配置"; return 1; }
+    local current desired next rc=0
+    dog_lock || return 75
+    if ! current=$(read_root_crontab); then
+        dog_unlock; return 1
     fi
-    printf '%s\n' "$current_cron" | filter_all_dog_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
+    desired=$(desired_dog_cron_lines)
+    next=$(printf '%s\n' "$current" | filter_dog_cron_lines)
+    if [ -n "$desired" ]; then
+        if [ -n "$next" ]; then next=$(printf '%s\n%s' "$next" "$desired"); else next="$desired"; fi
+    fi
+    if [ "$next" != "$current" ]; then
+        printf '%s\n' "$next" | crontab - || rc=1
+    fi
+    dog_unlock
+    [ -n "$desired" ] && { ensure_cron_service_running || dog_error "cron 服务未运行，定时任务不会执行"; }
+    return "$rc"
+}
+
+cron_remove_all() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    local current
+    current=$(read_root_crontab) || return 1
+    printf '%s\n' "$current" | filter_dog_cron_lines | crontab -
+}
+
+# 自检：Dog 定时任务是否与期望一致。
+cron_in_sync() {
+    local current desired actual
+    current=$(read_root_crontab 2>/dev/null) || return 1
+    desired=$(desired_dog_cron_lines)
+    actual=$(printf '%s\n' "$current" | grep -F "$DOG_CRON_TAG" || true)
+    [ "$actual" = "$desired" ]
+}
+
+# 每分钟任务。任何一步失败都写入日志，不影响其他步骤。
+cron_tick() {
+    local failed=0 step
+    config_exists || return 0
+    validate_config_file "$CONFIG_FILE" 2>/dev/null || { log_notification "定时任务跳过：配置文件校验失败"; return 1; }
+    has_monitors || { collect_machine_traffic >/dev/null 2>&1 || true; return 0; }
+    # 交互操作持锁时最多等 40 秒，避免与菜单修改冲突；仍拿不到则跳过本轮。
+    dog_lock 40 || { log_notification "定时任务跳过：另一个 Dog 进程持有锁"; return 0; }
+    for step in runtime_ensure_nft check_expirations check_due_resets stats_snapshot; do
+        if ! "$step" quiet >/dev/null 2>&1; then
+            failed=1
+            dog_log_event cron_task 1 "step=${step//_/-}"
+        fi
+    done
+    dog_unlock
+    collect_machine_traffic >/dev/null 2>&1 || true
+    return "$failed"
 }
 
 cron_service_is_running() {
@@ -11646,18 +4801,6 @@ ensure_cron_service_running() {
     cron_service_is_running
 }
 
-refresh_notification_cron_from_config() {
-    local result=0
-    setup_telegram_notification_cron || result=1
-    setup_wecom_notification_cron || result=1
-    ensure_cron_service_running || result=1
-    return "$result"
-}
-
-# ── 整机流量（只读） ──────────────────────────────────────────────
-# 只读内部网卡计数器用于展示，不创建 nftables 规则、不碰 tc，也不参与任何限速或配额判断。
-# 数据单独存放，与端口计数和 TrafficCop 的 vnStat 统计互不影响。
-
 list_machine_interfaces() {
     # 只取有 device 链接的真物理网卡。隧道（warp、wg*）、网桥（docker0、br-*）、
     # veth、lo、ifb 都没有这个链接——用黑名单会漏掉非标准命名的隧道接口，
@@ -11676,9 +4819,9 @@ collect_machine_traffic() {
     [ "${#interfaces[@]}" -gt 0 ] || return 0
 
     mkdir -p "$CONFIG_DIR" 2>/dev/null || return 1
-    exec 8>"$CONFIG_DIR/.machine_traffic.lock" 2>/dev/null || return 1
-    if ! flock -n 8 2>/dev/null; then
-        exec 8>&-
+    exec 6>"$CONFIG_DIR/.machine_traffic.lock" 2>/dev/null || return 1
+    if ! flock -n 6 2>/dev/null; then
+        exec 6>&-
         return 0
     fi
 
@@ -11753,8 +4896,8 @@ collect_machine_traffic() {
         fi
     fi
 
-    flock -u 8 2>/dev/null || true
-    exec 8>&-
+    flock -u 6 2>/dev/null || true
+    exec 6>&-
     return 0
 }
 
@@ -11768,1247 +4911,989 @@ machine_traffic_summary() {
     printf '入 %s / 出 %s' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
 }
 
-filter_machine_traffic_cron_entries() {
-    awk '
-        /# port-traffic-dog machine traffic/ { next }
-        /port-traffic-dog.*--collect-machine-traffic/ { next }
-        { print }
-    '
+# ── 安装、更新、卸载 ──────────────────────────────────────────────
+# 更新只接受 GitHub Release 资产，并用同一 Release 的 SHA256SUMS 校验；镜像只用于加速，
+# 不论从哪个源下载都必须通过哈希校验。
+
+readonly SHORTCUT_MARKER="# port-traffic-dog shortcut"
+
+release_asset_url() {
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "$DOG_REPO" "$1"
 }
 
-setup_machine_traffic_cron() {
-    command -v crontab >/dev/null 2>&1 || return 0
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_machine_traffic_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    echo "* * * * * $script_path --collect-machine-traffic >/dev/null 2>&1  # port-traffic-dog machine traffic" >> "$temp_cron"
-    finish_cron_update "$temp_cron"
-}
-
-remove_machine_traffic_cron() {
-    command -v crontab >/dev/null 2>&1 || return 0
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_machine_traffic_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
-}
-
-filter_traffic_snapshot_cron_entries() {
-    awk '
-        /# port-traffic-dog traffic snapshot/ { next }
-        /port-traffic-dog.*--snapshot-traffic/ { next }
-        /port-traffic-dog.*--send-snapshot/ { next }
-        /port-traffic-dog.*--create-snapshot/ { next }
-        /\/etc\/port-traffic-dog\/data\/snapshots/ { next }
-        { print }
-    '
-}
-
-setup_traffic_snapshot_cron() {
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-
-    validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || { rm -f "$temp_cron"; return 1; }
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-
-    local active_ports_status=0
-    has_active_ports || active_ports_status=$?
-    if [ "$active_ports_status" -gt 1 ]; then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    if [ "$active_ports_status" -eq 0 ]; then
-        echo "* * * * * $script_path --snapshot-traffic >/dev/null 2>&1  # port-traffic-dog traffic snapshot" >> "$temp_cron"
-    fi
-    local result=0
-    finish_cron_update "$temp_cron" || result=1
-    setup_runtime_restore_cron || result=1
-    ensure_cron_service_running || result=1
-    return "$result"
-}
-
-remove_traffic_snapshot_cron() {
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_traffic_snapshot_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-
-    finish_cron_update "$temp_cron"
-}
-
-filter_runtime_restore_cron_entries() {
-    awk '
-        /# port-traffic-dog runtime restore/ { next }
-        /# port-traffic-dog expiry reboot check/ { next }
-        /port-traffic-dog.*--restore-runtime/ { next }
-        /port-traffic-dog.*--restore-nft-runtime/ { next }
-        /^@reboot[[:space:]].*port-traffic-dog.*--check-port-expirations/ { next }
-        { print }
-    '
-}
-
-setup_runtime_restore_cron() {
-    command -v crontab >/dev/null 2>&1 || return 0
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    # 到期封锁和 nftables 计数不依赖 TC；TC 开机恢复只由共享 systemd oneshot 负责。
-    echo "@reboot $script_path --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry reboot check" >> "$temp_cron"
-    echo "@reboot $script_path --restore-nft-runtime >/dev/null 2>&1  # port-traffic-dog runtime restore" >> "$temp_cron"
-    finish_cron_update "$temp_cron"
-}
-
-remove_runtime_restore_cron() {
-    command -v crontab >/dev/null 2>&1 || return 0
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_runtime_restore_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    finish_cron_update "$temp_cron"
-}
-
-export_notification_functions() {
-    export -f setup_telegram_notification_cron
-    export -f setup_wecom_notification_cron
-    export -f select_notification_interval
-}
-
-setup_port_auto_reset_cron() {
-    setup_auto_reset_cron
-}
-
-setup_auto_reset_cron() {
-    local script_path
-    script_path=$(get_script_exec_path)
-    local temp_cron
-    temp_cron=$(mktemp) || return 1
-    local current_cron
-
-    begin_cron_update || { rm -f "$temp_cron"; return 1; }
-    if ! current_cron=$(read_current_crontab); then
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    fi
-    printf '%s\n' "$current_cron" | filter_port_auto_reset_cron_entries > "$temp_cron" || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-
-    local active_ports=()
-    local ports_output
-    ports_output=$(get_active_ports 2>/dev/null) || {
-        rm -f "$temp_cron"
-        release_cron_update
-        return 1
-    }
-    if [ -n "$ports_output" ]; then
-        mapfile -t active_ports <<< "$ports_output"
-    fi
-    local has_reset_policy=false
-    local has_expiry_date=false
-    local port
-    for port in "${active_ports[@]}"; do
-        if port_has_auto_reset_policy "$port"; then
-            ensure_port_next_reset_date "$port" >/dev/null 2>&1 || true
-            has_reset_policy=true
-        fi
-        local expiry_status=0
-        port_has_expiry_date "$port" || expiry_status=$?
-        if [ "$expiry_status" -eq 0 ]; then
-            has_expiry_date=true
-        elif [ "$expiry_status" -gt 1 ]; then
-            rm -f "$temp_cron"
-            release_cron_update
-            return 1
+# 下载到文件：先直连，失败再走镜像（PORT_TRAFFIC_DOG_MIRROR，默认 gh-proxy）。
+download_url() {
+    local url="$1" out="$2" mirror="${PORT_TRAFFIC_DOG_MIRROR:-https://v6.gh-proxy.org}" src
+    for src in "$url" "${mirror%/}/$url"; do
+        if curl -fsSL --connect-timeout "$SHORT_CONNECT_TIMEOUT" --max-time 120 "$src" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+            return 0
         fi
     done
-    # 服务到期与流量周期重置是两条独立生命周期，互不改变调度频率。
-    if [ "$has_reset_policy" = "true" ]; then
-        echo "*/5 * * * * $script_path --check-scheduled-resets >/dev/null 2>&1  # port-traffic-dog scheduled reset check" >> "$temp_cron"
-    fi
-    if [ "$has_expiry_date" = "true" ]; then
-        echo "* * * * * $script_path --check-port-expirations >/dev/null 2>&1  # port-traffic-dog expiry check" >> "$temp_cron"
-    fi
-
-    local result=0
-    finish_cron_update "$temp_cron" || result=1
-    if [ "$has_reset_policy" = "true" ] || [ "$has_expiry_date" = "true" ]; then
-        ensure_cron_service_running || result=1
-    fi
-    return "$result"
-}
-
-refresh_port_auto_reset_cron_from_config() {
-    setup_auto_reset_cron
-}
-
-refresh_all_cron_from_config() {
-    local result=0
-    setup_cron_environment || result=1
-    refresh_port_auto_reset_cron_from_config || result=1
-    refresh_notification_cron_from_config || result=1
-    setup_traffic_snapshot_cron || result=1
-    setup_machine_traffic_cron || result=1
-    return "$result"
-}
-
-legacy_cron_needs_migration() {
-    command -v crontab >/dev/null 2>&1 || return 1
-    local cron_content=""
-    cron_content=$(read_root_crontab_locked 2>/dev/null) || return 1
-    if printf '%s\n' "$cron_content" | grep -Eq \
-        'port-traffic-dog(\.sh)?.*--(reset-port|check-reset-port|send-snapshot|create-snapshot)|/etc/port-traffic-dog/data/snapshots'; then
-        return 0
-    fi
-    if has_active_ports &&
-       ! printf '%s\n' "$cron_content" | grep -q 'port-traffic-dog.*--restore-nft-runtime'; then
-        return 0
-    fi
-    if has_active_ports &&
-       ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]].*port-traffic-dog.*--check-port-expirations'; then
-        return 0
-    fi
     return 1
 }
 
-migrate_legacy_cron_if_needed() {
-    if legacy_cron_needs_migration; then
-        refresh_all_cron_from_config
-    fi
+# 下载 Release 资产并校验；$3 为已下载的 SHA256SUMS 文件。
+release_download_verified() {
+    local name="$1" out="$2" sums="$3" want got
+    download_url "$(release_asset_url "$name")" "$out" || { dog_error "下载 $name 失败"; return 1; }
+    want=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1; exit }' "$sums")
+    [ -n "$want" ] || { dog_error "SHA256SUMS 中没有 $name"; return 1; }
+    got=$(sha256sum "$out" | awk '{print $1}')
+    [ "$want" = "$got" ] || { dog_error "$name 校验失败（期望 $want，实际 $got），已拒绝安装"; return 1; }
 }
 
-remove_port_auto_reset_cron() {
-    setup_auto_reset_cron
+get_script_version_from_file() {
+    awk -F'"' '/^readonly SCRIPT_VERSION="[0-9]+(\.[0-9]+)+"/ { print $2; exit }' "$1" 2>/dev/null
 }
 
-# 格式化状态消息（HTML格式）
-format_status_message() {
-    local server_name="${1:-$(hostname)}"  # 接受服务器名称参数
-    local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local active_ports=($(get_active_ports))
-    local port_count=${#active_ports[@]}
-    local daily_total=$(get_daily_total_traffic)
-
-    local message="🔗 服务器: ${server_name} | ⏰ ${timestamp}
-────────────────────────────────────────
-状态: 监控中 | 守护端口: ${port_count}个 | 端口总流量: ${daily_total}
-────────────────────────────────────────
-$(format_port_list "telegram")"
-
-    echo "$message"
+# $1 < $2 时返回 0。
+version_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
 }
 
-# 格式化状态消息（纯文本text格式）
-format_text_status_message() {
-    local server_name="${1:-$(hostname)}"
-    local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local active_ports=($(get_active_ports))
-    local port_count=${#active_ports[@]}
-    local daily_total=$(get_daily_total_traffic)
-
-    local message="🔗 服务器: ${server_name} | ⏰ ${timestamp}
-────────────────────────────────────────
-状态: 监控中 | 守护端口: ${port_count}个 | 端口总流量: ${daily_total}
-────────────────────────────────────────
-$(format_port_list "telegram")"
-
-    echo "$message"
+# 归属判断：2.0 标记、指向安装路径的软链接，或 1.4/1.5 生成的单行包装脚本（exec bash <安装路径>）。
+shortcut_is_ours() {
+    [ ! -e "$SHORTCUT_PATH" ] && return 0
+    grep -qF "$SHORTCUT_MARKER" "$SHORTCUT_PATH" 2>/dev/null && return 0
+    [ "$(readlink -f "$SHORTCUT_PATH" 2>/dev/null)" = "$INSTALLED_SCRIPT_PATH" ] && return 0
+    [ -f "$SHORTCUT_PATH" ] && [ ! -L "$SHORTCUT_PATH" ] && [ "$(stat -c %s "$SHORTCUT_PATH" 2>/dev/null || echo 9999)" -lt 512 ] &&
+        [ "$(grep -Evc '^[[:space:]]*(#.*)?$' "$SHORTCUT_PATH" 2>/dev/null)" = 1 ] &&
+        grep -Eq "^exec bash \"?${INSTALLED_SCRIPT_PATH//./\\.}\"? \"\\\$@\"\$" "$SHORTCUT_PATH" 2>/dev/null
 }
 
-# 格式化状态消息（Markdown格式）
-format_markdown_status_message() {
-    local server_name="${1:-$(hostname)}"
-    local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local active_ports=($(get_active_ports))
-    local port_count=${#active_ports[@]}
-    local daily_total=$(get_daily_total_traffic)
-
-    local message="🔗 **服务器**: ${server_name} | ⏰ ${timestamp}
-────────────────────────────────────────
-**状态**: 监控中 | **守护端口**: ${port_count}个 | **端口总流量**: ${daily_total}
-────────────────────────────────────────
-$(format_port_list "telegram")"
-
-    echo "$message"
-}
-
-# 记录通知日志
-log_notification() {
-    local message="$1"
-    local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
-    local log_file="$CONFIG_DIR/logs/notification.log"
-
-    mkdir -p "$(dirname "$log_file")"
-
-    echo "[$timestamp] $message" >> "$log_file"
-
-    # 日志轮转：防止日志文件过大
-    if [ -f "$log_file" ] && [ $(wc -l < "$log_file") -gt 1000 ]; then
-        tail -n 500 "$log_file" > "${log_file}.tmp"
-        mv "${log_file}.tmp" "$log_file"
-    fi
-}
-
-# 通用状态通知发送函数
-send_status_notification() {
-    local active_ports_status=0
-    has_active_ports || active_ports_status=$?
-    [ "$active_ports_status" -eq 0 ] || {
-        [ "$active_ports_status" -eq 1 ] && return 0
-        return 1
-    }
-
-    local success_count=0
-    local total_count=0
-
-    # 发送Telegram通知
-    if load_telegram_module; then
-        total_count=$((total_count + 1))
-        if telegram_send_status_notification; then
-            success_count=$((success_count + 1))
-        fi
-    fi
-
-    # 发送企业wx 通知
-    local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
-    if [ -f "$wecom_script" ]; then
-        source "$wecom_script"
-        total_count=$((total_count + 1))
-        if wecom_send_status_notification; then
-            success_count=$((success_count + 1))
-        fi
-    fi
-
-    if [ $total_count -eq 0 ]; then
-        log_notification "通知模块不存在"
-        echo -e "${RED}通知模块不存在${NC}"
-        return 1
-    elif [ $success_count -gt 0 ]; then
-        echo -e "${GREEN}状态通知发送成功 ($success_count/$total_count)${NC}"
+create_shortcut() {
+    if ! shortcut_is_ours; then
+        echo -e "${YELLOW}$SHORTCUT_PATH 已被其他程序占用，未创建快捷命令；请使用 $INSTALLED_SCRIPT_PATH${NC}" >&2
         return 0
-    else
-        echo -e "${RED}状态通知发送失败${NC}"
-        return 1
     fi
+    printf '#!/bin/sh\n%s\nexec %s "$@"\n' "$SHORTCUT_MARKER" "$INSTALLED_SCRIPT_PATH" | atomic_write "$SHORTCUT_PATH" 755
 }
 
-self_check() {
-    local total=0
-    local failed=0
-    local warned=0
-
-    check_ok() {
-        total=$((total + 1))
-        echo -e "${GREEN}[OK]${NC} $1"
-    }
-
-    check_warn() {
-        total=$((total + 1))
-        warned=$((warned + 1))
-        echo -e "${YELLOW}[WARN]${NC} $1"
-    }
-
-    check_fail() {
-        total=$((total + 1))
-        failed=$((failed + 1))
-        echo -e "${RED}[FAIL]${NC} $1"
-    }
-
-    echo -e "${BLUE}=== 端口流量狗 自检 ===${NC}"
-    echo
-
-    if [ -f "$CONFIG_FILE" ]; then
-        if validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then
-            check_ok "配置文件结构、端口范围与兼容字段有效: $CONFIG_FILE"
-        else
-            check_fail "配置文件无效或存在重叠端口: $CONFIG_FILE"
-        fi
-    else
-        check_fail "配置文件不存在: $CONFIG_FILE"
+# 把当前运行的脚本安装到固定位置（首次运行下载的脚本时自动调用）。
+install_self() {
+    if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ]; then
+        bash -n "$SCRIPT_PATH" || { dog_error "脚本语法检查失败，未安装"; return 1; }
+        cat "$SCRIPT_PATH" | atomic_write "$INSTALLED_SCRIPT_PATH" 755 || return 1
     fi
+    create_shortcut || true
+    ensure_config || return 1
+    if [ -f "$SCRIPT_PATH" ] && [ -f "$(dirname "$SCRIPT_PATH")/port-ip-guard.sh" ] && [ ! -f "$IP_GUARD_SCRIPT_PATH" ]; then
+        install_ip_guard_script_file "$(dirname "$SCRIPT_PATH")/port-ip-guard.sh" >/dev/null 2>&1 || true
+    fi
+    dog_log_event install 0
+}
 
-    local invalid_quota_ports=()
-    local configured_ports=()
-    mapfile -t configured_ports < <(get_active_ports 2>/dev/null || true)
-    local configured_port
-    for configured_port in "${configured_ports[@]}"; do
-        local quota_enabled
-        quota_enabled=$(jq -r --arg port "$configured_port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE" 2>/dev/null || echo true)
-        local quota_limit
-        quota_limit=$(jq -r --arg port "$configured_port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE" 2>/dev/null || echo unlimited)
-        if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
-            local quota_bytes
-            quota_bytes=$(parse_size_to_bytes "$quota_limit" 2>/dev/null || echo 0)
-            if ! [[ "$quota_bytes" =~ ^[0-9]+$ ]] || [ "$quota_bytes" -le 0 ]; then
-                invalid_quota_ports+=("$configured_port")
-            fi
+# 更新后由新版本执行的维护：迁移、恢复规则、刷新定时任务。
+post_update() {
+    local rc=0
+    ensure_config || return 1
+    if legacy_needs_migration; then
+        migrate_from_legacy || return 1
+    fi
+    validate_config_file "$CONFIG_FILE" || return 1
+    restore_runtime || rc=1
+    cron_sync || rc=1
+    tc_write_interop || true
+    return "$rc"
+}
+
+update_dog() {
+    local force="${1:-}" tmp sums new cur ver backup guard_installed=false rc=0
+    tmp=$(mktemp -d) || return 1
+    sums="$tmp/SHA256SUMS"; new="$tmp/port-traffic-dog.sh"
+    echo "正在从 GitHub Release 获取最新版本（$DOG_REPO）..."
+    if ! download_url "$(release_asset_url SHA256SUMS)" "$sums"; then
+        rm -rf "$tmp"; dog_error "无法下载 SHA256SUMS（仓库尚无 Release 或网络不可达）"; return 1
+    fi
+    release_download_verified port-traffic-dog.sh "$new" "$sums" || { rm -rf "$tmp"; return 1; }
+    bash -n "$new" || { rm -rf "$tmp"; dog_error "新脚本语法检查失败"; return 1; }
+    ver=$(get_script_version_from_file "$new")
+    cur="$SCRIPT_VERSION"
+    echo "当前版本 $cur，最新版本 ${ver:-未知}"
+    if [ -z "$ver" ]; then rm -rf "$tmp"; dog_error "无法识别新脚本版本"; return 1; fi
+    if [ "$ver" = "$cur" ] && [ "$force" != "--force" ]; then rm -rf "$tmp"; echo "已是最新版本"; return 0; fi
+    if version_lt "$ver" "$cur" && [ "$force" != "--force" ]; then
+        rm -rf "$tmp"; dog_error "Release 版本 $ver 低于当前 $cur，已拒绝降级（如确需降级请加 --force）"; return 1
+    fi
+    [ -f "$IP_GUARD_SCRIPT_PATH" ] && guard_installed=true
+    # 只在服务原本运行时才重启（与 1.5.x 一致）；状态无法确认时不动任何文件。
+    local guard_state=absent
+    if ! guard_state=$(get_ip_guard_service_state); then
+        rm -rf "$tmp"; dog_error "无法确认 IP Guard 服务状态，已停止更新"; return 1
+    fi
+    if [ "$guard_installed" = "true" ]; then
+        release_download_verified port-ip-guard.sh "$tmp/port-ip-guard.sh" "$sums" || { rm -rf "$tmp"; return 1; }
+    fi
+    backup="$BACKUP_DIR/update-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup" && chmod 700 "$backup"
+    cp -p "$INSTALLED_SCRIPT_PATH" "$backup/" 2>/dev/null || true
+    cp -p "$CONFIG_FILE" "$TRAFFIC_DATA_FILE" "$TRAFFIC_STATS_FILE" "$backup/" 2>/dev/null || true
+    cp -p "$IP_GUARD_SCRIPT_PATH" "$backup/" 2>/dev/null || true
+    crontab -l > "$backup/crontab.txt" 2>/dev/null || true
+    atomic_write "$INSTALLED_SCRIPT_PATH" 755 < "$new" || { rm -rf "$tmp"; return 1; }
+    if [ "$guard_installed" = "true" ]; then
+        if ! install_ip_guard_script_file "$tmp/port-ip-guard.sh"; then
+            rc=1
+        elif [ "$guard_state" = active ] && ! restart_ip_guard_after_update; then
+            rc=1; dog_error "IP Guard 服务重启或自检失败，请执行 systemctl status $IP_GUARD_SERVICE 检查"
         fi
+    fi
+    create_shortcut || true
+    if ! "$INSTALLED_SCRIPT_PATH" --post-update; then
+        echo -e "${RED}新版本维护失败，正在恢复更新前的文件...${NC}" >&2
+        cp -p "$backup/port-traffic-dog.sh" "$INSTALLED_SCRIPT_PATH" 2>/dev/null || true
+        for f in config.json traffic_data.json traffic_stats.json; do
+            [ -f "$backup/$f" ] && cp -p "$backup/$f" "$CONFIG_DIR/$f"
+        done
+        [ -f "$backup/port-ip-guard.sh" ] && cp -p "$backup/port-ip-guard.sh" "$IP_GUARD_SCRIPT_PATH"
+        [ -f "$backup/crontab.txt" ] && crontab "$backup/crontab.txt" 2>/dev/null || true
+        rm -rf "$tmp"
+        dog_log_event install_rollback 0
+        dog_error "已恢复到 $cur（备份 $backup）"
+        return 1
+    fi
+    rm -rf "$tmp"
+    dog_log_event install "$rc"
+    echo -e "${GREEN}已更新到 $ver（更新前备份：$backup）${NC}"
+    return "$rc"
+}
+
+uninstall_dog() {
+    local keep_config="${1:-}" iface id rc=0
+    echo -e "${YELLOW}将删除全部端口监控规则、限速、定时任务和 Dog 程序文件。${NC}"
+    if [ "$keep_config" = "--keep-config" ]; then
+        echo "配置与统计将保留在 $CONFIG_DIR"
+    else
+        echo "配置与统计也会删除（可加 --keep-config 保留）"
+    fi
+    confirm "确认卸载" || { echo "已取消"; return 0; }
+    dog_lock || return 75
+    cron_remove_all || rc=1
+    if config_exists && [ "$(config_schema)" = "2" ]; then
+        begin_tc_update && {
+            while IFS= read -r id; do
+                [ -n "$id" ] || continue
+                monitor_tc_rate "$id" >/dev/null && { tc_remove_monitor_locked "$id" || rc=1; }
+            done < <(monitor_ids)
+            iface=$(get_default_interface 2>/dev/null) && cleanup_owned_tc_root_if_unused_locked "$iface"
+            finish_tc_update
+        }
+    fi
+    if nft_table_exists; then nft delete table "$NFT_FAMILY" "$NFT_TABLE" || rc=1; fi
+    if [ -f "$IP_GUARD_SCRIPT_PATH" ]; then
+        bash "$IP_GUARD_SCRIPT_PATH" --uninstall --yes || rc=1
+    fi
+    rm -f "$TC_INTEROP_FILE"
+    dog_unlock
+    if [ "$keep_config" != "--keep-config" ]; then
+        rm -rf "$CONFIG_DIR" || rc=1
+    fi
+    shortcut_is_ours && rm -f "$SHORTCUT_PATH"
+    rm -f "$INSTALLED_SCRIPT_PATH" || rc=1
+    cleanup_tc_recovery_files_if_unused || true
+    if [ "$rc" -eq 0 ]; then
+        echo -e "${GREEN}卸载完成。依赖软件包未删除，如需移除可运行：bash port-traffic-dog.sh --dependencies remove${NC}"
+    else
+        echo -e "${YELLOW}卸载完成，但有部分清理步骤失败，请检查 nft list ruleset 与 tc qdisc show${NC}"
+    fi
+    return "$rc"
+}
+
+# ── 配置导出 / 导入 ───────────────────────────────────────────────
+# 配置包是 tar.gz，根目录 port-traffic-dog-config/。导入只读取白名单中的 JSON 数据文件，
+# 不会导入任何可执行内容（1.5.x 会把包内的通知脚本复制进来并由 root cron 执行）。
+
+readonly CONFIG_IO_FILES="config.json traffic_data.json traffic_stats.json reset_history.json"
+
+export_config() {
+    local out_dir="${1:-/root}" ts tmp pkg archive f
+    ts=$(date +%Y%m%d-%H%M%S)
+    archive="$out_dir/port-traffic-dog-config-$ts.tar.gz"
+    dog_lock || return 75
+    if has_monitors && ! stats_snapshot; then
+        echo -e "${YELLOW}警告：刷新内核计数失败，导出的流量为最近一次灾备值${NC}" >&2
+    fi
+    tmp=$(mktemp -d); pkg="$tmp/port-traffic-dog-config"
+    mkdir -p "$pkg"
+    for f in $CONFIG_IO_FILES; do
+        [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$pkg/"
     done
-    if [ ${#invalid_quota_ports[@]} -eq 0 ]; then
-        check_ok "端口配额配置有效"
-    else
-        check_fail "端口配额配置无效: ${invalid_quota_ports[*]}"
-    fi
+    dog_unlock
+    printf 'version=%s\nexported_at=%s\nhost=%s\nmonitors=%s\n' "$SCRIPT_VERSION" "$(date -u +%FT%TZ)" \
+        "$(hostname)" "$(jq -r '[.monitors | keys[]] | join(" ")' "$CONFIG_FILE" 2>/dev/null)" > "$pkg/package_info.txt"
+    ( umask 077; tar -czf "$archive" -C "$tmp" port-traffic-dog-config ) || { rm -rf "$tmp"; dog_error "打包失败"; return 1; }
+    rm -rf "$tmp"
+    chmod 600 "$archive"
+    dog_log_event export_config 0
+    echo -e "${GREEN}已导出：$archive（包含 Telegram/企业微信凭据，请妥善保管）${NC}"
+}
 
-    local corrupt_stats_files=()
-    shopt -s nullglob
-    corrupt_stats_files=("${TRAFFIC_STATS_FILE}.corrupt."*)
-    shopt -u nullglob
-    if [ -f "$TRAFFIC_STATS_FILE" ]; then
-        if jq -e 'type == "object" and (.daily | type == "object") and (.last_snapshot | type == "object")' \
-            "$TRAFFIC_STATS_FILE" >/dev/null 2>&1; then
-            if [ ${#corrupt_stats_files[@]} -gt 0 ]; then
-                check_warn "自然日流量统计文件有效，但存在 ${#corrupt_stats_files[@]} 个已隔离的损坏备份"
+import_config() {
+    local archive="$1" tmp src backup f schema rc=0
+    [ -f "$archive" ] || { dog_error "文件不存在：$archive"; return 1; }
+    tmp=$(mktemp -d)
+    # 只提取白名单文件；拒绝绝对路径、.. 与非普通文件。
+    if tar -tvzf "$archive" 2>/dev/null | awk 'substr($1,1,1) !~ /^[-d]$/ {bad=1} END {exit !bad}'; then
+        rm -rf "$tmp"; dog_error "配置包含有链接或设备文件，已拒绝"; return 1
+    fi
+    local listing
+    # 先完整取出清单再匹配：管道里 grep -q 提前退出会让 tar 收到 SIGPIPE，pipefail 下整个判断变假，
+    # 不安全路径反而被放行。
+    listing=$(tar -tzf "$archive" 2>/dev/null) || { rm -rf "$tmp"; dog_error "无法读取归档：$archive"; return 1; }
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' <<< "$listing"; then
+        rm -rf "$tmp"; dog_error "配置包含有不安全路径，已拒绝"; return 1
+    fi
+    for f in $CONFIG_IO_FILES; do
+        tar -xzf "$archive" -C "$tmp" "port-traffic-dog-config/$f" 2>/dev/null || true
+    done
+    src="$tmp/port-traffic-dog-config"
+    [ -s "$src/config.json" ] || { rm -rf "$tmp"; dog_error "配置包中没有 config.json"; return 1; }
+    schema=$(jq -r '.schema // (if has("ports") then 1 else 0 end)' "$src/config.json" 2>/dev/null || echo 0)
+    case "$schema" in
+        2) validate_config_file "$src/config.json" || { rm -rf "$tmp"; dog_error "配置无效，未导入"; return 1; } ;;
+        1) echo -e "${YELLOW}这是 1.5.x 导出的配置包，将按旧格式迁移（流量取包内灾备值）${NC}" ;;
+        *) rm -rf "$tmp"; dog_error "无法识别的配置格式"; return 1 ;;
+    esac
+    if [ "$schema" = "1" ] && jq -e '[.ports[] | select((.bandwidth_limit.enabled // false))] | length > 0' "$src/config.json" >/dev/null; then
+        tc_require_ntc_compatible || { rm -rf "$tmp"; return 1; }
+    fi
+    if has_monitors; then
+        echo -e "${YELLOW}导入会替换当前全部 $(monitor_ids | grep -c .) 个监控项及其统计。${NC}"
+    fi
+    confirm "确认导入" || { rm -rf "$tmp"; return 0; }
+
+    dog_lock || { rm -rf "$tmp"; return 75; }
+    backup="$BACKUP_DIR/import-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup" && chmod 700 "$backup"
+    has_monitors && stats_snapshot >/dev/null 2>&1 || true
+    for f in $CONFIG_IO_FILES; do [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$backup/"; done
+    teardown_runtime
+    for f in $CONFIG_IO_FILES; do
+        rm -f "$CONFIG_DIR/$f"
+        [ -f "$src/$f" ] && install -m 600 "$src/$f" "$CONFIG_DIR/$f"
+    done
+    rm -rf "$tmp"
+    if [ "$schema" = "1" ]; then
+        migrate_from_legacy || rc=1
+    else
+        nft_rebuild_all || rc=1
+        [ "$rc" -eq 0 ] && { stats_rebaseline_all || true; tc_restore_all || rc=1; }
+    fi
+    if [ "$rc" -ne 0 ]; then
+        echo -e "${RED}导入失败，正在恢复原配置...${NC}" >&2
+        teardown_runtime
+        for f in $CONFIG_IO_FILES; do
+            rm -f "$CONFIG_DIR/$f"
+            [ -f "$backup/$f" ] && cp -p "$backup/$f" "$CONFIG_DIR/$f"
+        done
+        config_exists || ensure_config
+        nft_rebuild_all || true
+        tc_restore_all || true
+    fi
+    dog_unlock
+    cron_sync || true
+    dog_log_event import_config "$rc"
+    [ "$rc" -eq 0 ] && echo -e "${GREEN}导入完成（原配置备份：$backup）${NC}"
+    return "$rc"
+}
+
+# 拆除当前全部运行状态（TC 限速与 nft 表），不改配置文件。调用方持有 Dog 锁。
+teardown_runtime() {
+    local id iface
+    if config_exists && [ "$(config_schema)" = "2" ]; then
+        if begin_tc_update; then
+            while IFS= read -r id; do
+                [ -n "$id" ] || continue
+                monitor_tc_rate "$id" >/dev/null && tc_remove_monitor_locked "$id" >/dev/null 2>&1
+            done < <(monitor_ids)
+            iface=$(get_default_interface 2>/dev/null) && cleanup_owned_tc_root_if_unused_locked "$iface" >/dev/null 2>&1
+            finish_tc_update
+        fi
+    fi
+    nft_table_exists && nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || true
+}
+
+# ── 交互菜单 ──────────────────────────────────────────────────────
+# 所有子菜单都是循环，返回即回到上一级（1.5.x 的菜单互相递归调用，层数越用越深）。
+
+menu_text_width() {
+    local text="$1" index character code width=0 LC_CTYPE=C.UTF-8
+    for ((index=0; index<${#text}; index++)); do
+        character="${text:index:1}"
+        printf -v code '%d' "'$character"
+        if (( code >= 0x300 && code <= 0x36f )); then continue; fi
+        if (( code >= 0x1100 && (code <= 0x115f || code >= 0x2e80) )); then
+            width=$((width+2))
+        else width=$((width+1)); fi
+    done
+    printf '%s' "$width"
+}
+
+menu_columns() {
+    local columns="${COLUMNS:-80}" size
+    if [ -t 1 ]; then
+        size=$(stty size 2>/dev/null) || size=''
+        [ -z "$size" ] || columns="${size##* }"
+    fi
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
+    printf '%s' "$columns"
+}
+
+menu_item() {
+    local number="$1" text="$2" columns="${3:-80}" index character width=4 amount
+    local LC_CTYPE=C.UTF-8
+    printf '%b%2s.%b ' "$BLUE" "$number" "$NC"
+    for ((index=0; index<${#text}; index++)); do
+        character="${text:index:1}"
+        amount=$(menu_text_width "$character")
+        if [ "$((width+amount))" -gt "$columns" ]; then printf '\n    '; width=4; fi
+        printf '%s' "$character"
+        width=$((width+amount))
+    done
+    printf '\n'
+}
+
+readonly -a MAIN_MENU_LABELS=(
+    '添加监控项' '修改端口（加/减/替换/拆分/合并）'
+    '删除监控项' '配额与自动重置'
+    '带宽限制' '服务到期'
+    '计费模式与备注' '立即重置流量'
+    '通知管理' '系统自检/修复'
+    'TC 冲突处理/自动恢复' '在线 IP / 并发限制（测试中）'
+    '依赖检测/安装/卸载' '配置导出/导入'
+    '查看日志' '更新脚本'
+    '卸载'
+)
+
+show_main_menu_options() {
+    local columns index left right width n="${#MAIN_MENU_LABELS[@]}" lw=0 rw=0
+    columns=$(menu_columns)
+    # 左列宽度取最长左侧标签，保证右列对齐；两列放不下时改为单列。
+    for ((index = 0; index < n; index++)); do
+        width=$(menu_text_width "${MAIN_MENU_LABELS[index]}")
+        if ((index % 2 == 0)); then ((width > lw)) && lw=$width; else ((width > rw)) && rw=$width; fi
+    done
+    if [ $((4 + lw + 2 + 4 + rw)) -le "$columns" ]; then
+        for ((index = 0; index < n; index += 2)); do
+            left="${MAIN_MENU_LABELS[index]}"
+            if [ $((index + 1)) -lt "$n" ]; then
+                right="${MAIN_MENU_LABELS[index + 1]}"
+                width=$(menu_text_width "$left")
+                printf '%b%2d.%b %s%*s%b%2d.%b %s\n' "$BLUE" "$((index + 1))" "$NC" "$left" "$((lw - width + 2))" '' \
+                    "$BLUE" "$((index + 2))" "$NC" "$right"
             else
-                check_ok "自然日流量统计文件有效"
-            fi
-        else
-            check_fail "自然日流量统计文件损坏: $TRAFFIC_STATS_FILE"
-        fi
-    elif [ ${#corrupt_stats_files[@]} -gt 0 ]; then
-        check_fail "自然日流量统计文件损坏并已隔离: ${corrupt_stats_files[-1]}"
-    else
-        check_warn "尚未生成自然日流量统计文件"
-    fi
-
-    if [ ${#configured_ports[@]} -gt 0 ]; then
-        if [ -f "$TRAFFIC_DATA_FILE" ] && jq -e 'type == "object"' "$TRAFFIC_DATA_FILE" >/dev/null 2>&1; then
-            check_ok "流量恢复备份文件有效"
-        else
-            check_warn "流量恢复备份尚未生成，下一次分钟快照会自动创建"
-        fi
-    fi
-
-    if command -v nft >/dev/null 2>&1; then
-        if nft_runtime_base_chains_valid; then
-            check_ok "nftables base chain 的 hook 与优先级契约有效"
-        else
-            check_fail "nftables base chain 缺失或 hook/优先级冲突"
-        fi
-        local invalid_rule_ports=()
-        for configured_port in "${configured_ports[@]}"; do
-            local billing_mode
-            billing_mode=$(jq -r --arg port "$configured_port" '.ports[$port].billing_mode // "double"' "$CONFIG_FILE" 2>/dev/null || echo double)
-            local expected_in_count
-            expected_in_count=$(get_expected_counter_rule_count "$billing_mode" "$configured_port")
-            local expected_out_count="$expected_in_count"
-
-            local actual_in_count
-            actual_in_count=$(count_counter_rules "$configured_port" in)
-            local actual_out_count
-            actual_out_count=$(count_counter_rules "$configured_port" out)
-            local expected_quota_count=0
-            local quota_enabled
-            quota_enabled=$(jq -r --arg port "$configured_port" '.ports[$port].quota.enabled // true' "$CONFIG_FILE" 2>/dev/null || echo true)
-            local quota_limit
-            quota_limit=$(jq -r --arg port "$configured_port" '.ports[$port].quota.monthly_limit // "unlimited"' "$CONFIG_FILE" 2>/dev/null || echo unlimited)
-            if [ "$quota_enabled" = "true" ] && [ "$quota_limit" != "unlimited" ]; then
-                expected_quota_count=$(get_expected_quota_rule_count "$billing_mode" "$configured_port")
-            fi
-            local actual_quota_count
-            actual_quota_count=$(count_quota_rules "$configured_port")
-            local quota_limit_matches=true
-            if [ "$expected_quota_count" -gt 0 ]; then
-                if ! nftables_quota_limit_matches "$configured_port" "$quota_limit"; then
-                    quota_limit_matches=false
-                fi
-            elif ! nftables_quota_is_absent "$configured_port"; then
-                quota_limit_matches=false
-            fi
-            local expiry_rules_match=true
-            if ! port_expiry_rules_complete "$configured_port"; then
-                expiry_rules_match=false
-            fi
-            local invalid_order=""
-            if [ "$actual_in_count" -eq "$expected_in_count" ] && \
-               [ "$actual_out_count" -eq "$expected_out_count" ]; then
-                invalid_order=$(get_invalid_counter_order_directions "$configured_port" 2>/dev/null) || invalid_order="unknown"
-            fi
-
-            if [ "$actual_in_count" -ne "$expected_in_count" ] || \
-               [ "$actual_out_count" -ne "$expected_out_count" ] || \
-               [ "$actual_quota_count" -ne "$expected_quota_count" ] || \
-               [ "$quota_limit_matches" != "true" ] || \
-               [ "$expiry_rules_match" != "true" ] || \
-               [ -n "$invalid_order" ]; then
-                invalid_rule_ports+=("$configured_port")
+                menu_item "$((index + 1))" "$left" "$columns"
             fi
         done
-        if [ ${#invalid_rule_ports[@]} -eq 0 ]; then
-            check_ok "流量计数、配额与服务到期规则完整"
-        else
-            check_fail "流量计数、配额或服务到期规则异常: ${invalid_rule_ports[*]}"
-        fi
-
-        local orphaned_runtime_objects=""
-        local orphaned_expiry_rules=""
-        local orphan_status=0
-        orphaned_runtime_objects=$(list_orphaned_runtime_objects 2>/dev/null) || orphan_status=$?
-        if [ "$orphan_status" -eq 0 ]; then
-            orphaned_expiry_rules=$(list_orphaned_expiry_rules 2>/dev/null) || orphan_status=$?
-        fi
-        if [ "$orphan_status" -ne 0 ]; then
-            check_fail "无法核对 nftables 孤儿运行对象/到期规则"
-        elif [ -z "$orphaned_runtime_objects" ] && [ -z "$orphaned_expiry_rules" ]; then
-            check_ok "nftables 运行对象与当前端口配置一致"
-        else
-            check_fail "发现未被当前配置使用的 nftables 对象/到期规则: $(printf '%s\n%s' "$orphaned_runtime_objects" "$orphaned_expiry_rules" | tr '\n' ' ')"
-        fi
-
-        local inconsistent_usage_ports=()
-        for configured_port in "${configured_ports[@]}"; do
-            if ! port_counter_quota_usage_consistent "$configured_port"; then
-                inconsistent_usage_ports+=("$configured_port")
-            fi
-        done
-        if [ ${#inconsistent_usage_ports[@]} -eq 0 ]; then
-            check_ok "流量 counter 与 quota 当前周期用量一致"
-        else
-            check_fail "流量 counter 与 quota 当前周期用量不一致: ${inconsistent_usage_ports[*]}"
-        fi
-
-        local invalid_tc_ports=()
-        for configured_port in "${configured_ports[@]}"; do
-            local limit_enabled
-            local rate_limit
-            limit_enabled=$(jq -r --arg port "$configured_port" '.ports[$port].bandwidth_limit.enabled // false' "$CONFIG_FILE")
-            rate_limit=$(jq -r --arg port "$configured_port" '.ports[$port].bandwidth_limit.rate // "unlimited"' "$CONFIG_FILE")
-            if [ "$limit_enabled" = "true" ] && [ "$rate_limit" != "unlimited" ] &&
-               ! tc_limit_runtime_complete "$configured_port"; then
-                invalid_tc_ports+=("$configured_port")
-            fi
-        done
-        if [ ${#invalid_tc_ports[@]} -eq 0 ]; then
-            check_ok "带宽限制运行状态有效"
-        else
-            check_fail "带宽限制规则不完整: ${invalid_tc_ports[*]}"
-        fi
-
-        local self_tc_interface
-        local ntc_rate=""
-        local ntc_state_status=0
-        self_tc_interface=$(get_default_interface 2>/dev/null || true)
-        if [ -z "$self_tc_interface" ]; then
-            check_fail "无法确定统一HTB使用的默认网卡"
-        else
-            ntc_rate=$(trafficcop_unified_state_rate "$self_tc_interface" 2>/dev/null) || ntc_state_status=$?
-            case "$ntc_state_status" in
-                0)
-                    if tc_root_is_managed "$self_tc_interface" &&
-                       tc_class_rate_matches "$self_tc_interface" "1:1" "$ntc_rate" &&
-                       tc_class_rate_matches "$self_tc_interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$ntc_rate"; then
-                        check_ok "TrafficCop整机上限优先，父类与Dog端口子类共用统一HTB"
-                    else
-                        check_fail "TrafficCop统一状态与1:1/1:30运行层级不一致"
-                    fi
-                    ;;
-                1|4)
-                    check_ok "当前网卡没有TrafficCop整机限速状态"
-                    ;;
-                3)
-                    local legacy_qdisc
-                    legacy_qdisc=$(tc_root_qdisc_line "$self_tc_interface" 2>/dev/null || true)
-                    if trafficcop_legacy_tbf_rate "$self_tc_interface" "$legacy_qdisc" >/dev/null 2>&1; then
-                        check_warn "检测到TrafficCop旧TBF；启用Dog端口限速时会安全迁移为统一HTB"
-                    elif tc_root_is_owned "$self_tc_interface" &&
-                         desired_tc_parent_rate "$self_tc_interface" >/dev/null 2>&1; then
-                        check_warn "TrafficCop仍是旧状态格式，统一HTB已迁移，请让NTC重新应用整机限速以升级状态"
-                    else
-                        check_fail "TrafficCop旧TC状态与当前root qdisc不一致"
-                    fi
-                    ;;
-                *)
-                    check_fail "TrafficCop TC状态文件格式、归属或权限无效"
-                    ;;
-            esac
-        fi
     else
-        check_warn "nft 命令不可用，跳过流量规则核对"
+        for ((index = 0; index < n; index++)); do menu_item "$((index + 1))" "${MAIN_MENU_LABELS[index]}" "$columns"; done
     fi
+    menu_item 0 退出 "$columns"
+}
 
-    if command -v crontab >/dev/null 2>&1; then
-        local cron_content
-        cron_content=$(read_root_crontab_locked 2>/dev/null || true)
-        local expected_reset_count=0
-        local expected_expiry_count=0
-        local has_reset_policy=false
-        local has_expiry_date=false
-        local cron_matches_config=true
-        for configured_port in "${configured_ports[@]}"; do
-            if port_has_auto_reset_policy "$configured_port"; then
-                has_reset_policy=true
-            fi
-            if port_has_expiry_date "$configured_port"; then
-                has_expiry_date=true
-            fi
-        done
-        if [ "$has_reset_policy" = "true" ]; then
-            expected_reset_count=1
-            if ! printf '%s\n' "$cron_content" | grep -Eq '^\*/5[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--check-scheduled-resets([[:space:]]|$)'; then
-                cron_matches_config=false
-            fi
-        fi
-        if [ "$has_expiry_date" = "true" ]; then
-            expected_expiry_count=1
-            if ! printf '%s\n' "$cron_content" | grep -Eq '^\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)'; then
-                cron_matches_config=false
-            fi
-        fi
-
-        local actual_reset_count
-        actual_reset_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--(reset-port|check-reset-port|check-scheduled-resets)' || true)
-        local actual_expiry_count
-        actual_expiry_count=$(printf '%s\n' "$cron_content" | grep -Ec '^[^@].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)' || true)
-        local actual_snapshot_count
-        actual_snapshot_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--snapshot-traffic' || true)
-        local actual_telegram_count
-        actual_telegram_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--send-telegram-status' || true)
-        local actual_wecom_count
-        actual_wecom_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--send-wecom-status' || true)
-        local actual_restore_count
-        actual_restore_count=$(printf '%s\n' "$cron_content" | grep -Ec 'port-traffic-dog\.sh[[:space:]]+--restore-nft-runtime' || true)
-        local actual_expiry_reboot_count
-        actual_expiry_reboot_count=$(printf '%s\n' "$cron_content" | grep -Ec '^@reboot[[:space:]].*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)' || true)
-
-        local expected_snapshot_count=0
-        local expected_telegram_count=0
-        local expected_wecom_count=0
-        local expected_restore_count=1
-        local expected_expiry_reboot_count=1
-        if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--restore-nft-runtime([[:space:]]|$)'; then
-            cron_matches_config=false
-        fi
-        if ! printf '%s\n' "$cron_content" | grep -Eq '^@reboot[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--check-port-expirations([[:space:]]|$)'; then
-            cron_matches_config=false
-        fi
-        if [ ${#configured_ports[@]} -gt 0 ]; then
-            expected_snapshot_count=1
-            if ! printf '%s\n' "$cron_content" | grep -Eq '^\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*port-traffic-dog\.sh[[:space:]]+--snapshot-traffic([[:space:]]|$)'; then
-                cron_matches_config=false
-            fi
-            if [ "$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
-               [ "$(jq -r '.notifications.telegram.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
-                expected_telegram_count=1
-                local telegram_interval
-                local telegram_schedule
-                telegram_interval=$(jq -r '.notifications.telegram.status_notifications.interval // "1h"' "$CONFIG_FILE")
-                telegram_schedule=$(notification_interval_cron_expression "$telegram_interval" 2>/dev/null || true)
-                if [ -z "$telegram_schedule" ] ||
-                   ! printf '%s\n' "$cron_content" | awk -v schedule="$telegram_schedule " '
-                       index($0, schedule) == 1 && /port-traffic-dog\.sh[[:space:]]+--send-telegram-status/ { found=1 }
-                       END { exit found ? 0 : 1 }
-                   '; then
-                    cron_matches_config=false
-                fi
-            fi
-            if [ "$(jq -r '.notifications.wecom.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ] &&
-               [ "$(jq -r '.notifications.wecom.status_notifications.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false)" = "true" ]; then
-                expected_wecom_count=1
-                local wecom_interval
-                local wecom_schedule
-                wecom_interval=$(jq -r '.notifications.wecom.status_notifications.interval // "1h"' "$CONFIG_FILE")
-                wecom_schedule=$(notification_interval_cron_expression "$wecom_interval" 2>/dev/null || true)
-                if [ -z "$wecom_schedule" ] ||
-                   ! printf '%s\n' "$cron_content" | awk -v schedule="$wecom_schedule " '
-                       index($0, schedule) == 1 && /port-traffic-dog\.sh[[:space:]]+--send-wecom-status/ { found=1 }
-                       END { exit found ? 0 : 1 }
-                   '; then
-                    cron_matches_config=false
-                fi
-            fi
-        fi
-
-        if [ "$actual_reset_count" -ne "$expected_reset_count" ] || \
-           [ "$actual_expiry_count" -ne "$expected_expiry_count" ] || \
-           [ "$actual_snapshot_count" -ne "$expected_snapshot_count" ] || \
-           [ "$actual_telegram_count" -ne "$expected_telegram_count" ] || \
-           [ "$actual_wecom_count" -ne "$expected_wecom_count" ] || \
-           [ "$actual_restore_count" -ne "$expected_restore_count" ] || \
-           [ "$actual_expiry_reboot_count" -ne "$expected_expiry_reboot_count" ]; then
-            cron_matches_config=false
-        fi
-
-        if [ "$cron_matches_config" = "true" ]; then
-            check_ok "定时任务与当前配置一致"
-        else
-            check_fail "定时任务与当前配置不一致（重置 ${actual_reset_count}/${expected_reset_count}，到期 ${actual_expiry_count}/${expected_expiry_count}，快照 ${actual_snapshot_count}/${expected_snapshot_count}，运行时恢复 ${actual_restore_count}/${expected_restore_count}，到期开机恢复 ${actual_expiry_reboot_count}/${expected_expiry_reboot_count}，Telegram ${actual_telegram_count}/${expected_telegram_count}，企业微信 ${actual_wecom_count}/${expected_wecom_count}）"
-        fi
-        if cron_service_is_running; then
-            check_ok "cron/crond 定时服务正在运行"
-        elif [ ${#configured_ports[@]} -eq 0 ]; then
-            check_warn "cron/crond 定时服务未运行（当前无监控端口）"
-        else
-            check_fail "cron/crond 定时服务未运行，自动重置和服务到期将不会执行"
-        fi
-    else
-        check_warn "crontab 命令不可用，跳过定时任务核对"
+# 监控项汇总表（只读一次 nft）。
+show_monitor_table() {
+    local values id idx=0 in_b out_b mult billed limit pct usage ports n
+    if ! has_monitors; then
+        echo "  （暂无监控项）"
+        return 1
     fi
-
-    if [ -f "$INSTALLED_SCRIPT_PATH" ]; then
-        check_ok "主脚本安装路径存在: $INSTALLED_SCRIPT_PATH"
-        if shortcut_command_is_valid; then
-            check_ok "快捷命令有效: $SHORTCUT_PATH"
-        else
-            check_fail "快捷命令缺失、不可执行或内容异常: $SHORTCUT_PATH"
+    values=$(nft_read_values 2>/dev/null || echo '{}')
+    printf '  %-3s %-5s %-34s %-12s %s\n' '#' 'ID' '端口 / 备注' '周期流量' '配额 / 状态'
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        idx=$((idx + 1))
+        read -r in_b out_b < <(jq -r --arg id "$id" '.[$id] // {} | "\(.in // 0) \(.out // 0)"' <<< "$values")
+        mult=$(monitor_billing_multiplier "$id")
+        billed=$(( (in_b + out_b) * mult ))
+        ports=$(monitor_label "$id")
+        n=$(monitor_ports "$id" | wc -l)
+        [ "$n" -gt 1 ] && ports="$ports [${n}项]"
+        usage="不限额"
+        limit=$(mget "$id" .quota.monthly_limit unlimited)
+        if [ "$(mget "$id" .quota.enabled false)" = "true" ] && [ "$limit" != "unlimited" ]; then
+            pct=$(( billed * 100 / $(parse_size_to_bytes "$limit") ))
+            usage="${limit} ${pct}%"
         fi
-    else
-        check_warn "主脚本安装路径不存在，当前使用: $SCRIPT_PATH"
-    fi
+        monitor_is_expired "$id" && usage+=" 已到期"
+        monitor_tc_rate "$id" >/dev/null && usage+=" 限速$(monitor_tc_rate "$id")"
+        jq -e --arg id "$id" 'has($id)' <<< "$values" >/dev/null || usage+=" ⚠计数缺失"
+        printf '  %-3s %-5s %-34s %-12s %s\n' "$idx" "$id" "$ports" "$(format_bytes "$billed")" "$usage"
+    done < <(monitor_ids)
+}
 
-    local dep_tools=("nft" "tc" "ss" "jq" "awk" "bc" "unzip" "cron" "curl" "conntrack" "flock")
-    local missing_dep=()
-    local dep
-    for dep in "${dep_tools[@]}"; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing_dep+=("$dep")
-        fi
-    done
-    if [ ${#missing_dep[@]} -eq 0 ]; then
-        check_ok "依赖命令完整"
-    else
-        check_fail "缺少依赖命令: ${missing_dep[*]}"
-    fi
-
-    local telegram_script="$CONFIG_DIR/notifications/telegram.sh"
-    local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
-    if [ -f "$telegram_script" ] && [ -f "$wecom_script" ]; then
-        check_ok "通知模块文件存在"
-    else
-        check_fail "通知模块缺失(telegram.sh 或 wecom.sh)"
-    fi
-
-    if load_telegram_module; then
-        if declare -F send_telegram_message >/dev/null 2>&1 && declare -F telegram_send_status_notification >/dev/null 2>&1; then
-            check_ok "Telegram模块函数完整"
-        else
-            check_fail "Telegram模块函数不完整"
-        fi
-    else
-        check_fail "Telegram模块加载失败"
-    fi
-
-    local telegram_route
-    local telegram_custom_base
-    local telegram_api_base_valid=true
-    telegram_route=$(jq -r '.notifications.telegram.api_route // "official"' "$CONFIG_FILE" 2>/dev/null || echo official)
-    telegram_custom_base=$(jq -r '.notifications.telegram.custom_api_base // ""' "$CONFIG_FILE" 2>/dev/null || true)
-    telegram_custom_base="${telegram_custom_base%/}"
-    if [ "$telegram_route" = "custom" ] &&
-       { ! declare -F telegram_api_base_is_secure >/dev/null 2>&1 ||
-         ! telegram_api_base_is_secure "$telegram_custom_base"; }; then
-        check_fail "Telegram自定义线路无效，发送已拒绝；请改用远程 HTTPS 或本机回环 HTTP"
-        telegram_api_base_valid=false
-    fi
-
-    local telegram_enabled
-    telegram_enabled=$(jq -r '.notifications.telegram.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo "false")
-    local bot_token
-    bot_token=$(jq -r '.notifications.telegram.bot_token // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
-    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ] &&
-       [ "$telegram_api_base_valid" = "true" ]; then
-        local api_base
-        if ! api_base=$(get_telegram_api_base 2>/dev/null); then
-            check_fail "Telegram线路配置无法解析，已跳过连通性检测"
-            telegram_api_base_valid=false
-        fi
-    fi
-    if [ "$telegram_enabled" = "true" ] && [ -n "$bot_token" ] && [ "$bot_token" != "null" ] &&
-       [ "$telegram_api_base_valid" = "true" ]; then
-        local getme_url
-        if [[ "$api_base" =~ /bot$ ]]; then
-            getme_url="${api_base}${bot_token}/getMe"
-        else
-            getme_url="${api_base}/bot${bot_token}/getMe"
-        fi
-        local getme_resp
-        getme_resp=$(curl -sS --connect-timeout 5 --max-time 12 "$getme_url" 2>/dev/null || true)
-        if echo "$getme_resp" | grep -q '"ok":true'; then
-            check_ok "Telegram线路与Token可用(getMe通过)"
-        else
-            local err_desc
-            err_desc=$(echo "$getme_resp" | jq -r '.description // empty' 2>/dev/null || true)
-            if [ -z "$err_desc" ]; then
-                err_desc=$(echo "$getme_resp" | tr '\n' ' ' | cut -c1-160)
-            fi
-            check_warn "Telegram连通性异常: ${err_desc:-无响应}"
-        fi
-    elif [ "$telegram_enabled" != "true" ] || [ -z "$bot_token" ] || [ "$bot_token" = "null" ]; then
-        check_warn "Telegram未启用或Token为空，跳过连通性检测"
-    fi
-
-    echo
-    echo "自检汇总: 总计 ${total} 项 | 失败 ${failed} 项 | 警告 ${warned} 项"
-    if [ "$failed" -eq 0 ]; then
-        echo -e "${GREEN}自检完成：可用${NC}"
+# 交互选择监控项：接受序号、ID（m3）或成员端口（8031）。输出 ID。
+select_monitor() {
+    local prompt="${1:-请选择监控项}" input ids id
+    mapfile -t ids < <(monitor_ids)
+    [ "${#ids[@]}" -gt 0 ] || { echo -e "${YELLOW}暂无监控项${NC}" >&2; return 1; }
+    show_monitor_table >&2 || true
+    read -r -p "$prompt（序号 / ID / 端口，回车取消）: " input
+    [ -n "$input" ] || return 1
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "${#ids[@]}" ] && [ "$input" -le 999 ]; then
+        echo "${ids[$((input - 1))]}"
         return 0
     fi
-    echo -e "${RED}自检完成：存在失败项，请先修复${NC}"
+    if id=$(resolve_monitor "$input"); then echo "$id"; return 0; fi
+    echo -e "${RED}找不到监控项：$input${NC}" >&2
     return 1
 }
 
-system_check_and_repair() {
-    clear 2>/dev/null || true
-    echo -e "${BLUE}=== 系统自检/修复 ===${NC}"
+menu_add_monitor() {
+    local input units unit remark id
+    echo -e "${BLUE}=== 添加监控项 ===${NC}"
+    show_listening_ports
     echo
-
-    echo -e "${YELLOW}[1/6] 检查依赖、权限和本地配置...${NC}"
-    local repair_status=0
-    local base_environment_ok=true
-
-    check_dependencies true
-    if ! init_config; then
-        echo -e "${RED}本地配置无效，无法继续自动修复${NC}"
-        return 1
-    fi
-    if ! setup_script_permissions; then
-        echo -e "${RED}脚本权限修复失败${NC}"
-        base_environment_ok=false
-        repair_status=1
-    fi
-    if ! setup_cron_environment; then
-        echo -e "${RED}cron 基础环境配置失败${NC}"
-        base_environment_ok=false
-        repair_status=1
-    fi
-    if ! create_shortcut_command >/dev/null; then
-        echo -e "${RED}快捷命令创建或校验失败${NC}"
-        base_environment_ok=false
-        repair_status=1
-    fi
-    install_tc_recovery_service_files >/dev/null 2>&1 || true
-    if [ "$base_environment_ok" = "true" ]; then
-        echo -e "${GREEN}基础运行环境已就绪${NC}"
-    fi
-
-    echo -e "${YELLOW}[2/6] 检查通知模块...${NC}"
-    if download_notification_modules >/dev/null 2>&1; then
-        echo -e "${GREEN}通知模块已就绪${NC}"
-    else
-        echo -e "${YELLOW}通知模块补齐失败，将在自检结果中显示${NC}"
-    fi
-
-    echo -e "${YELLOW}[3/6] 重建端口重置和通知定时任务...${NC}"
-    if refresh_all_cron_from_config; then
-        echo -e "${GREEN}定时任务已按当前配置刷新${NC}"
-    else
-        echo -e "${RED}定时任务刷新失败，已保留可读取的现有任务${NC}"
-        repair_status=1
-    fi
-
-    echo -e "${YELLOW}[4/6] 检查并修复流量与配额规则...${NC}"
-    local repaired_count
-    if repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null); then
-        echo -e "${GREEN}流量规则检查完成，修复端口数: ${repaired_count}${NC}"
-    else
-        echo -e "${RED}流量规则修复失败，将在最终自检中显示异常端口${NC}"
-        repair_status=1
-    fi
-    if restore_runtime_state >/dev/null 2>&1; then
-        echo -e "${GREEN}nftables 与 TC 运行状态已按当前配置恢复${NC}"
-    else
-        echo -e "${RED}运行状态恢复失败，将在最终自检中显示异常端口${NC}"
-        repair_status=1
-    fi
-
-    echo -e "${YELLOW}[5/6] 更新自然日流量快照...${NC}"
-    if record_traffic_snapshot >/dev/null 2>&1; then
-        echo -e "${GREEN}流量快照已更新${NC}"
-    else
-        echo -e "${YELLOW}流量快照更新失败，将保留现有统计数据${NC}"
-    fi
-
-    echo
-    echo -e "${YELLOW}[6/6] 执行最终自检...${NC}"
-    if self_check; then
-        if [ "$repair_status" -eq 0 ]; then
-            echo -e "${GREEN}系统自检/修复完成${NC}"
+    echo -e "格式：${GREEN},${NC} 组合多个端口为一个监控项（共享统计/配额/限速），${GREEN};${NC} 分隔多个独立监控项，${GREEN}-${NC} 表示端口段"
+    echo -e "例：${GREEN}80,443${NC} 一个监控项；${GREEN}80,443;8080-8090${NC} 两个监控项"
+    read -r -p "端口: " input
+    [ -n "$input" ] || return 0
+    parse_monitor_units "$input" units || { pause; return 1; }
+    read -r -p "备注（可留空）: " remark
+    for unit in "${units[@]}"; do
+        if id=$(monitor_add "$unit" "$remark"); then
+            echo -e "${GREEN}已添加 $id：$unit${NC}"
         else
-            echo -e "${YELLOW}最终自检已通过，但本次修复过程存在失败步骤，请按上方提示处理${NC}"
+            echo -e "${RED}添加 $unit 失败${NC}"
+        fi
+    done
+    cron_sync || true
+    if [ "${#units[@]}" -eq 1 ] && [ -n "${id:-}" ] && confirm "现在设置配额与自动重置"; then
+        menu_quota_for "$id"
+    fi
+}
+
+menu_edit_ports() {
+    local id choice input target remark copy
+    id=$(select_monitor "要修改的监控项") || return 0
+    while monitor_exists "$id"; do
+        echo
+        echo -e "${BLUE}=== 修改端口：$id $(monitor_label "$id") ===${NC}"
+        echo "当前成员：$(monitor_ports_csv "$id")"
+        echo "1. 添加端口/端口段（流量继续累计）"
+        echo "2. 删除端口（已统计流量保留在本项）"
+        echo "3. 整组替换端口"
+        echo "4. 拆出部分端口为新监控项（新项从 0 开始计）"
+        echo "5. 把本项合并到另一个监控项（流量相加）"
+        echo "0. 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) read -r -p "要添加的端口（逗号分隔）: " input
+               [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "$input" "" "" &&
+                   echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
+            2) read -r -p "要删除的成员（逗号分隔，端口段按原样写）: " input
+               [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "" "$input" "" &&
+                   echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
+            3) read -r -p "新的完整端口列表: " input
+               [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "" "" "$input" &&
+                   echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
+            4) read -r -p "要拆出的成员（逗号分隔）: " input
+               [ -n "$input" ] || continue
+               input=$(parse_port_list "$input" | paste -sd,) || continue
+               read -r -p "新监控项备注（可留空）: " remark
+               copy=""; confirm "新项是否复制本项的配额、重置策略和到期日" && copy=copy
+               if target=$(monitor_split "$id" "$input" "$remark" "$copy"); then
+                   echo -e "${GREEN}已拆出新监控项 $target${NC}"
+               fi ;;
+            5) target=$(select_monitor "合并到哪个监控项") || continue
+               [ "$target" != "$id" ] || { echo -e "${RED}不能合并到自身${NC}"; continue; }
+               echo "将把 $id 的端口与流量并入 $target，$id 的配额/限速/到期设置作废，以 $target 为准。"
+               confirm "确认合并" || continue
+               if monitor_merge "$id" "$target"; then
+                   echo -e "${GREEN}已合并到 $target${NC}"
+                   return 0
+               fi ;;
+            0|"") return 0 ;;
+        esac
+    done
+}
+
+menu_remove_monitor() {
+    local id
+    id=$(select_monitor "要删除的监控项") || return 0
+    confirm "确认删除 $id（$(monitor_label "$id")）及其统计、配额、限速与到期设置" || return 0
+    monitor_remove "$id" && echo -e "${GREEN}已删除 $id${NC}"
+    cron_sync || true
+}
+
+menu_quota_for() {
+    local id="$1" limit policy
+    echo "当前配额：$(mget "$id" .quota.monthly_limit unlimited)（$(mget "$id" .billing_mode double) 计费）"
+    read -r -p "流量配额（如 500GB、1.5TB；0 取消；回车不变）: " limit
+    if [ -n "$limit" ]; then
+        monitor_set_quota "$id" "$limit" && echo -e "${GREEN}配额已更新${NC}"
+    fi
+    if confirm "设置自动重置策略（当前：$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)）"; then
+        policy=$(prompt_reset_policy "$(mget "$id" .reset_policy.day 1)") || return 0
+        monitor_set_reset_policy "$id" "$policy" && echo -e "${GREEN}重置策略已更新：$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)${NC}"
+    fi
+}
+
+menu_quota_reset() {
+    local id
+    id=$(select_monitor "设置配额/重置的监控项") || return 0
+    menu_quota_for "$id"
+}
+
+menu_bandwidth() {
+    local id input rate
+    id=$(select_monitor "设置带宽限制的监控项") || return 0
+    echo "当前：$(monitor_tc_rate "$id" 2>/dev/null || echo 不限速)（上下行分别限制，同项端口共享）"
+    read -r -p "带宽（如 100Mbps、1Gbps；0 取消）: " input
+    [ -n "$input" ] || return 0
+    validate_bandwidth "$input" || { echo -e "${RED}格式无效${NC}"; return 1; }
+    if [ "$input" = "0" ]; then rate=0; else rate=$(convert_bandwidth_to_tc "$input"); fi
+    if [ "$rate" != "0" ] && [ "$(tc_auto_recovery_state 2>/dev/null || echo disabled)" != "enabled" ]; then
+        show_tc_auto_recovery_notice 2>/dev/null || true
+    fi
+    tc_set_monitor_limit "$id" "$rate" && echo -e "${GREEN}带宽限制已更新${NC}"
+}
+
+menu_expiry() {
+    local id input
+    id=$(select_monitor "设置服务到期的监控项") || return 0
+    echo "当前：$(monitor_expiry_label "$id" 2>/dev/null || echo 未设置)"
+    read -r -p "到期日 YYYY-MM-DD（输入 0 取消到期）: " input
+    [ -n "$input" ] || return 0
+    [ "$input" = "0" ] && input=""
+    monitor_set_expiry "$id" "$input" && echo -e "${GREEN}到期设置已更新${NC}"
+}
+
+menu_billing_remark() {
+    local id choice input
+    id=$(select_monitor "要修改的监控项") || return 0
+    echo "1. 计费模式（当前：$(mget "$id" .billing_mode double)）"
+    echo "2. 备注（当前：$(mget "$id" .remark "")）"
+    read -r -p "请选择: " choice
+    case "$choice" in
+        1) echo "double：入站+出站，各按 2 倍计（与上游一致）；single：入站+出站按 1 倍计"
+           read -r -p "模式 [double/single]: " input
+           [ -n "$input" ] && monitor_set_billing "$id" "$input" && echo -e "${GREEN}已切换${NC}" ;;
+        2) read -r -p "新备注（最长 64 字符，留空清除）: " input
+           monitor_set_remark "$id" "$input" && echo -e "${GREEN}已更新${NC}" ;;
+    esac
+}
+
+menu_reset_now() {
+    local id
+    id=$(select_monitor "要立即清零流量的监控项") || return 0
+    confirm "确认清零 $id 的本周期流量与已用配额（自动重置日程不变）" || return 0
+    reset_monitor "$id" manual && echo -e "${GREEN}已清零${NC}"
+}
+
+menu_config_io() {
+    local choice file
+    echo "1. 导出配置与统计"
+    echo "2. 导入配置包"
+    read -r -p "请选择: " choice
+    case "$choice" in
+        1) export_config ;;
+        2) read -r -p "配置包路径: " file; [ -n "$file" ] && import_config "$file" ;;
+    esac
+}
+
+show_dashboard() {
+    local total=0 values id machine
+    echo -e "${BLUE}=== ${SCRIPT_NAME} v${SCRIPT_VERSION} ===${NC}"
+    if has_monitors; then
+        values=$(nft_read_values 2>/dev/null || echo '{}')
+        while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            total=$(( total + $(jq -r --arg id "$id" '.[$id] // {} | ((.in // 0) + (.out // 0))' <<< "$values") * $(monitor_billing_multiplier "$id") ))
+        done < <(monitor_ids)
+        echo -e "${GREEN}状态: 监控中${NC} | 监控项 $(monitor_ids | grep -c .) 个 | 周期总流量 $(format_bytes "$total")"
+    else
+        echo -e "${YELLOW}状态: 未添加监控项${NC}"
+    fi
+    machine=$(machine_traffic_summary 2>/dev/null || true)
+    [ -n "$machine" ] && echo "$machine"
+    show_monitor_table >/dev/null 2>&1 && show_monitor_table
+    if ! nft_runtime_drift >/dev/null 2>&1 && has_monitors; then
+        echo -e "${YELLOW}⚠ nftables 规则与配置不一致，建议执行 10. 系统自检/修复${NC}"
+    fi
+    if has_monitors && ! cron_in_sync 2>/dev/null; then
+        echo -e "${YELLOW}⚠ 定时任务与配置不一致，建议执行 10. 系统自检/修复${NC}"
+    fi
+}
+
+show_main_menu() {
+    local choice
+    while true; do
+        menu_clear
+        show_dashboard
+        echo
+        show_main_menu_options
+        read -r -p "请选择操作: " choice || exit 0
+        case "$choice" in
+            1) menu_add_monitor ;;
+            2) menu_edit_ports ;;
+            3) menu_remove_monitor ;;
+            4) menu_quota_reset ;;
+            5) menu_bandwidth ;;
+            6) menu_expiry ;;
+            7) menu_billing_remark ;;
+            8) menu_reset_now ;;
+            9) manage_notifications; continue ;;
+            10) system_check_and_repair ;;
+            11) manage_tc_recovery ;;
+            12) manage_ip_guard; continue ;;
+            13) dependency_menu ;;
+            14) menu_config_io ;;
+            15) show_operation_logs ;;
+            16) update_dog ;;
+            17) uninstall_dog && exit 0 ;;
+            0) exit 0 ;;
+            *) continue ;;
+        esac
+        pause
+    done
+}
+
+# ── 自检与修复 ────────────────────────────────────────────────────
+
+SC_ERRORS=0
+SC_WARNINGS=0
+sc_ok() { echo -e "  ${GREEN}✓${NC} $*"; }
+sc_warn() { echo -e "  ${YELLOW}!${NC} $*"; SC_WARNINGS=$((SC_WARNINGS + 1)); }
+sc_err() { echo -e "  ${RED}✗${NC} $*"; SC_ERRORS=$((SC_ERRORS + 1)); }
+
+nft_version_ok() {
+    local v
+    v=$(nft --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    [ -n "$v" ] && ! version_lt "$v" "0.9.2"
+}
+
+# 只读自检；有错误返回 1。
+self_check() {
+    local exe cmd rt drift id age saved c
+    SC_ERRORS=0; SC_WARNINGS=0
+    echo -e "${BLUE}=== Dog 自检（v${SCRIPT_VERSION}） ===${NC}"
+
+    echo "[运行环境]"
+    for cmd in nft jq tc ip crontab curl flock awk ss sha256sum; do
+        if command -v "$cmd" >/dev/null 2>&1; then :; else sc_err "缺少命令：$cmd"; fi
+    done
+    if nft_version_ok; then sc_ok "nftables $(nft --version 2>/dev/null | awk '{print $2}')（需要 ≥ 0.9.2）"; else sc_err "nftables 版本过低或不可用（需要 ≥ 0.9.2）"; fi
+    exe=$(get_script_exec_path)
+    # 用 cron 的最小环境运行一次，确认脚本自身能找到 nft（1.5.x 的空推送就是在这里失败）。
+    if env -i HOME=/root PATH=/usr/bin:/bin "$exe" --cron-env-probe >/dev/null 2>&1; then
+        sc_ok "cron 最小环境（PATH=/usr/bin:/bin）下可找到 nft 与 jq"
+    else
+        sc_err "cron 最小环境下脚本无法运行或找不到 nft：$exe"
+    fi
+    if cron_service_is_running; then sc_ok "cron 服务运行中"; else sc_err "cron 服务未运行，定时统计/重置/推送不会执行"; fi
+
+    echo "[配置]"
+    if ! config_exists; then
+        sc_warn "尚未创建配置"
+    elif [ "$(config_schema)" = "1" ]; then
+        sc_err "仍是 1.5.x 配置，请运行 dog --repair 完成迁移"
+    else
+        # 校验错误直接收进变量：不在 /tmp 用可预测文件名（root 写入可被符号链接劫持）。
+        local verr
+        if verr=$(validate_config_file "$CONFIG_FILE" 2>&1 >/dev/null); then
+            sc_ok "配置有效：$(monitor_ids | grep -c .) 个监控项"
+        else
+            while IFS= read -r c; do [ -n "$c" ] && sc_err "$c"; done <<< "$verr"
+        fi
+    fi
+    [ "$(config_schema)" = "2" ] || { echo; echo "错误 $SC_ERRORS，警告 $SC_WARNINGS"; [ "$SC_ERRORS" -eq 0 ]; return; }
+
+    echo "[nftables 计数与配额]"
+    if has_monitors; then
+        rt=$(nft_runtime_json 2>/dev/null || echo null)
+        if [ "$rt" = "null" ]; then
+            sc_err "表 $NFT_FAMILY $NFT_TABLE 不存在"
+        elif drift=$(nft_runtime_drift "$rt"); then
+            sc_ok "规则、计数器、配额、到期封锁与配置一致"
+        else
+            while IFS= read -r c; do sc_err "$c"; done <<< "$drift"
         fi
     else
-        repair_status=1
-        echo -e "${YELLOW}修复后仍有异常，请根据上方 FAIL/WARN 处理${NC}"
+        sc_ok "无监控项"
     fi
 
+    echo "[带宽限制]"
+    local any_tc=false
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        monitor_tc_rate "$id" >/dev/null || continue
+        any_tc=true
+        if tc_monitor_complete "$id"; then sc_ok "$id 限速 $(monitor_tc_rate "$id") 完整"; else sc_err "$id 限速对象缺失或不一致"; fi
+    done < <(monitor_ids)
+    [ "$any_tc" = "true" ] || sc_ok "未设置限速"
+    if [ -e /etc/trafficcop-lite/trafficcop-lite-monitor.sh ]; then
+        if tc_ntc_compatible; then sc_ok "TrafficCop Lite 已安装且支持 Dog 2.0 类清单"
+        elif [ "$any_tc" = "true" ]; then sc_err "TrafficCop Lite 版本过旧（不识别 $TC_CLASS_MANIFEST_SCHEMA），请升级到 1.2.0+"
+        else sc_warn "TrafficCop Lite 版本过旧；设置限速前需先升级"; fi
+    fi
+    if [ "$any_tc" = "true" ] && [ ! -s "$TC_INTEROP_FILE" ]; then sc_err "缺少类清单 $TC_INTEROP_FILE"; fi
+
+    echo "[定时任务与数据]"
+    if cron_in_sync; then sc_ok "Dog 定时任务与配置一致"; else sc_err "Dog 定时任务缺失或与配置不一致"; fi
+    if has_monitors; then
+        saved=$(jq -r '.saved_at // empty' "$TRAFFIC_DATA_FILE" 2>/dev/null || true)
+        if [ -n "$saved" ]; then
+            age=$(( $(date +%s) - $(date -d "$saved" +%s 2>/dev/null || echo 0) ))
+            if [ "$age" -le 300 ]; then sc_ok "流量灾备 ${age}s 前更新"; else sc_warn "流量灾备已 $((age / 60)) 分钟未更新（定时任务可能未执行）"; fi
+        else
+            sc_warn "尚无流量灾备文件"
+        fi
+        while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            monitor_has_auto_reset "$id" || continue
+            monitor_next_reset "$id" >/dev/null 2>&1 || sc_err "$id 无法计算下次重置日期"
+        done < <(monitor_ids)
+    fi
+
+    echo "[通知]"
+    for c in telegram wecom; do
+        channel_enabled "$c" || continue
+        if [ "$c" = telegram ]; then
+            [ -n "$(cfg '.notifications.telegram.bot_token // ""')" ] && [ -n "$(cfg '.notifications.telegram.chat_id // ""')" ] &&
+                sc_ok "Telegram 已配置（推送 $(channel_status_enabled telegram && cfg '.notifications.telegram.status_notifications.interval' || echo 关闭)）" ||
+                sc_err "Telegram 已开启但 Token/Chat ID 不完整"
+            telegram_api_base >/dev/null || sc_err "Telegram 自定义线路无效"
+        else
+            [ -n "$(cfg '.notifications.wecom.webhook_url // ""')" ] && sc_ok "企业微信已配置" || sc_err "企业微信已开启但未设置 Webhook"
+        fi
+    done
+
     echo
-    read -r -p "按回车键返回主菜单..."
-    return "$repair_status"
+    if [ "$SC_ERRORS" -eq 0 ]; then
+        echo -e "${GREEN}自检通过${NC}（警告 $SC_WARNINGS）"
+    else
+        echo -e "${RED}发现 $SC_ERRORS 个错误${NC}（警告 $SC_WARNINGS），可运行 dog --repair 自动修复"
+    fi
+    [ "$SC_ERRORS" -eq 0 ]
+}
+
+# 修复：补依赖、迁移、重建规则与限速、刷新定时任务，然后自检。
+system_check_and_repair() {
+    echo -e "${BLUE}=== 系统修复 ===${NC}"
+    # 只检测一次；缺失时交给 dependency_install_missing（--yes 时自动装，否则询问）。
+    # check_dependencies 自带无确认安装，不能与之串用（会绕过确认并重复执行 apt）。
+    dependency_report core >/dev/null 2>&1 || dependency_install_missing "$DOG_NONINTERACTIVE" core || true
+    ensure_config || return 1
+    if legacy_needs_migration; then migrate_from_legacy || return 1; fi
+    validate_config_file "$CONFIG_FILE" || { dog_error "配置无效，请先修正 $CONFIG_FILE"; return 1; }
+    create_shortcut || true
+    if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ] && [ ! -f "$INSTALLED_SCRIPT_PATH" ]; then install_self || true; fi
+    dog_lock || return 75
+    echo "· 修复 nftables 规则"; runtime_ensure_nft || true
+    echo "· 同步到期封锁"; check_expirations || true
+    echo "· 刷新统计与灾备"; stats_snapshot || true
+    dog_unlock
+    echo "· 恢复带宽限制"; tc_restore_all || true
+    echo "· 刷新定时任务"; cron_sync || true
+    echo
+    self_check
+}
+
+# ── 命令行入口 ────────────────────────────────────────────────────
+
+show_usage() {
+    cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+用法：dog                         打开交互菜单
+      dog list [--json]           列出监控项
+      dog status                  打印状态报告（与推送内容相同）
+      dog add <端口> [--remark R]  添加监控项；"80,443" 为一项，"80;443" 为两项，"8000-8010" 为端口段
+      dog edit <ID|端口> [选项]    修改监控项：
+          --add P,P   --del P,P   --set P,P        增加 / 删除 / 整组替换端口（流量连续）
+          --remark R  --quota 500GB|0  --billing double|single
+          --limit 100Mbps|0  --expiry YYYY-MM-DD|0
+          --reset monthly:1 | days:30[@YYYY-MM-DD] | months:3[@YYYY-MM-DD][:15] | yearly:1-1 | once:YYYY-MM-DD | none
+      dog split <ID> <端口> [--remark R] [--copy]   拆出为新监控项（--copy 复制配额/重置/到期）
+      dog merge <源ID> <目标ID>                     合并（流量相加，保留目标设置）
+      dog remove <ID|端口>        删除监控项
+      dog reset <ID|端口>         立即清零本周期流量
+      --yes                       非交互确认
+
+维护：--self-check  --repair  --restore-runtime  --tc-status  --recover-tc --manual|--auto
+      --update [--force]  --uninstall [--keep-config]  --export [目录]  --import <文件>
+      --dependencies check|install|owned|remove [--all] [--yes]  --logs  --version
+EOF
+}
+
+# "monthly:1" 等简写 → 重置策略 JSON
+parse_reset_spec() {
+    local s="$1" today
+    today=$(get_current_date)
+    case "$s" in
+        none) echo '{"type":"none"}' ;;
+        monthly:*) validate_day_1_31 "${s#*:}" && jq -cn --argjson d "${s#*:}" '{type:"monthly",day:$d}' ;;
+        days:*)
+            local rest="${s#days:}" n a
+            n="${rest%%@*}"; a="$today"; [[ "$rest" == *@* ]] && a="${rest#*@}"
+            [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && is_valid_date "$a" &&
+                jq -cn --argjson e "$n" --arg a "$a" '{type:"interval_days",every:$e,anchor_date:$a}' ;;
+        months:*)
+            local rest="${s#months:}" n a d
+            n="${rest%%[@:]*}"; a="$today"; d=""
+            if [[ "$rest" == *@* ]]; then a="${rest#*@}"; a="${a%%:*}"; fi
+            [[ "$rest" =~ :([0-9]+)$ ]] && d="${BASH_REMATCH[1]}"
+            [ -n "$d" ] || d=$((10#${a:8:2}))
+            [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && is_valid_date "$a" && validate_day_1_31 "$d" &&
+                jq -cn --argjson e "$n" --arg a "$a" --argjson d "$d" '{type:"interval_months",every:$e,anchor_date:$a,day:$d}' ;;
+        yearly:*-*)
+            local m="${s#yearly:}"; local d="${m#*-}"; m="${m%-*}"
+            validate_month_1_12 "$m" && validate_day_1_31 "$d" && jq -cn --argjson m "$m" --argjson d "$d" '{type:"yearly",month:$m,day:$d}' ;;
+        once:*) is_valid_date "${s#once:}" && jq -cn --arg d "${s#once:}" '{type:"fixed_date",date:$d}' ;;
+        *) return 1 ;;
+    esac
+}
+
+cli_list() {
+    if [ "${1:-}" = "--json" ]; then
+        jq -n --argjson c "$(jq '.monitors' "$CONFIG_FILE")" --argjson v "$(nft_read_values)" '
+            $c | to_entries | map(.value + {id: .key, counters: ($v[.key] // null)})'
+    else
+        show_monitor_table || true
+    fi
+}
+
+cli_edit() {
+    local ref="$1" id add="" del="" set="" rc=0
+    shift
+    id=$(resolve_monitor "$ref") || { dog_error "找不到监控项：$ref"; return 1; }
+    local -a ops=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --add|--del|--set) [ -n "${2:-}" ] || { show_usage; return 2; }
+                local v; v=$(parse_port_list "$2" | paste -sd,) || return 1
+                case "$1" in --add) add="$v" ;; --del) del="$v" ;; --set) set="$v" ;; esac; shift 2 ;;
+            --remark|--quota|--billing|--limit|--expiry|--reset)
+                [ "$#" -ge 2 ] || { show_usage; return 2; }
+                ops+=("$1" "$2"); shift 2 ;;
+            *) dog_error "未知选项：$1"; return 2 ;;
+        esac
+    done
+    if [ -n "$add$del$set" ]; then
+        monitor_edit_ports "$id" "$add" "$del" "$set" || rc=1
+    fi
+    local i
+    for ((i = 0; i < ${#ops[@]}; i += 2)); do
+        local opt="${ops[i]}" val="${ops[i+1]}"
+        case "$opt" in
+            --remark) monitor_set_remark "$id" "$val" || rc=1 ;;
+            --quota) monitor_set_quota "$id" "$val" || rc=1 ;;
+            --billing) monitor_set_billing "$id" "$val" || rc=1 ;;
+            --expiry) [ "$val" = "0" ] && val=""; monitor_set_expiry "$id" "$val" || rc=1 ;;
+            --limit)
+                if [ "$val" = "0" ]; then tc_set_monitor_limit "$id" 0 || rc=1
+                elif validate_bandwidth "$val"; then tc_set_monitor_limit "$id" "$(convert_bandwidth_to_tc "$val")" || rc=1
+                else dog_error "带宽格式无效：$val"; rc=1; fi ;;
+            --reset)
+                local p; p=$(parse_reset_spec "$val") || { dog_error "重置策略格式无效：$val"; rc=1; continue; }
+                monitor_set_reset_policy "$id" "$p" || rc=1 ;;
+        esac
+    done
+    [ "$rc" -eq 0 ] && echo "$id: $(monitor_ports_csv "$id")"
+    return "$rc"
 }
 
 main() {
+    local args=() a
+    for a in "$@"; do
+        if [ "$a" = "--yes" ] || [ "$a" = "-y" ]; then DOG_NONINTERACTIVE=true; else args+=("$a"); fi
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
+    case "${1:-}" in
+        --version|-v) echo "$SCRIPT_NAME v$SCRIPT_VERSION"; return 0 ;;
+        --help|-h|help) show_usage; return 0 ;;
+        --cron-env-probe) command -v nft >/dev/null && command -v jq >/dev/null; return ;;
+        --validate-config) [ -n "${2:-}" ] || return 2; validate_config_file "$2"; return ;;
+    esac
     check_root
 
-    # cron 快速路径：跳过重型初始化（依赖检查、通知模块下载、规则恢复等）
-    if [ $# -gt 0 ]; then
-        case $1 in
-            --dependencies)
-                shift
-                local dependency_status=0
-                dependency_cli "$@" || dependency_status=$?
-                exit "$dependency_status"
-                ;;
-            --logs)
-                [ $# -eq 1 ] || exit 2
-                show_operation_logs
-                exit 0
-                ;;
-            --version)
-                echo -e "${BLUE}$SCRIPT_NAME v$SCRIPT_VERSION${NC}"
-                exit 0
-                ;;
-            --reset-port)
-                if [ $# -lt 2 ]; then
-                    echo -e "${RED}错误：--reset-port 需要指定端口号${NC}"
-                    exit 1
-                fi
-                local reset_status=0
-                auto_reset_port "$2" || reset_status=$?
-                exit "$reset_status"
-                ;;
-            --check-reset-port)
-                if [ $# -lt 2 ]; then
-                    echo -e "${RED}错误：--check-reset-port 需要指定端口号${NC}"
-                    exit 1
-                fi
-                local reset_check_status=0
-                check_reset_port_due "$2" || reset_check_status=$?
-                exit "$reset_check_status"
-                ;;
-            --check-scheduled-resets)
-                local scheduled_reset_status=0
-                check_scheduled_resets || scheduled_reset_status=$?
-                exit "$scheduled_reset_status"
-                ;;
-            --check-port-expirations)
-                local expiry_check_status=0
-                check_port_expirations || expiry_check_status=$?
-                exit "$expiry_check_status"
-                ;;
-            --restore-runtime)
-                [ -f "$CONFIG_FILE" ] || exit 0
-                validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
-                restore_runtime_state
-                exit $?
-                ;;
-            --restore-nft-runtime)
-                [ -f "$CONFIG_FILE" ] || exit 0
-                validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
-                restore_runtime_state false
-                exit $?
-                ;;
-            --tc-status)
-                [ -f "$CONFIG_FILE" ] || {
-                    echo "TC_STATUS=ERROR REASON=config-missing"
-                    exit 1
-                }
-                validate_config_file "$CONFIG_FILE" >/dev/null || exit 1
-                local tc_status=0
-                dog_tc_status || tc_status=$?
-                exit "$tc_status"
-                ;;
-            --recover-tc)
-                [ -f "$CONFIG_FILE" ] || exit 0
-                local recovery_status=0
-                recover_tc_runtime "${2:---manual}" || recovery_status=$?
-                exit "$recovery_status"
-                ;;
-            --collect-machine-traffic)
-                [ -f "$CONFIG_FILE" ] || exit 0
-                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
-                collect_machine_traffic
-                exit $?
-                ;;
-            --snapshot-traffic)
-                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
-                local active_ports_status=0
-                has_active_ports || active_ports_status=$?
-                if [ "$active_ports_status" -gt 1 ]; then
-                    exit 1
-                fi
-                if [ "$active_ports_status" -eq 1 ]; then
-                    remove_traffic_snapshot_cron >/dev/null 2>&1 || true
-                    exit 0
-                fi
-                if ! runtime_counter_objects_complete; then
-                    restore_runtime_state >/dev/null 2>&1 || exit 1
-                fi
-                record_traffic_snapshot >/dev/null 2>&1
-                exit $?
-                ;;
-            --send-telegram-status)
-                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
-                local active_ports_status=0
-                has_active_ports || active_ports_status=$?
-                if [ "$active_ports_status" -gt 1 ]; then
-                    exit 1
-                fi
-                if [ "$active_ports_status" -eq 1 ]; then
-                    remove_telegram_notification_cron >/dev/null 2>&1 || true
-                    exit 0
-                fi
-                # 与 --snapshot-traffic 相同的自愈：统计规则不完整时先重建，
-                # 否则这次推送会把 0 或冻结的旧值发出去。
-                if ! runtime_counter_objects_complete; then
-                    restore_runtime_state >/dev/null 2>&1 || true
-                fi
-                load_telegram_module || exit 1
-                local telegram_status=0
-                telegram_send_status_notification || telegram_status=$?
-                exit "$telegram_status"
-                ;;
-            --send-wecom-status)
-                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
-                local active_ports_status=0
-                has_active_ports || active_ports_status=$?
-                if [ "$active_ports_status" -gt 1 ]; then
-                    exit 1
-                fi
-                if [ "$active_ports_status" -eq 1 ]; then
-                    remove_wecom_notification_cron >/dev/null 2>&1 || true
-                    exit 0
-                fi
-                # 与 --send-telegram-status 同理：推送前先确认统计规则完整。
-                if ! runtime_counter_objects_complete; then
-                    restore_runtime_state >/dev/null 2>&1 || true
-                fi
-                local wecom_script="$CONFIG_DIR/notifications/wecom.sh"
-                [ -f "$wecom_script" ] || exit 1
-                source "$wecom_script" || exit 1
-                declare -F wecom_send_status_notification >/dev/null || exit 1
-                local wecom_status=0
-                wecom_send_status_notification || wecom_status=$?
-                exit "$wecom_status"
-                ;;
-            --send-status)
-                validate_config_file "$CONFIG_FILE" >/dev/null 2>&1 || exit 1
-                local active_ports_status=0
-                has_active_ports || active_ports_status=$?
-                [ "$active_ports_status" -eq 0 ] || {
-                    [ "$active_ports_status" -eq 1 ] && exit 0
-                    exit 1
-                }
-                local notification_status=0
-                send_status_notification || notification_status=$?
-                exit "$notification_status"
-                ;;
-        esac
+    case "${1:-}" in
+        --dependencies) shift; dependency_cli "$@"; return ;;
+        --uninstall) uninstall_dog "${2:-}"; return ;;
+        --logs) show_operation_logs; return ;;   # 只读，不创建配置目录
+    esac
+
+    if ! command -v jq >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
+        if is_interactive; then
+            dependency_install_missing false core || { dog_error "缺少 jq/nft，无法继续"; return 1; }
+        else
+            dog_error "缺少 jq 或 nft，无法继续（PATH=$PATH）"; return 1
+        fi
+    fi
+    ensure_config || return 1
+    if legacy_needs_migration; then
+        migrate_from_legacy || return 1
     fi
 
-    if [ $# -gt 0 ]; then
-        case $1 in
-            --validate-config)
-                [ $# -eq 2 ] && validate_config_file "$2"
-                exit $?
-                ;;
-            --check-deps)
-                check_dependencies false all
-                exit $?
-                ;;
-            --finalize-update)
-                local finalize_status=0
-                finalize_script_update || finalize_status=$?
-                exit "$finalize_status"
-                ;;
-            --install)
-                local install_status=0
-                install_update_script false || install_status=$?
-                exit "$install_status"
-                ;;
-            --install-local)
-                [ $# -eq 2 ] && [ -d "$2" ] || {
-                    echo "用法: $0 --install-local DIRECTORY" >&2
-                    exit 2
-                }
-                install_update_script false "$2"
-                exit $?
-                ;;
-            --uninstall)
-                # 可选参数 --yes：跳过交互确认，供自动化/无人值守卸载使用
-                if [ $# -gt 2 ] || { [ $# -eq 2 ] && [ "$2" != "--yes" ]; }; then
-                    echo -e "${RED}错误：--uninstall 只接受可选参数 --yes${NC}"
-                    exit 1
-                fi
-                local uninstall_assume_yes=false
-                if [ $# -eq 2 ]; then
-                    uninstall_assume_yes=true
-                fi
-                local uninstall_status=0
-                uninstall_script "$uninstall_assume_yes" || uninstall_status=$?
-                exit "$uninstall_status"
-                ;;
-            --self-check)
-                self_check
-                exit $?
-                ;;
-            --sync-notification-modules)
-                mkdir -p "$CONFIG_DIR"
-                echo -e "${YELLOW}正在强制同步通知模块...${NC}"
-                if download_notification_modules "force"; then
-                    echo -e "${GREEN}通知模块强制同步完成${NC}"
-                    exit 0
-                else
-                    echo -e "${RED}通知模块同步失败，请检查网络后重试${NC}"
-                    exit 1
-                fi
-                ;;
-            --refresh-notification-cron)
-                check_dependencies true
-                init_config || exit 1
-                refresh_notification_cron_from_config || exit 1
-                echo -e "${GREEN}通知定时任务已刷新${NC}"
-                exit 0
-                ;;
-            --refresh-port-reset-cron)
-                check_dependencies true
-                init_config || exit 1
-                setup_cron_environment
-                refresh_port_auto_reset_cron_from_config || exit 1
-                ensure_cron_service_running || {
-                    echo -e "${RED}定时服务未运行${NC}"
-                    exit 1
-                }
-                echo -e "${GREEN}端口自动重置定时任务已刷新${NC}"
-                exit 0
-                ;;
-            --refresh-all-cron)
-                check_dependencies true
-                init_config || exit 1
-                refresh_all_cron_from_config || exit 1
-                echo -e "${GREEN}全部定时任务已按当前配置刷新${NC}"
-                exit 0
-                ;;
-            --repair-traffic-rules)
-                check_dependencies true
-                init_config || exit 1
-                if reconcile_orphaned_runtime_objects &&
-                   repaired_count=$(repair_duplicate_traffic_rules 2>/dev/null); then
-                    echo -e "${GREEN}流量计数/配额规则检查完成，修复端口数: ${repaired_count}${NC}"
-                    exit 0
-                fi
-                echo -e "${RED}流量计数/配额规则修复失败，请运行 --self-check 查看异常端口${NC}"
-                exit 1
-                ;;
-            *)
-                echo -e "${YELLOW}用法: $0 [选项]${NC}"
-                echo "选项:"
-                echo "  --check-deps              检查依赖工具"
-                echo '  --dependencies check      只读检测全部命令和 IP Guard 运行库'
-                echo '  --dependencies install [--yes]  仅补装缺失项并记录新增包'
-                echo '  --dependencies remove [--all] [--yes]  预览并卸载依赖（先卸载脚本）'
-                echo '  --dependencies owned      查看本脚本实际新增的软件包'
-                echo "  --version                 显示版本信息"
-                echo "  --logs                    查看主要操作 / IP Guard / 通知日志（不初始化配置）"
-                echo "  --install                 安装/更新脚本"
-                echo "  --install-local DIRECTORY  安装本地完整脚本包（不下载主程序）"
-                echo "  --finalize-update         执行更新后的配置和运行状态迁移"
-                echo "  --uninstall [--yes]       卸载脚本（--yes 跳过确认，供自动化使用）"
-                echo "  --send-status             发送所有启用的状态通知"
-                echo "  --send-telegram-status    发送Telegram状态通知"
-                echo "  --send-wecom-status       发送企业wx 状态通知"
-                echo "  --self-check              执行一键自检"
-                echo "  --tc-status               检查 Dog/NTC TC 运行状态"
-                echo "  --recover-tc [--auto|--manual]  由共享恢复入口重建统一 HTB"
-                echo "  --validate-config FILE    只校验指定配置文件"
-                echo "  --sync-notification-modules  强制同步通知模块(覆盖本地)"
-                echo "  --refresh-notification-cron  刷新通知定时任务并拉起cron服务"
-                echo "  --refresh-port-reset-cron    刷新端口自动重置定时任务"
-                echo "  --refresh-all-cron           刷新全部定时任务并清理旧任务"
-                echo "  --repair-traffic-rules  按计费模式修复流量计数/配额规则"
-                echo "  --snapshot-traffic       写入自然日流量快照"
-                echo "  --collect-machine-traffic 采集整机流量（只读，不创建规则）"
-                echo "  --restore-runtime        手动恢复 nftables/TC 运行状态"
-                echo "  --restore-nft-runtime    开机恢复 nftables（不修改 TC）"
-                echo "  --reset-port PORT         重置指定端口流量"
-                echo "  --check-reset-port PORT   检查指定端口是否到重置日"
-                echo "  --check-scheduled-resets  检查所有端口是否到重置日"
-                echo "  --check-port-expirations  检查并同步所有端口的服务到期封锁"
-                echo
-                echo -e "${GREEN}快捷命令: $SHORTCUT_COMMAND${NC}"
-                exit 1
-                ;;
-        esac
-    fi
+    local cmd="${1:-}"
+    [ "$#" -gt 0 ] && shift
+    case "$cmd" in
+        "")
+            [ -f "$INSTALLED_SCRIPT_PATH" ] && [ -x "$SHORTCUT_PATH" ] || install_self || true
+            validate_config_file "$CONFIG_FILE" || { dog_error "配置无效，请修正 $CONFIG_FILE 或运行 dog --repair"; return 1; }
+            show_main_menu ;;
+        list) cli_list "$@" ;;
+        status) build_status_report "$(hostname)" ;;
+        add)
+            [ -n "${1:-}" ] || { show_usage; return 2; }
+            local input="$1" remark="" units u rc=0
+            [ "${2:-}" = "--remark" ] && remark="${3:-}"
+            parse_monitor_units "$input" units || return 1
+            for u in "${units[@]}"; do monitor_add "$u" "$remark" || rc=1; done
+            cron_sync || true
+            return "$rc" ;;
+        edit) [ -n "${1:-}" ] || { show_usage; return 2; }; cli_edit "$@" ;;
+        split)
+            [ -n "${2:-}" ] || { show_usage; return 2; }
+            local sid sp sr="" sc=""
+            sid=$(resolve_monitor "$1") || { dog_error "找不到监控项：$1"; return 1; }
+            sp=$(parse_port_list "$2" | paste -sd,) || return 1
+            shift 2
+            while [ "$#" -gt 0 ]; do
+                case "$1" in --remark) sr="${2:-}"; shift 2 ;; --copy) sc=copy; shift ;; *) return 2 ;; esac
+            done
+            monitor_split "$sid" "$sp" "$sr" "$sc" ;;
+        merge)
+            [ -n "${2:-}" ] || { show_usage; return 2; }
+            local ms md
+            ms=$(resolve_monitor "$1") && md=$(resolve_monitor "$2") || { dog_error "找不到监控项"; return 1; }
+            monitor_merge "$ms" "$md" ;;
+        remove|rm)
+            local rid; rid=$(resolve_monitor "${1:-}") || { dog_error "找不到监控项：${1:-}"; return 1; }
+            confirm "确认删除 $rid（$(monitor_label "$rid")）" || return 1
+            monitor_remove "$rid" && cron_sync ;;
+        reset)
+            local zid; zid=$(resolve_monitor "${1:-}") || { dog_error "找不到监控项：${1:-}"; return 1; }
+            confirm "确认清零 $zid 本周期流量" || return 1
+            reset_monitor "$zid" manual ;;
 
-    # 普通菜单只做本地轻量初始化；重型修复由菜单 8 主动执行。
-    check_dependencies true
-    init_config || exit 1
-    ensure_installation_files
-    migrate_legacy_cron_if_needed
-    show_main_menu
+        # 定时任务入口
+        --tick) cron_tick ;;
+        --boot|--restore-nft-runtime) restore_runtime_nft_only ;;
+        --send-status) send_status_report "${1:-telegram}" ;;
+        --send-telegram-status) send_status_report telegram ;;
+        --send-wecom-status) send_status_report wecom ;;
+        # 1.5.x 旧定时任务兼容（cron 刷新前仍可能被调用）
+        --snapshot-traffic|--check-scheduled-resets|--check-port-expirations|--collect-machine-traffic)
+            cron_tick ;;
+
+        --self-check) self_check ;;
+        --repair|--repair-traffic-rules|--refresh-all-cron) system_check_and_repair ;;
+        --refresh-notification-cron|--refresh-port-reset-cron) cron_sync ;;
+        --sync-notification-modules) echo "2.0 起通知功能已内置，无需同步模块" ;;
+        --restore-runtime) restore_runtime ;;
+        --tc-status) dog_tc_status ;;
+        --recover-tc) recover_tc_runtime "${1:---manual}" ;;
+        --install) install_self && cron_sync ;;
+        # --finalize-update：1.5.x 的 --update 装好新脚本后调用的入口，失败时由旧版负责回滚。
+        --post-update|--finalize-update) post_update ;;
+        --update) update_dog "${1:-}" ;;
+        --export) export_config "${1:-/root}" ;;
+        --import) [ -n "${1:-}" ] || return 2; import_config "$1" ;;
+        *) show_usage; return 2 ;;
+    esac
 }
 
 main "$@"
