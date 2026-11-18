@@ -313,18 +313,17 @@ manage_tc_recovery() {
     local status_kind=""
 
     menu_clear
-    echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
-    echo "TC 状态: $(dog_tc_status_label)"
-    echo "自动恢复: $(tc_auto_recovery_state)"
-    echo "恢复方式: 单一 systemd oneshot；启用后在网络就绪时执行一次"
+    ui_title "TC 冲突处理 / 自动恢复"
+    ui_kv "TC 状态" "$(dog_tc_status_label)"
+    ui_kv "自动恢复" "$(tc_auto_recovery_state)"
+    ui_kv "恢复方式" "单一 systemd oneshot；启用后在网络就绪时执行一次"
     echo
-    echo "1. 检测并按需重建 Dog/NTC 规则"
-    echo "2. 检测并按需重建，同时启用开机自动恢复"
-    echo "3. 启用开机自动恢复"
-    echo "4. 关闭开机自动恢复"
-    echo "0. 返回主菜单"
-    echo
-    read -r -p "请选择操作 [0-4]: " tc_choice
+    ui_option 1 "检测并按需重建 Dog/NTC 规则"
+    ui_option 2 "检测并按需重建，同时启用开机自动恢复"
+    ui_option 3 "启用开机自动恢复"
+    ui_option 4 "关闭开机自动恢复"
+    ui_option 0 "返回主菜单"
+    ui_prompt 4 tc_choice || return 0
     case "$tc_choice" in
         1|2)
             status_output=$(dog_tc_status 2>/dev/null || true)

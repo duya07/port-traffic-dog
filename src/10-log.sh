@@ -40,6 +40,7 @@ dog_write_event() (
         monitor_edit) description="修改监控项端口" ;;
         monitor_split) description="拆分监控项" ;;
         monitor_merge) description="合并监控项" ;;
+        monitor_notify) description="设置监控项推送开关" ;;
         tc_apply) description="应用带宽限制" ;;
         tc_clear) description="撤销带宽限制" ;;
         expiry_apply) description="应用服务到期封锁" ;;
@@ -90,11 +91,11 @@ dog_error() {
 show_operation_logs() {
     local file
     for file in "$LOG_FILE" "$LOG_DIR/ip-guard.log" "$NOTIFY_LOG_FILE"; do
-        printf '\n=== %s ===\n' "${file##*/}"
+        ui_title "${file##*/}" "最近 50 条"
         if [ -f "$file" ] && [ ! -L "$file" ]; then
             if [[ "$file" == */ip-guard.log ]]; then
                 tail -n 50 -- "$file" | jq -r '"\(.time) \(.message // .event)"' 2>/dev/null || tail -n 50 -- "$file"
             else tail -n 50 -- "$file"; fi
-        else echo '暂无日志'; fi
+        else echo '  暂无日志'; fi
     done
 }

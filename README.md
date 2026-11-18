@@ -4,6 +4,7 @@
 
 - 上游来源：<https://github.com/zywe03/realm-xwPF>（`port-traffic-dog.sh` 与 `notifications/`）
 - 2.0 是一次核心重写：监控项改用稳定 ID，**已有监控项可以直接增删端口而不丢流量**；从 1.5.x 原地升级会无损迁移计数、配额与设置。
+- 2.1：界面重排（主菜单两组竖排编号、监控项表格按显示宽度对齐、子菜单统一样式），可以**按监控项关闭推送**（见“6) 通知”）。
 - 1.5.x 的逐条改动记录见 1.5.23（提交 `8371863`）的 README。
 
 ## 2.0 有什么不同
@@ -83,11 +84,12 @@ dog split m1 8443 [--copy]            把端口拆成新监控项（--copy 复�
 dog merge m2 m1                       合并：流量相加，保留 m1 的设置
 dog reset m1                          立即清零本周期流量（不改下次重置日）
 dog remove m1
+dog edit m1 --notify off              不出现在状态推送中（默认 on；只影响推送，统计与配额照常）
 ```
 
 `edit/remove/reset` 也接受端口号代替 ID。一个端口只能属于一个监控项，重叠会被拒绝。
 
-菜单：1 添加、2 改端口、3 删除、4 配额与重置、5 带宽限制、6 到期日、7 计费与备注、8 立即重置、9 通知、10 自检/修复、11 TC 冲突处理、12 IP Guard、13 依赖管理、14 导入导出、15 操作日志、16 更新、17 卸载。
+菜单分两组，编号竖排：左列“监控项”——1 添加、2 改端口、3 删除、4 配额与重置、5 带宽限制、6 到期日、7 计费与备注、8 立即重置、9 通知；右列“系统维护”——10 自检/修复、11 TC 冲突处理、12 IP Guard、13 依赖管理、14 导入导出、15 操作日志、16 更新、17 卸载（编号与 2.0 相同）。终端宽度不够两列时自动改为单列；监控项表格宽屏显示用量条，较窄时只显示百分比，再窄时每项占两行。
 
 ### 维护命令
 
@@ -124,6 +126,8 @@ dog remove m1
 ## 6) 通知
 
 菜单 9 配置 Telegram（官方或自定义 HTTPS 线路；HTTP 只允许本机回环）和企业微信 Webhook，可设推送间隔。状态推送内容与 `dog status` 相同；nft 表或计数器缺失时推送“流量读取失败，请运行 dog --repair”，而不是空报告。
+
+按监控项开关推送（2.1）：菜单 9 →“选择推送的监控项”勾选（输入序号切换，可一次输入多个；`a` 全部推送、`n` 全部不推送），或 `dog edit m2 --notify off`。关闭的监控项不出现在推送里，报告头的“监控项 N 个”和周期总流量也不计入，接收方看不到它；它的计数器缺失也不会触发告警。所有监控项都关闭时不发送（不发空报告），只在 `notification.log` 记一条“状态报告未发送”。拆分出的新监控项继承原项的推送开关；合并以目标项为准。配置字段为 `.monitors.<id>.notify`（缺省为 true）；降级回 2.0.0 时该字段被忽略，即恢复全部推送。
 
 ## 7) IP Guard（在线 IP / 并发连接限制，测试中）
 
@@ -175,4 +179,4 @@ bash tests/logging.sh; python3 tests/dependencies.py; python3 tests/menu-layout.
 
 真实 TC 测试（会让内核加载 ifb/sch_htb 等全局模块）只在可丢弃的测试机上跑，入口在 TrafficCop Lite 的 `tests/integration-netns.sh`（`DOG_SCRIPT=…/port-traffic-dog.sh`）。
 
-发布：`tools/release.sh v2.0.0` 生成 `dist/port-traffic-dog.sh`、`dist/port-ip-guard.sh`、`dist/SHA256SUMS`，再 `gh release create v2.0.0 dist/*`。`--update` 与 `migrate-to-custom.sh` 只接受与 `SHA256SUMS` 一致的 Release 资产。
+发布：`tools/release.sh v2.1.0` 生成 `dist/port-traffic-dog.sh`、`dist/port-ip-guard.sh`、`dist/SHA256SUMS`，再 `gh release create v2.1.0 dist/*`。`--update` 与 `migrate-to-custom.sh` 只接受与 `SHA256SUMS` 一致的 Release 资产。

@@ -16,7 +16,7 @@ nft_version_ok() {
 self_check() {
     local exe cmd rt drift id age saved c
     SC_ERRORS=0; SC_WARNINGS=0
-    echo -e "${BLUE}=== Dog 自检（v${SCRIPT_VERSION}） ===${NC}"
+    ui_title "Dog 自检" "v${SCRIPT_VERSION}"
 
     echo "[运行环境]"
     for cmd in nft jq tc ip crontab curl flock awk ss sha256sum; do
@@ -107,6 +107,13 @@ self_check() {
             [ -n "$(cfg '.notifications.wecom.webhook_url // ""')" ] && sc_ok "企业微信已配置" || sc_err "企业微信已开启但未设置 Webhook"
         fi
     done
+    if has_monitors && { channel_status_enabled telegram || channel_status_enabled wecom; }; then
+        if ! has_notify_monitors; then
+            sc_warn "所有监控项均已关闭推送，定时报告不会发送（通知管理 → 选择推送的监控项）"
+        elif [ "$(notify_monitor_ids | grep -c .)" -lt "$(monitor_ids | grep -c .)" ]; then
+            sc_ok "推送范围：$(notify_scope_summary)"
+        fi
+    fi
 
     echo
     if [ "$SC_ERRORS" -eq 0 ]; then
@@ -119,7 +126,7 @@ self_check() {
 
 # 修复：补依赖、迁移、重建规则与限速、刷新定时任务，然后自检。
 system_check_and_repair() {
-    echo -e "${BLUE}=== 系统修复 ===${NC}"
+    ui_title "系统修复"
     # 只检测一次；缺失时交给 dependency_install_missing（--yes 时自动装，否则询问）。
     # check_dependencies 自带无确认安装，不能与之串用（会绕过确认并重复执行 apt）。
     dependency_report core >/dev/null 2>&1 || dependency_install_missing "$DOG_NONINTERACTIVE" core || true

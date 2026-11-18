@@ -155,6 +155,7 @@ uninstall_dog() {
     fi
     confirm "确认卸载" || { echo "已取消"; return 0; }
     dog_lock || return 75
+    DOG_UNINSTALL_STARTED=true   # 交互菜单据此判断：已开始卸载则退出菜单；取消或锁忙则回到菜单
     cron_remove_all || rc=1
     if config_exists && [ "$(config_schema)" = "2" ]; then
         begin_tc_update && {

@@ -156,6 +156,73 @@ if grep -q '周期总流量' <<< "$cron_report" && grep -q 'm1' <<< "$cron_repor
 else
     bad "cron 最小环境报告：$cron_report"
 fi
+
+echo "# 按监控项开关推送（2.1）"
+send_udp 8080 972 3   # 让 m3 有流量，才能验证总量不含它
+check "关闭 m3 推送（edit --notify off）" "${DOG[@]}" edit m3 --notify off
+[ "$(cfg '.monitors.m3.notify')" = "false" ] && ok "配置写入 notify=false" || bad "notify=$(cfg '.monitors.m3.notify')"
+grep -q '设置监控项推送开关：成功 id=m3 mode=off' "$PORT_TRAFFIC_DOG_CONFIG_DIR/logs/traffic.log" && ok "审计日志记录推送开关" || bad "审计日志缺推送开关记录"
+if "${DOG[@]}" edit m3 --notify maybe >/dev/null 2>&1; then bad "非法开关值应被拒绝"; else ok "非法开关值被拒绝"; fi
+[ "$(cfg '.monitors.m3.notify')" = "false" ] && ok "非法值不改配置" || bad "非法值改了配置"
+mult() { [ "$(cfg ".monitors.$1.billing_mode")" = single ] && echo 1 || echo 2; }
+billed() { echo $(( ($(nft_bytes "ptd_$1_in") + $(nft_bytes "ptd_$1_out")) * $(mult "$1") )); }
+fmt_bytes() { bash -c 'source <(sed "\$d" "$1"); format_bytes "$2"' _ "$ROOT/port-traffic-dog.sh" "$1"; }
+[ "$(billed m3)" -gt 0 ] && ok "m3 有计费流量 $(billed m3)" || bad "m3 无流量，下一条没有区分力"
+want_total=$(fmt_bytes $(( $(billed m1) + $(billed m2) )))
+report=$("${DOG[@]}" status)
+if grep -q "监控项: 2个 | 周期总流量: $want_total" <<< "$report" && grep -q '\[m1\]' <<< "$report" && ! grep -q '\[m3\]' <<< "$report"; then
+    ok "status 不含 m3，头部数量与总量只算 m1、m2（$want_total）"
+else
+    bad "status：$(head -n 4 <<< "$report")（期望总量 $want_total）"
+fi
+lj=$("${DOG[@]}" list --json)
+[ "$(jq -r '.[] | select(.id == "m3") | .notify' <<< "$lj")" = false ] && [ "$(jq -r '.[] | select(.id == "m1") | .notify' <<< "$lj")" = true ] &&
+    ok "list --json 输出实际生效的 notify" || bad "list --json：$(jq -c 'map({id, notify})' <<< "$lj")"
+list_out=$("${DOG[@]}" list)
+grep -q '不推送' <<< "$list_out" && ok "dog list 状态列显示 不推送" || bad "dog list 未显示不推送"
+for d in in out; do nft flush chain inet port_traffic_monitor "ptd_m3_$d"; nft delete counter inet port_traffic_monitor "ptd_m3_$d"; done
+rc=0; "${DOG[@]}" status >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && ok "关闭推送的 m3 缺计数器时不告警" || bad "m3 缺计数器时 status rc=$rc"
+check "重新开启 m3 推送" "${DOG[@]}" edit m3 --notify on
+rc=0; out=$("${DOG[@]}" status 2>&1) || rc=$?
+[ "$rc" -eq 2 ] && grep -q '监控项 m3 的计数器缺失' <<< "$out" && ok "开启推送后 m3 缺计数器即告警（rc=2）" || bad "开启后 status rc=$rc：$out"
+check "tick 修复缺失的计数器" "${DOG[@]}" --tick
+[ -n "$(nft_bytes ptd_m3_in)" ] && ok "m3 计数器已重建" || bad "m3 计数器未重建"
+cp "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json" "$T/config-before-notify.json"
+jq '.notifications.telegram += {enabled: true, bot_token: "123:T", chat_id: "1", status_notifications: {enabled: true, interval: "12h"}}' \
+    "$T/config-before-notify.json" > "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json"
+mkdir -p "$T/tgstub"
+cat > "$T/tgstub/curl" <<EOF
+#!/bin/bash
+printf '%s\n' "\$@" > "$T/tg.args"
+cat > /dev/null
+echo '{"ok":true}'
+EOF
+chmod +x "$T/tgstub/curl"
+for id in m1 m2 m3; do "${DOG[@]}" edit "$id" --notify off >/dev/null 2>&1 || bad "关闭 $id 推送失败"; done
+rc=0; env PATH="$T/tgstub:$PATH" "${DOG[@]}" --send-status telegram >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$T/tg.args" ] &&
+   grep -q 'telegram 状态报告未发送：所有监控项均已关闭推送' "$PORT_TRAFFIC_DOG_CONFIG_DIR/logs/notification.log"; then
+    ok "全部关闭推送：--send-status 返回 0、未调用 curl、通知日志记录跳过"
+else
+    bad "全部关闭推送：rc=$rc，curl $( [ -e "$T/tg.args" ] && echo 被调用 || echo 未调用)"
+fi
+rc=0; out=$("${DOG[@]}" status 2>&1) || rc=$?
+[ "$rc" -eq 0 ] && grep -q '所有监控项均已关闭推送' <<< "$out" && ok "全部关闭时 status 打印说明并返回 0" || bad "全部关闭 status rc=$rc：$out"
+sc_out=$("${DOG[@]}" --self-check 2>&1)   # 先取完整输出再匹配：pipefail 下自检的非 0 返回码会让 `| grep -q` 判失败
+grep -q '所有监控项均已关闭推送' <<< "$sc_out" && ok "自检提示定时报告不会发送" || bad "自检未提示全部关闭"
+check "重新开启 m1 推送" "${DOG[@]}" edit m1 --notify on
+rc=0; env PATH="$T/tgstub:$PATH" "${DOG[@]}" --send-status telegram >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && grep -q '\[m1\]' "$T/tg.args" 2>/dev/null && ! grep -q '\[m2\]' "$T/tg.args" && ! grep -q '\[m3\]' "$T/tg.args" &&
+    ok "推送只包含开启的监控项" || bad "推送内容 rc=$rc：$(grep -o '\[m[0-9]*\]' "$T/tg.args" 2>/dev/null | paste -sd,)"
+check "关闭 m1 推送（准备拆分）" "${DOG[@]}" edit m1 --notify off
+sid=$("${DOG[@]}" split m1 8033-8035 2>/dev/null | tail -n1)
+[ -n "$sid" ] && [ "$(cfg ".monitors.$sid.notify")" = "false" ] && ok "拆出的新项 $sid 继承 notify=false" || bad "拆分后 $sid notify=$(cfg ".monitors.${sid:-x}.notify")"
+check "合并回 m1" "${DOG[@]}" merge "$sid" m1
+for id in m1 m2 m3; do "${DOG[@]}" edit "$id" --notify on >/dev/null 2>&1 || bad "开启 $id 推送失败"; done
+jq '.notifications = $n' --argjson n "$(jq '.notifications' "$T/config-before-notify.json")" \
+    "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json" > "$T/cfg.tmp" && cat "$T/cfg.tmp" > "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json"
+[ "$(cfg '[.monitors[] | .notify] | all')" = true ] && [ "$(cfg '.notifications.telegram.enabled')" = false ] && ok "推送设置已复原" || bad "复原失败"
 nft delete table inet port_traffic_monitor
 rc=0; report=$("${DOG[@]}" status) || rc=$?
 [ "$rc" -eq 2 ] && grep -q '流量读取失败' <<< "$report" && ok "规则缺失时报告为告警（rc=2）而非空内容" || bad "缺表报告 rc=$rc"
@@ -248,19 +315,21 @@ make_release() {   # $1=版本 [$2=sed 额外改动]
     (cd "$REL" && sha256sum port-traffic-dog.sh port-ip-guard.sh > SHA256SUMS)
 }
 inst_ver() { awk -F'"' '/^readonly SCRIPT_VERSION=/ { print $2; exit }' "$PORT_TRAFFIC_DOG_INSTALL_PATH"; }
-make_release 2.0.1; echo "# tampered" >> "$REL/port-traffic-dog.sh"
+CUR_VER=$(awk -F'"' '/^readonly SCRIPT_VERSION=/ { print $2; exit }' "$ROOT/port-traffic-dog.sh")
+NEXT_VER="${CUR_VER%.*}.$(( ${CUR_VER##*.} + 1 ))"
+make_release "$NEXT_VER"; echo "# tampered" >> "$REL/port-traffic-dog.sh"
 "${UPD[@]}" --update >/dev/null 2>&1 && bad "校验失败仍安装" || ok "SHA256 不符时拒绝更新"
 [ "$(inst_ver)" = "$(awk -F'"' '/^readonly SCRIPT_VERSION=/ { print $2; exit }' "$ROOT/port-traffic-dog.sh")" ] && ok "拒绝后版本不变" || bad "版本=$(inst_ver)"
-make_release 2.0.1 's/^        --post-update|--finalize-update) post_update ;;$/        --post-update|--finalize-update) return 9 ;;/'
+make_release "$NEXT_VER" 's/^        --post-update|--finalize-update) post_update ;;$/        --post-update|--finalize-update) return 9 ;;/'
 cfg_before=$(sha256sum < "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json")
 "${UPD[@]}" --update > "$T/upd-bad.out" 2>&1 && bad "维护失败仍返回成功" || ok "新版维护失败时返回非 0"
 grep -q '正在恢复更新前的文件' "$T/upd-bad.out" && ok "失败发生在新版维护阶段（走到了回滚）" || { bad "未走到回滚"; tail -5 "$T/upd-bad.out"; }
-[ "$(inst_ver)" != "2.0.1" ] && [ "$(sha256sum < "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json")" = "$cfg_before" ] && ok "已回滚到更新前文件" || bad "回滚失败：$(inst_ver)"
+[ "$(inst_ver)" != "$NEXT_VER" ] && [ "$(sha256sum < "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json")" = "$cfg_before" ] && ok "已回滚到更新前文件" || bad "回滚失败：$(inst_ver)"
 make_release 1.9.9
 "${UPD[@]}" --update >/dev/null 2>&1 && bad "允许了降级" || ok "拒绝降级"
-make_release 2.0.1
+make_release "$NEXT_VER"
 "${UPD[@]}" --update > "$T/upd.out" 2>&1 && ok "正常更新" || { bad "正常更新"; tail -15 "$T/upd.out"; }
-[ "$(inst_ver)" = "2.0.1" ] && ok "已更新到 2.0.1" || bad "版本=$(inst_ver)"
+[ "$(inst_ver)" = "$NEXT_VER" ] && ok "已更新到 $NEXT_VER" || bad "版本=$(inst_ver)"
 ls -d "$PORT_TRAFFIC_DOG_CONFIG_DIR"/backups/update-* >/dev/null 2>&1 && ok "更新前备份存在" || bad "无更新备份"
 grep -q "$PORT_TRAFFIC_DOG_INSTALL_PATH --tick" "$T/crontab" && ok "定时任务指向已安装脚本" || bad "cron：$(cat "$T/crontab")"
 unset PORT_TRAFFIC_DOG_INSTALL_PATH PORT_TRAFFIC_DOG_MIRROR

@@ -21,7 +21,7 @@ unset _ptd_locale
 # 北京时间使用固定偏移，不依赖 tzdata（缺 tzdata 时 Asia/Shanghai 会静默退回 UTC）。
 readonly DOG_TZ="CST-8"
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="端口流量狗"
 readonly CONFIG_SCHEMA=2
 _ptd_self=$(realpath "$0" 2>/dev/null || printf '%s' "$0")
@@ -78,12 +78,15 @@ readonly TC_IFB_INGRESS_HANDLE="ffff:"
 
 readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
 
+# 颜色：标题粗体青色、编号青色、次要信息变暗（SGR 2；不支持的终端按正常亮度显示，不会看不见）。
+# 2.0 及以前用深蓝（0;34）做标题和编号，在黑底终端上几乎看不清，2.1 起不再使用。
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
-    RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; GREEN='\033[0;32m'; NC='\033[0m'
+    RED='\033[0;31m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
+    BOLD_CYAN='\033[1;36m'; DIM='\033[2m'; NC='\033[0m'
 else
-    RED=''; YELLOW=''; BLUE=''; GREEN=''; NC=''
+    RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD_CYAN=''; DIM=''; NC=''
 fi
-readonly RED YELLOW BLUE GREEN NC
+readonly RED YELLOW GREEN CYAN BOLD_CYAN DIM NC
 
 readonly SHORT_CONNECT_TIMEOUT=5
 readonly DOG_REPO="${PORT_TRAFFIC_DOG_REPO:-duya07/port-traffic-dog}"

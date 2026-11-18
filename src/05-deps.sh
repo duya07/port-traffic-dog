@@ -380,21 +380,25 @@ dependency_cli() {
 dependency_menu() {
     local choice scope
     while true; do
-        printf '\n=== 依赖检测、安装与卸载 ===\n'
-        printf ' 1. 检测全部依赖（只读）\n 2. 仅安装缺失依赖\n 3. 查看本脚本新增包账本\n 4. 卸载依赖\n 0. 返回\n'
-        read -r -p '请选择 [0-4]：' choice || return 0
+        ui_title "依赖检测、安装与卸载"
+        ui_option 1 "检测全部依赖（只读）"
+        ui_option 2 "仅安装缺失依赖"
+        ui_option 3 "查看本脚本新增包账本"
+        ui_option 4 "卸载依赖"
+        ui_option 0 "返回"
+        ui_prompt 4 choice || return 0
         case "$choice" in
             1) dependency_report all || true ;;
             2) dependency_install_missing false all || true ;;
             3) dependency_read_owned || true; printf '账本位置：%s/installed-packages\n' "$DEPENDENCY_STATE_DIR" ;;
             4)
-                read -r -p '范围：1 仅本脚本新增（默认），2 全部相关，0 取消：' scope || return 0
+                read -r -p ' 范围：1 仅本脚本新增（默认），2 全部相关，0 取消：' scope || return 0
                 case "$scope" in ''|1) dependency_remove owned false || true ;; 2) dependency_remove all false || true ;; 0) ;; *) printf '无效范围。\n' ;; esac
                 ;;
             0) return 0 ;;
             *) printf '无效选择。\n' ;;
         esac
-        read -r -p '按回车返回依赖管理...' choice || return 0
+        read -r -p ' 按回车返回依赖管理...' choice || return 0
     done
 }
 

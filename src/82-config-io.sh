@@ -12,14 +12,17 @@ export_config() {
     if has_monitors && ! stats_snapshot; then
         echo -e "${YELLOW}警告：刷新内核计数失败，导出的流量为最近一次灾备值${NC}" >&2
     fi
-    tmp=$(mktemp -d); pkg="$tmp/port-traffic-dog-config"
-    mkdir -p "$pkg"
+    tmp=$(mktemp -d) || { dog_unlock; dog_error "无法创建临时目录，未导出"; return 1; }
+    pkg="$tmp/port-traffic-dog-config"
+    mkdir -p "$pkg" || { dog_unlock; rm -rf "$tmp"; dog_error "无法创建临时目录，未导出"; return 1; }
     for f in $CONFIG_IO_FILES; do
-        [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$pkg/"
+        [ -f "$CONFIG_DIR/$f" ] || continue
+        cp -p "$CONFIG_DIR/$f" "$pkg/" || { dog_unlock; rm -rf "$tmp"; dog_error "复制 $f 失败，未导出"; return 1; }
     done
     dog_unlock
     printf 'version=%s\nexported_at=%s\nhost=%s\nmonitors=%s\n' "$SCRIPT_VERSION" "$(date -u +%FT%TZ)" \
-        "$(hostname)" "$(jq -r '[.monitors | keys[]] | join(" ")' "$CONFIG_FILE" 2>/dev/null)" > "$pkg/package_info.txt"
+        "$(hostname)" "$(jq -r '[.monitors | keys[]] | join(" ")' "$CONFIG_FILE" 2>/dev/null)" > "$pkg/package_info.txt" ||
+        { rm -rf "$tmp"; dog_error "写入包信息失败，未导出"; return 1; }
     ( umask 077; tar -czf "$archive" -C "$tmp" port-traffic-dog-config ) || { rm -rf "$tmp"; dog_error "打包失败"; return 1; }
     rm -rf "$tmp"
     chmod 600 "$archive"
@@ -63,9 +66,15 @@ import_config() {
 
     dog_lock || { rm -rf "$tmp"; return 75; }
     backup="$BACKUP_DIR/import-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup" && chmod 700 "$backup"
+    # 备份不完整就不能继续：下面会先拆除运行状态、删除现有文件，失败时的回滚全靠这份备份。
+    if ! mkdir -p "$backup" || ! chmod 700 "$backup"; then
+        dog_unlock; rm -rf "$tmp"; dog_error "无法创建备份目录 $backup，未导入"; return 1
+    fi
     has_monitors && stats_snapshot >/dev/null 2>&1 || true
-    for f in $CONFIG_IO_FILES; do [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$backup/"; done
+    for f in $CONFIG_IO_FILES; do
+        [ -f "$CONFIG_DIR/$f" ] || continue
+        cp -p "$CONFIG_DIR/$f" "$backup/" || { dog_unlock; rm -rf "$tmp"; dog_error "备份 $f 失败，未导入"; return 1; }
+    done
     teardown_runtime
     for f in $CONFIG_IO_FILES; do
         rm -f "$CONFIG_DIR/$f"

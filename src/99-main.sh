@@ -6,12 +6,12 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 用法：dog                         打开交互菜单
       dog list [--json]           列出监控项
-      dog status                  打印状态报告（与推送内容相同）
+      dog status                  打印状态报告（与推送内容相同：只含开启推送的监控项）
       dog add <端口> [--remark R]  添加监控项；"80,443" 为一项，"80;443" 为两项，"8000-8010" 为端口段
       dog edit <ID|端口> [选项]    修改监控项：
           --add P,P   --del P,P   --set P,P        增加 / 删除 / 整组替换端口（流量连续）
           --remark R  --quota 500GB|0  --billing double|single
-          --limit 100Mbps|0  --expiry YYYY-MM-DD|0
+          --limit 100Mbps|0  --expiry YYYY-MM-DD|0  --notify on|off（是否出现在状态推送中）
           --reset monthly:1 | days:30[@YYYY-MM-DD] | months:3[@YYYY-MM-DD][:15] | yearly:1-1 | once:YYYY-MM-DD | none
       dog split <ID> <端口> [--remark R] [--copy]   拆出为新监控项（--copy 复制配额/重置/到期）
       dog merge <源ID> <目标ID>                     合并（流量相加，保留目标设置）
@@ -56,7 +56,7 @@ parse_reset_spec() {
 cli_list() {
     if [ "${1:-}" = "--json" ]; then
         jq -n --argjson c "$(jq '.monitors' "$CONFIG_FILE")" --argjson v "$(nft_read_values)" '
-            $c | to_entries | map(.value + {id: .key, counters: ($v[.key] // null)})'
+            $c | to_entries | map(.value + {id: .key, notify: (.value.notify != false), counters: ($v[.key] // null)})'
     else
         show_monitor_table || true
     fi
@@ -72,7 +72,7 @@ cli_edit() {
             --add|--del|--set) [ -n "${2:-}" ] || { show_usage; return 2; }
                 local v; v=$(parse_port_list "$2" | paste -sd,) || return 1
                 case "$1" in --add) add="$v" ;; --del) del="$v" ;; --set) set="$v" ;; esac; shift 2 ;;
-            --remark|--quota|--billing|--limit|--expiry|--reset)
+            --remark|--quota|--billing|--limit|--expiry|--reset|--notify)
                 [ "$#" -ge 2 ] || { show_usage; return 2; }
                 ops+=("$1" "$2"); shift 2 ;;
             *) dog_error "未知选项：$1"; return 2 ;;
@@ -88,6 +88,7 @@ cli_edit() {
             --remark) monitor_set_remark "$id" "$val" || rc=1 ;;
             --quota) monitor_set_quota "$id" "$val" || rc=1 ;;
             --billing) monitor_set_billing "$id" "$val" || rc=1 ;;
+            --notify) monitor_set_notify "$id" "$val" || rc=1 ;;
             --expiry) [ "$val" = "0" ] && val=""; monitor_set_expiry "$id" "$val" || rc=1 ;;
             --limit)
                 if [ "$val" = "0" ]; then tc_set_monitor_limit "$id" 0 || rc=1
@@ -143,7 +144,11 @@ main() {
             validate_config_file "$CONFIG_FILE" || { dog_error "配置无效，请修正 $CONFIG_FILE 或运行 dog --repair"; return 1; }
             show_main_menu ;;
         list) cli_list "$@" ;;
-        status) build_status_report "$(hostname)" ;;
+        status)
+            local src=0
+            build_status_report "$(hostname)" || src=$?
+            [ "$src" -ne 3 ] || src=0   # 没有开启推送的监控项：已打印说明，不算失败
+            return "$src" ;;
         add)
             [ -n "${1:-}" ] || { show_usage; return 2; }
             local input="$1" remark="" units u rc=0

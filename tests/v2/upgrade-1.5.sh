@@ -167,6 +167,11 @@ grep -q -- '--tick' "$T/crontab" && ! grep -q -- '--snapshot-traffic' "$T/cronta
 [ ! -d /etc/port-traffic-dog/notifications ] && ok "旧通知模块目录已移除" || bad "notifications 目录残留"
 ls /etc/port-traffic-dog/backups/migrate-1.5-*/config.json >/dev/null 2>&1 && ok "迁移备份存在" || bad "无迁移备份"
 bash /usr/local/bin/port-traffic-dog.sh list >/dev/null 2>&1 && ok "升级后 dog list 正常" || bad "升级后 list 失败"
+jq -e '[.monitors[] | has("notify")] | any | not' /etc/port-traffic-dog/config.json >/dev/null &&
+    ok "迁移后的配置没有 notify 字段（缺省全部推送）" || bad "迁移后出现 notify 字段"
+st=$(bash /usr/local/bin/port-traffic-dog.sh status 2>&1)
+[ "$(grep -c '^[0-9][0-9]*\. \[m[0-9][0-9]*\]' <<< "$st")" -eq "$(jq '.monitors | length' /etc/port-traffic-dog/config.json)" ] &&
+    ok "升级后 status 包含全部监控项" || bad "status：$st"
 send_udp 8032 972 10
 [ "$(nft_bytes "ptd_${id}_in")" -gt "$new_in" ] && ok "升级后继续计数" || bad "升级后计数未增长"
 

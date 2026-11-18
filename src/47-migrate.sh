@@ -113,7 +113,7 @@ migrate_from_legacy() {
         legacy_tc=true
         tc_require_ntc_compatible || { dog_error "迁移已中止，未做任何修改"; return 1; }
     fi
-    echo -e "${BLUE}检测到 1.5.x 配置，开始迁移到 2.0（监控项改为稳定 ID，可直接增删端口）...${NC}"
+    echo -e "${CYAN}检测到 1.5.x 配置，开始迁移到 2.0（监控项改为稳定 ID，可直接增删端口）...${NC}"
     dog_lock || return 75
     ts=$(date +%Y%m%d-%H%M%S)
     dir="$BACKUP_DIR/migrate-1.5-$ts"

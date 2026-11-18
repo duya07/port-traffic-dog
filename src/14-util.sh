@@ -103,6 +103,16 @@ convert_bandwidth_to_tc() {
     esac
 }
 
+# tc 速率（100mbit）→ 显示用（100Mbps）。
+format_tc_rate() {
+    case "$1" in
+        *kbit) echo "${1%kbit}Kbps" ;;
+        *mbit) echo "${1%mbit}Mbps" ;;
+        *gbit) echo "${1%gbit}Gbps" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 validate_day_1_31() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 31 ]
 }
@@ -328,9 +338,4 @@ add_years_to_date() {
     day=$(clamp_day_to_month "$year" "$month" "$day")
 
     format_date "$year" "$month" "$day"
-}
-
-# 清屏只在交互终端、非 dumb、未设置 NO_COLOR 时进行（clear 输出的是控制序列）。
-menu_clear() {
-    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
 }

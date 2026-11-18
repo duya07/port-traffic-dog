@@ -110,7 +110,7 @@ ports_json_to_nft_elements() {
 # 当前系统监听端口（程序名 → 端口），添加监控时作参考。
 show_listening_ports() {
     command -v ss >/dev/null 2>&1 || return 0
-    echo -e "${GREEN}当前监听端口：${NC}"
+    printf '  %b当前监听端口%b\n' "$DIM" "$NC"
     ss -tulnpH 2>/dev/null | awk '
         {
             n = split($5, a, ":"); port = a[n]
@@ -118,6 +118,6 @@ show_listening_ports() {
             if (match($0, /users:\(\("[^"]+"/)) { prog = substr($0, RSTART + 9, RLENGTH - 10) }
             if (port ~ /^[0-9]+$/ && !seen[prog SUBSEP port]++) list[prog] = list[prog] (list[prog] ? "," : "") port
         }
-        END { for (p in list) printf "  %-18s %s\n", p, list[p] }
+        END { for (p in list) printf "    %-18s %s\n", p, list[p] }
     ' | sort | head -n 30
 }

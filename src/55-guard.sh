@@ -80,11 +80,11 @@ ensure_ip_guard_script() {
 
 manage_ip_guard() {
     menu_clear
-    echo -e "${BLUE}=== 在线 IP / 并发连接限制（测试中） ===${NC}"
-    echo -e "${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
-    echo "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
-    echo "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
-    echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
+    ui_title "在线 IP / 并发连接限制" "测试中"
+    echo -e "  ${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
+    ui_note "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
+    ui_note "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
+    ui_note "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
     echo
     if ! dependency_install_missing false all; then
         echo '依赖未就绪；可在主菜单“依赖管理”中安装。未启用新的防火墙限制。' >&2

@@ -274,37 +274,36 @@ prompt_reset_policy() {
     today=$(get_current_date)
     while true; do
         {
-            echo
-            echo -e "${BLUE}=== 自动重置策略 ===${NC}"
-            echo "1. 每月几号重置（默认每月${default_day}日）"
-            echo "2. 每隔多少天重置"
-            echo "3. 每隔多少个月重置"
-            echo "4. 每年几月几号重置"
-            echo "5. 指定日期清零一次"
-            echo "0. 不自动重置"
+            ui_title "自动重置策略"
+            ui_option 1 "每月几号重置（默认每月${default_day}日）"
+            ui_option 2 "每隔多少天重置"
+            ui_option 3 "每隔多少个月重置"
+            ui_option 4 "每年几月几号重置"
+            ui_option 5 "指定日期清零一次"
+            ui_option 0 "不自动重置"
         } >&2
-        read -r -p "请选择(回车默认1) [0-5]: " choice
+        ui_prompt 5 choice "回车默认 1" || return 1
         case "$choice" in
             1|"")
-                read -r -p "每月几号重置(回车默认${default_day}) [1-31]: " day
+                read -r -p " 每月几号重置（回车默认 ${default_day}）[1-31]: " day
                 day="${day:-$default_day}"
                 validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
                 jq -cn --argjson d "$day" '{type: "monthly", day: $d}'; return 0 ;;
             2|3)
                 if [ "$choice" = 2 ]; then
-                    read -r -p "每隔多少天重置 [1-3650]: " every
+                    read -r -p " 每隔多少天重置 [1-3650]: " every
                     [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 3650 ] || { echo -e "${RED}天数无效${NC}" >&2; continue; }
                 else
-                    read -r -p "每隔多少个月重置 [1-120]: " every
+                    read -r -p " 每隔多少个月重置 [1-120]: " every
                     [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 120 ] || { echo -e "${RED}月数无效${NC}" >&2; continue; }
                 fi
-                read -r -p "起算日期(回车默认今天 ${today}) [YYYY-MM-DD]: " anchor
+                read -r -p " 起算日期(回车默认今天 ${today}) [YYYY-MM-DD]: " anchor
                 anchor="${anchor:-$today}"
                 is_valid_date "$anchor" || { echo -e "${RED}日期格式应为 YYYY-MM-DD${NC}" >&2; continue; }
                 if [ "$choice" = 2 ]; then
                     jq -cn --argjson e "$every" --arg a "$anchor" '{type: "interval_days", every: $e, anchor_date: $a}'
                 else
-                    read -r -p "每次按几号重置(回车默认 $((10#${anchor:8:2}))) [1-31]: " day
+                    read -r -p " 每次按几号重置(回车默认 $((10#${anchor:8:2}))) [1-31]: " day
                     day="${day:-$((10#${anchor:8:2}))}"
                     validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
                     jq -cn --argjson e "$every" --arg a "$anchor" --argjson d "$day" \
@@ -312,12 +311,12 @@ prompt_reset_policy() {
                 fi
                 return 0 ;;
             4)
-                read -r -p "每年几月 [1-12]: " month
-                read -r -p "几号 [1-31]: " day
+                read -r -p " 每年几月 [1-12]: " month
+                read -r -p " 几号 [1-31]: " day
                 validate_month_1_12 "$month" && validate_day_1_31 "$day" || { echo -e "${RED}月份或日期无效${NC}" >&2; continue; }
                 jq -cn --argjson m "$month" --argjson d "$day" '{type: "yearly", month: $m, day: $d}'; return 0 ;;
             5)
-                read -r -p "清零日期 [YYYY-MM-DD]: " date
+                read -r -p " 清零日期 [YYYY-MM-DD]: " date
                 is_valid_date "$date" && ! date_lt "$date" "$today" || { echo -e "${RED}日期无效或早于今天${NC}" >&2; continue; }
                 jq -cn --arg d "$date" '{type: "fixed_date", date: $d}'; return 0 ;;
             0) echo '{"type":"none"}'; return 0 ;;

@@ -169,5 +169,144 @@ eq "缺表：runtime_json 无输出" "$(sed -n 1p "$T/drift.out")" "json=[]"
 eq "缺表：调用方得到单个 null" "$(sed -n 2p "$T/drift.out")" "fallback=[null]"
 eq "缺表：漂移明细为表不存在" "$(sed -n 3p "$T/drift.out")" "drift=1 nftables 表 port_traffic_monitor 不存在"
 
+# 2.1：按监控项开关推送（.notify 缺省为 true）
+for v in true false; do
+    jq --argjson v "$v" '.monitors.m2.notify = $v' "$CONFIG_FILE" > "$T/n.json"; yes_ validate_config_file "$T/n.json"
+done
+for v in '"no"' 1 null; do
+    jq --argjson v "$v" '.monitors.m2.notify = $v' "$CONFIG_FILE" > "$T/n.json"; no_ validate_config_file "$T/n.json"
+done
+cp "$CONFIG_FILE" "$T/config-base.json"
+jq '.monitors.m2.notify = false' "$T/config-base.json" > "$CONFIG_FILE"
+yes_ monitor_notify_enabled m1
+no_ monitor_notify_enabled m2
+eq "推送项不含 notify:false" "$(notify_monitor_ids | paste -sd,)" "m1"
+# 对照：jq 的 `//` 把 false 当成“没有值”，所以不能用 mget 读缺省为真的布尔字段。
+eq "mget 读 notify 的坑（对照）" "$(mget m2 .notify true)" "true"
+report_case() {   # $1=nft 读数 JSON；输出报告正文与返回码
+    (
+        values_json="$1"
+        nft_available() { return 0; }
+        nft_table_exists() { return 0; }
+        nft_read_values() { echo "$values_json"; }
+        build_status_report demo-node; echo "rc=$?"
+    )
+}
+out=$(report_case '{"m1":{"in":1000,"out":2000,"quota_used":0},"m2":{"in":5000,"out":5000,"quota_used":0}}')
+grep -q '\[m1\]' <<< "$out" && ! grep -q '\[m2\]' <<< "$out"; eq "报告不含关闭推送的 m2" "$?" "0"
+grep -q '监控项: 1个 | 周期总流量: 5.86KB' <<< "$out"; eq "报告头的数量与总量只算开启推送的项" "$?" "0"
+eq "报告正常返回 0" "$(tail -n1 <<< "$out")" "rc=0"
+out=$(report_case '{"m1":{"in":1,"out":1,"quota_used":0}}')
+eq "关闭推送的项缺计数不告警" "$(tail -n1 <<< "$out")" "rc=0"
+jq '.monitors.m1.notify = false | .monitors.m2.notify = false' "$T/config-base.json" > "$CONFIG_FILE"
+out=$(report_case '{}')
+eq "全部关闭：报告返回 3" "$(tail -n1 <<< "$out")" "rc=3"
+grep -q '所有监控项均已关闭推送' <<< "$out"; eq "全部关闭：说明文字" "$?" "0"
+rm -f "$T/curl.args"; : > "$NOTIFY_LOG_FILE"
+PATH="$T/stub:$PATH" send_status_report telegram; eq "全部关闭：推送返回 0" "$?" "0"
+eq "全部关闭：未调用 curl" "$([ -e "$T/curl.args" ] && echo called || echo none)" "none"
+grep -q 'telegram 状态报告未发送：所有监控项均已关闭推送' "$NOTIFY_LOG_FILE"; eq "全部关闭：通知日志记录跳过" "$?" "0"
+cp "$T/config-base.json" "$CONFIG_FILE"
+
+# 开机恢复日志措辞：开机缺表记为“开机恢复”；真正的漂移明细用“；”连接，末尾没有多余分隔符。
+(
+    has_monitors() { return 0; }
+    nft_rebuild_all() { return 0; }
+    nft_table_exists() { return 0; }
+    nft_runtime_drift() { printf '缺少链 ptd_m1_in\n缺少计数器 ptd_m1_out\n'; return 1; }
+    runtime_ensure_nft quiet; tail -n1 "$NOTIFY_LOG_FILE"
+    nft_table_exists() { return 1; }
+    nft_runtime_drift() { echo "nftables 表 port_traffic_monitor 不存在"; return 1; }
+    printf '{"schema":2,"saved_at":"2026-11-18T04:59:01Z","monitors":{}}\n' > "$TRAFFIC_DATA_FILE"
+    runtime_ensure_nft quiet boot; tail -n1 "$NOTIFY_LOG_FILE"
+    rm -f "$TRAFFIC_DATA_FILE"
+    runtime_ensure_nft quiet boot; tail -n1 "$NOTIFY_LOG_FILE"
+    runtime_ensure_nft quiet; tail -n1 "$NOTIFY_LOG_FILE"
+) | sed 's/^\[[^]]*\] //' > "$T/boot.out"
+eq "漂移日志：明细连接" "$(sed -n 1p "$T/boot.out")" "nftables 规则漂移，已自动重建：缺少链 ptd_m1_in；缺少计数器 ptd_m1_out"
+eq "开机恢复日志（灾备时间为北京时间）" "$(sed -n 2p "$T/boot.out")" "开机恢复：已按配置重建 nftables 规则，计数从灾备恢复（灾备时间 2026-11-18 12:59:01）"
+eq "开机恢复日志（无灾备）" "$(sed -n 3p "$T/boot.out")" "开机恢复：已按配置重建 nftables 规则（没有可用灾备，计数从 0 开始）"
+eq "非开机缺表仍按漂移记录" "$(sed -n 4p "$T/boot.out")" "nftables 规则漂移，已自动重建：nftables 表 port_traffic_monitor 不存在"
+
+# 界面：宽度按显示列数（中文与全角标点 2 列；方框线、省略号、用量条 1 列）
+eq "宽度：ASCII" "$(ui_width 'abc 12')" "6"
+eq "宽度：中文与全角标点" "$(ui_width '东京（主线）')" "12"
+eq "宽度：符号" "$(ui_width '─…·█░●✓')" "7"
+eq "补齐按显示宽度" "$(ui_pad '中a' 6)|" "中a   |"
+eq "超宽截断加省略号" "$(ui_truncate '东京主线（8023）' 9)" "东京主线…"
+eq "不超宽不截断" "$(ui_truncate '8443' 9)" "8443"
+eq "tc 速率显示" "$(format_tc_rate 100mbit)" "100Mbps"
+eq "宽度：emoji 与符号（交通、扩展、杂项）" "$(ui_width '🚀🪐⌚✅')" "8"
+eq "宽度：组合附加符不占列" "$(ui_width $'e\u0301')" "1"
+eq "宽度：拉丁扩展" "$(ui_width 'é')" "1"
+
+# 重建失败时日志不能写“已重建”，并返回非 0。
+(
+    has_monitors() { return 0; }
+    nft_rebuild_all() { return 1; }
+    nft_table_exists() { return 1; }
+    nft_runtime_drift() { echo "nftables 表 port_traffic_monitor 不存在"; return 1; }
+    runtime_ensure_nft quiet boot; echo "rc=$?"; tail -n1 "$NOTIFY_LOG_FILE"
+    nft_table_exists() { return 0; }
+    runtime_ensure_nft quiet; echo "rc=$?"; tail -n1 "$NOTIFY_LOG_FILE"
+) | sed 's/^\[[^]]*\] //' > "$T/rebuild-fail.out"
+eq "开机重建失败：返回非 0" "$(sed -n 1p "$T/rebuild-fail.out")" "rc=1"
+eq "开机重建失败：日志" "$(sed -n 2p "$T/rebuild-fail.out")" "开机恢复失败：按配置重建 nftables 规则未成功（返回码 1），请运行 dog --repair"
+eq "漂移重建失败：返回非 0" "$(sed -n 3p "$T/rebuild-fail.out")" "rc=1"
+eq "漂移重建失败：日志" "$(sed -n 4p "$T/rebuild-fail.out")" "nftables 规则漂移，自动重建失败（返回码 1）：nftables 表 port_traffic_monitor 不存在"
+
+# 序号带前导 0 按十进制：08、09 曾按八进制报错并中止整个命令（|| true 也拦不住），010 会选成 m8。
+jq '.monitors = ([range(1; 11)] | map({key: "m\(.)", value: {ports: ["\(8000 + .)"], billing_mode: "double",
+    quota: {enabled: false, monthly_limit: "unlimited"}, reset_policy: {type: "none"}}}) | from_entries) |
+    .global.next_monitor_id = 11' "$T/config-base.json" > "$CONFIG_FILE"
+for v in 08 010 9; do
+    ( nft_read_values() { echo '{}'; }; echo "pick=$(select_monitor 选择 <<< "$v" 2>/dev/null)" )
+done > "$T/zero.out" 2>&1
+for v in 08 '09 010'; do
+    (
+        monitors_set_notify() { echo "set=$(jq -c . <<< "$1")"; }
+        notify_scope_summary() { :; }
+        menu_notify_monitors <<< "$v" 2>&1 | grep '^set=' || echo "set=<none>"
+    )
+done >> "$T/zero.out" 2>&1
+eq "选择监控项：08 → m8" "$(sed -n 1p "$T/zero.out")" "pick=m8"
+eq "选择监控项：010 → m10" "$(sed -n 2p "$T/zero.out")" "pick=m10"
+eq "选择监控项：9 → m9" "$(sed -n 3p "$T/zero.out")" "pick=m9"
+eq "推送勾选：08 切换 m8" "$(sed -n 4p "$T/zero.out")" 'set={"m8":false}'
+eq "推送勾选：09 010 切换 m9、m10" "$(sed -n 5p "$T/zero.out")" 'set={"m9":false,"m10":false}'
+
+# 宽屏表格：超额到 1000% 以上时百分比多一位，状态列仍与表头对齐，行宽不超过终端。
+jq '.monitors.m1.quota.monthly_limit = "1GB" | .monitors.m2.notify = false' "$T/config-base.json" > "$CONFIG_FILE"
+(
+    nft_read_values() { echo '{"m1":{"in":6442450944,"out":0},"m2":{"in":1048576,"out":0}}'; }
+    COLUMNS=120 show_monitor_table < /dev/null 2>/dev/null
+) > "$T/wide.out"
+status_col() { local line; line=$(grep -m1 -- "$1" "$T/wide.out") || { echo none; return; }; ui_width "${line%%"$2"*}"; }
+eq "宽屏：带用量条" "$(grep -c '█' "$T/wide.out")" "1"
+eq "宽屏：1200% 行的状态列与表头对齐" "$(status_col 'm1 ' 超额)" "$(status_col '端口 / 备注' 状态)"
+eq "宽屏：另一行的状态列与表头对齐" "$(status_col 'm2 ' 不推送)" "$(status_col '端口 / 备注' 状态)"
+grep -q '1200%' "$T/wide.out"; eq "宽屏：显示 1200%" "$?" "0"
+eq "宽屏：行宽不超过 120" "$(while IFS= read -r l; do ui_width "$l"; echo; done < "$T/wide.out" | sort -n | tail -n1 | awk '{print ($1 <= 120) ? "ok" : $1}')" "ok"
+cp "$T/config-base.json" "$CONFIG_FILE"
+
+# 导入：备份目录建不起来时，必须在拆除运行状态、删除现有文件之前停止（回滚全靠这份备份）。
+jq '.monitors.m1.remark = "imported"' "$T/config-base.json" > "$T/import-config.json"
+python3 - "$T/ok.tgz" "$T/import-config.json" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as t:
+    t.add(sys.argv[2], arcname="port-traffic-dog-config/config.json")
+PY
+# shellcheck disable=SC2034  # DOG_NONINTERACTIVE 由被测函数读取
+(
+    DOG_NONINTERACTIVE=true
+    teardown_runtime() { echo TEARDOWN; }
+    rm -rf "$BACKUP_DIR"; touch "$BACKUP_DIR"   # 让 mkdir -p 失败
+    import_config "$T/ok.tgz"; echo "rc=$?"
+    rm -f "$BACKUP_DIR"
+) > "$T/import-backup.out" 2>&1
+grep -q TEARDOWN "$T/import-backup.out"; eq "导入备份失败：未拆除运行状态" "$?" "1"
+eq "导入备份失败：返回 1" "$(tail -n1 "$T/import-backup.out")" "rc=1"
+cmp -s "$CONFIG_FILE" "$T/config-base.json"; eq "导入备份失败：现有配置未改动" "$?" "0"
+
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

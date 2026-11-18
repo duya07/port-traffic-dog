@@ -21,7 +21,7 @@ unset _ptd_locale
 # 北京时间使用固定偏移，不依赖 tzdata（缺 tzdata 时 Asia/Shanghai 会静默退回 UTC）。
 readonly DOG_TZ="CST-8"
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="端口流量狗"
 readonly CONFIG_SCHEMA=2
 _ptd_self=$(realpath "$0" 2>/dev/null || printf '%s' "$0")
@@ -78,12 +78,15 @@ readonly TC_IFB_INGRESS_HANDLE="ffff:"
 
 readonly DEFAULT_TRAFFIC_RETENTION_DAYS=400
 
+# 颜色：标题粗体青色、编号青色、次要信息变暗（SGR 2；不支持的终端按正常亮度显示，不会看不见）。
+# 2.0 及以前用深蓝（0;34）做标题和编号，在黑底终端上几乎看不清，2.1 起不再使用。
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
-    RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; GREEN='\033[0;32m'; NC='\033[0m'
+    RED='\033[0;31m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
+    BOLD_CYAN='\033[1;36m'; DIM='\033[2m'; NC='\033[0m'
 else
-    RED=''; YELLOW=''; BLUE=''; GREEN=''; NC=''
+    RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD_CYAN=''; DIM=''; NC=''
 fi
-readonly RED YELLOW BLUE GREEN NC
+readonly RED YELLOW GREEN CYAN BOLD_CYAN DIM NC
 
 readonly SHORT_CONNECT_TIMEOUT=5
 readonly DOG_REPO="${PORT_TRAFFIC_DOG_REPO:-duya07/port-traffic-dog}"
@@ -478,21 +481,25 @@ dependency_cli() {
 dependency_menu() {
     local choice scope
     while true; do
-        printf '\n=== 依赖检测、安装与卸载 ===\n'
-        printf ' 1. 检测全部依赖（只读）\n 2. 仅安装缺失依赖\n 3. 查看本脚本新增包账本\n 4. 卸载依赖\n 0. 返回\n'
-        read -r -p '请选择 [0-4]：' choice || return 0
+        ui_title "依赖检测、安装与卸载"
+        ui_option 1 "检测全部依赖（只读）"
+        ui_option 2 "仅安装缺失依赖"
+        ui_option 3 "查看本脚本新增包账本"
+        ui_option 4 "卸载依赖"
+        ui_option 0 "返回"
+        ui_prompt 4 choice || return 0
         case "$choice" in
             1) dependency_report all || true ;;
             2) dependency_install_missing false all || true ;;
             3) dependency_read_owned || true; printf '账本位置：%s/installed-packages\n' "$DEPENDENCY_STATE_DIR" ;;
             4)
-                read -r -p '范围：1 仅本脚本新增（默认），2 全部相关，0 取消：' scope || return 0
+                read -r -p ' 范围：1 仅本脚本新增（默认），2 全部相关，0 取消：' scope || return 0
                 case "$scope" in ''|1) dependency_remove owned false || true ;; 2) dependency_remove all false || true ;; 0) ;; *) printf '无效范围。\n' ;; esac
                 ;;
             0) return 0 ;;
             *) printf '无效选择。\n' ;;
         esac
-        read -r -p '按回车返回依赖管理...' choice || return 0
+        read -r -p ' 按回车返回依赖管理...' choice || return 0
     done
 }
 
@@ -571,6 +578,7 @@ dog_write_event() (
         monitor_edit) description="修改监控项端口" ;;
         monitor_split) description="拆分监控项" ;;
         monitor_merge) description="合并监控项" ;;
+        monitor_notify) description="设置监控项推送开关" ;;
         tc_apply) description="应用带宽限制" ;;
         tc_clear) description="撤销带宽限制" ;;
         expiry_apply) description="应用服务到期封锁" ;;
@@ -621,12 +629,12 @@ dog_error() {
 show_operation_logs() {
     local file
     for file in "$LOG_FILE" "$LOG_DIR/ip-guard.log" "$NOTIFY_LOG_FILE"; do
-        printf '\n=== %s ===\n' "${file##*/}"
+        ui_title "${file##*/}" "最近 50 条"
         if [ -f "$file" ] && [ ! -L "$file" ]; then
             if [[ "$file" == */ip-guard.log ]]; then
                 tail -n 50 -- "$file" | jq -r '"\(.time) \(.message // .event)"' 2>/dev/null || tail -n 50 -- "$file"
             else tail -n 50 -- "$file"; fi
-        else echo '暂无日志'; fi
+        else echo '  暂无日志'; fi
     done
 }
 
@@ -795,6 +803,16 @@ convert_bandwidth_to_tc() {
         *mbps) echo "${v%mbps}mbit" ;;
         *gbps) echo "${v%gbps}gbit" ;;
         *) return 1 ;;
+    esac
+}
+
+# tc 速率（100mbit）→ 显示用（100Mbps）。
+format_tc_rate() {
+    case "$1" in
+        *kbit) echo "${1%kbit}Kbps" ;;
+        *mbit) echo "${1%mbit}Mbps" ;;
+        *gbit) echo "${1%gbit}Gbps" ;;
+        *) echo "$1" ;;
     esac
 }
 
@@ -1025,6 +1043,131 @@ add_years_to_date() {
     format_date "$year" "$month" "$day"
 }
 
+# ── 终端界面元素 ──────────────────────────────────────────────────
+# 约定：标题粗体青色，编号青色，分隔线、组标题与提示变暗；状态用绿/黄/红。
+# 只画横线、不画右边框：东亚歧义宽度按双宽显示的终端会把右边框挤乱。
+# 宽度一律按“显示列数”计算（中日韩全角字符占 2 列）；bash 的 printf %-Ns 按字节补齐，不能用于中文。
+
+readonly UI_RULE_MAX=76
+
+# 把 $2 的显示宽度写入变量 $1（不开子进程，供循环里使用）。
+# 双宽：东亚宽/全角字符（Unicode East_Asian_Width 为 W/F），含常见 emoji；组合附加符与变体选择符为 0。
+ui_measure() {
+    local -n __ui_width_out=$1
+    local __ui_text="$2" __ui_i __ui_c __ui_w=0 LC_CTYPE=C.UTF-8
+    for ((__ui_i = 0; __ui_i < ${#__ui_text}; __ui_i++)); do
+        printf -v __ui_c '%d' "'${__ui_text:__ui_i:1}"
+        if (( __ui_c < 0x300 )); then
+            __ui_w=$((__ui_w + 1))
+        elif (( (__ui_c <= 0x36f) || (__ui_c >= 0x200b && __ui_c <= 0x200f) || (__ui_c >= 0xfe00 && __ui_c <= 0xfe0f) )); then
+            continue
+        elif (( (__ui_c >= 0x1100 && __ui_c <= 0x115f) || (__ui_c >= 0x2e80 && __ui_c <= 0xa4cf) ||
+                (__ui_c >= 0xac00 && __ui_c <= 0xd7a3) || (__ui_c >= 0xf900 && __ui_c <= 0xfaff) ||
+                (__ui_c >= 0xfe30 && __ui_c <= 0xfe4f) || (__ui_c >= 0xff00 && __ui_c <= 0xff60) ||
+                (__ui_c >= 0xffe0 && __ui_c <= 0xffe6) || (__ui_c >= 0x1f300 && __ui_c <= 0x1f64f) ||
+                (__ui_c >= 0x1f680 && __ui_c <= 0x1f6ff) || (__ui_c >= 0x1f900 && __ui_c <= 0x1f9ff) ||
+                (__ui_c >= 0x1fa70 && __ui_c <= 0x1faff) || (__ui_c >= 0x20000 && __ui_c <= 0x3fffd) )); then
+            __ui_w=$((__ui_w + 2))
+        elif (( __ui_c >= 0x231a && __ui_c <= 0x2b55 )) &&
+             (( (__ui_c >= 0x231a && __ui_c <= 0x231b) || (__ui_c >= 0x23e9 && __ui_c <= 0x23ec) || __ui_c == 0x23f0 ||
+                __ui_c == 0x23f3 || (__ui_c >= 0x25fd && __ui_c <= 0x25fe) || (__ui_c >= 0x2614 && __ui_c <= 0x2615) ||
+                (__ui_c >= 0x2648 && __ui_c <= 0x2653) || __ui_c == 0x267f || __ui_c == 0x2693 || __ui_c == 0x26a1 ||
+                (__ui_c >= 0x26aa && __ui_c <= 0x26ab) || (__ui_c >= 0x26bd && __ui_c <= 0x26be) ||
+                (__ui_c >= 0x26c4 && __ui_c <= 0x26c5) || __ui_c == 0x26ce || __ui_c == 0x26d4 || __ui_c == 0x26ea ||
+                (__ui_c >= 0x26f2 && __ui_c <= 0x26f3) || __ui_c == 0x26f5 || __ui_c == 0x26fa || __ui_c == 0x26fd ||
+                __ui_c == 0x2705 || (__ui_c >= 0x270a && __ui_c <= 0x270b) || __ui_c == 0x2728 || __ui_c == 0x274c ||
+                __ui_c == 0x274e || (__ui_c >= 0x2753 && __ui_c <= 0x2755) || __ui_c == 0x2757 ||
+                (__ui_c >= 0x2795 && __ui_c <= 0x2797) || __ui_c == 0x27b0 || __ui_c == 0x27bf ||
+                (__ui_c >= 0x2b1b && __ui_c <= 0x2b1c) || __ui_c == 0x2b50 || __ui_c == 0x2b55 )); then
+            __ui_w=$((__ui_w + 2))
+        else
+            __ui_w=$((__ui_w + 1))
+        fi
+    done
+    __ui_width_out=$__ui_w
+}
+
+ui_width() {
+    local w
+    ui_measure w "$1"
+    printf '%s' "$w"
+}
+
+# 左对齐补齐到 $2 列（超出时原样输出，不截断）。
+ui_pad() {
+    local w
+    ui_measure w "$1"
+    if [ "$w" -lt "$2" ]; then printf '%s%*s' "$1" $(($2 - w)) ''; else printf '%s' "$1"; fi
+}
+
+# 超过 $2 列时截断，末尾加“…”。
+ui_truncate() {
+    local text="$1" max="$2" out="" w=0 cw i ch
+    ui_measure w "$text"
+    if [ "$w" -le "$max" ]; then printf '%s' "$text"; return 0; fi
+    w=0
+    local LC_CTYPE=C.UTF-8
+    for ((i = 0; i < ${#text}; i++)); do
+        ch="${text:i:1}"
+        ui_measure cw "$ch"
+        [ $((w + cw)) -le $((max - 1)) ] || break
+        out+="$ch"; w=$((w + cw))
+    done
+    printf '%s…' "$out"
+}
+
+# 终端列数：优先问标准输入/错误所连的终端（菜单里 stdout 常被 $(...) 捕获），其次 $COLUMNS，默认 80。
+ui_columns() {
+    local size="" columns=""
+    if [ -t 0 ]; then size=$(stty size 2>/dev/null) || size=""
+    elif [ -t 2 ]; then size=$(stty size <&2 2>/dev/null) || size=""   # 先把 stdin 指向终端，再丢弃错误输出
+    fi
+    columns="${size##* }"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] || columns="${COLUMNS:-80}"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
+    printf '%s' "$columns"
+}
+
+ui_rule() {
+    local w line
+    w=$(( $(ui_columns) - 2 ))
+    [ "$w" -le "$UI_RULE_MAX" ] || w=$UI_RULE_MAX
+    printf -v line '%*s' "$w" ''
+    printf ' %b%s%b\n' "$DIM" "${line// /─}" "$NC"
+}
+
+# 小节标题：空一行，标题与可选副标题，下接分隔线。
+ui_title() {
+    printf '\n %b%s%b' "$BOLD_CYAN" "$1" "$NC"
+    [ -z "${2:-}" ] || printf ' %b·%b %s' "$DIM" "$NC" "$2"
+    printf '\n'
+    ui_rule
+}
+
+# 菜单项：编号 文本 [变暗的附注]
+ui_option() {
+    printf '   %b%2s.%b %s' "$CYAN" "$1" "$NC" "$2"
+    [ -z "${3:-}" ] || printf '  %b%s%b' "$DIM" "$3" "$NC"
+    printf '\n'
+}
+
+# 键值行：键变暗并补齐到 $3 列（默认 8）。
+ui_kv() {
+    printf '  %b%s%b  %s\n' "$DIM" "$(ui_pad "$1" "${3:-8}")" "$NC" "$2"
+}
+
+ui_note() {
+    printf '  %b%s%b\n' "$DIM" "$1" "$NC"
+}
+
+# 读取菜单选择写入变量 $2，提示统一为“请选择 [0-N]”，$3 为附加说明。
+# 读到 EOF 返回 1，调用方据此返回上一级。
+ui_prompt() {
+    local __ui_hint="0-$1"
+    [ -z "${3:-}" ] || __ui_hint+="，$3"
+    read -r -p " 请选择 [${__ui_hint}]: " "$2"
+}
+
 # 清屏只在交互终端、非 dumb、未设置 NO_COLOR 时进行（clear 输出的是控制序列）。
 menu_clear() {
     if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
@@ -1032,7 +1175,8 @@ menu_clear() {
 
 # ── 配置（schema 2） ──────────────────────────────────────────────
 # 监控项以稳定 ID（m1、m2…）为身份，端口只是成员列表：
-#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at }
+#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
+# notify 缺省视为 true（2.1 新增；2.0.0 读到会忽略，即全部推送）。
 # 所有 nft/tc/统计/历史的名字都从 ID 派生，所以加减端口不会改变身份。
 
 default_config_json() {
@@ -1075,6 +1219,8 @@ def monitor_errors($id):
              "监控项 \($id) 的端口无效: \(.)") end),
       (if (($m.billing_mode // "double") | IN("single", "double")) | not then "监控项 \($id) 计费模式无效" else empty end),
       (if (($m.remark // "") | type) != "string" or (($m.remark // "") | length) > 64 then "监控项 \($id) 备注无效（最长 64 字符）" else empty end),
+      (if ($m | type) == "object" and ($m | has("notify")) and (($m.notify | type) != "boolean")
+         then "监控项 \($id) 推送开关无效（只能是 true 或 false）" else empty end),
       (if ($m.quota // {}) | type != "object" then "监控项 \($id) quota 无效" else empty end),
       (if (($m.quota.enabled // false) | type) != "boolean" then "监控项 \($id) 配额开关无效" else empty end),
       (if (($m.quota.monthly_limit // "unlimited") | size_ok) | not then "监控项 \($id) 配额大小无效" else empty end),
@@ -1211,14 +1357,29 @@ monitor_ports_csv() {
     jq -r --arg id "$1" '(.monitors[$id].ports // []) | join(",")' "$CONFIG_FILE"
 }
 
-# 显示用标签：备注 + 端口，端口过多时截断。
+# 显示用标签：备注 + 端口，端口过多时截断。监控项表格与 monitor_label 共用这份 jq 定义。
+readonly MONITOR_LABEL_JQ='def monitor_label:
+    ((.ports // []) | join(",")) as $p |
+    (if ($p | length) > 40 then ($p[0:37] + "…") else $p end) as $ps |
+    if (.remark // "") != "" then "\(.remark)（\($ps)）" else $ps end;'
+
 monitor_label() {
-    jq -r --arg id "$1" '
-        .monitors[$id] as $m |
-        ($m.ports | join(",")) as $p |
-        (if ($p | length) > 40 then ($p[0:37] + "…") else $p end) as $ps |
-        if ($m.remark // "") != "" then "\($m.remark)（\($ps)）" else $ps end
-    ' "$CONFIG_FILE"
+    jq -r --arg id "$1" "$MONITOR_LABEL_JQ"' .monitors[$id] | monitor_label' "$CONFIG_FILE"
+}
+
+# 监控项是否参与状态推送（.notify 缺省为 true）。
+# 不能用 mget：jq 的 `//` 把 false 也当作“没有值”，`.notify // true` 永远得到 true。
+monitor_notify_enabled() {
+    jq -e --arg id "$1" '.monitors[$id].notify != false' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 参与状态推送的监控项 ID，按数字顺序。
+notify_monitor_ids() {
+    jq -r '.monitors // {} | to_entries[] | select(.value.notify != false) | .key' "$CONFIG_FILE" 2>/dev/null | sort -t m -k2 -n
+}
+
+has_notify_monitors() {
+    jq -e '[(.monitors // {})[] | select(.notify != false)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 monitor_billing_multiplier() {
@@ -1362,7 +1523,7 @@ ports_json_to_nft_elements() {
 # 当前系统监听端口（程序名 → 端口），添加监控时作参考。
 show_listening_ports() {
     command -v ss >/dev/null 2>&1 || return 0
-    echo -e "${GREEN}当前监听端口：${NC}"
+    printf '  %b当前监听端口%b\n' "$DIM" "$NC"
     ss -tulnpH 2>/dev/null | awk '
         {
             n = split($5, a, ":"); port = a[n]
@@ -1370,7 +1531,7 @@ show_listening_ports() {
             if (match($0, /users:\(\("[^"]+"/)) { prog = substr($0, RSTART + 9, RLENGTH - 10) }
             if (port ~ /^[0-9]+$/ && !seen[prog SUBSEP port]++) list[prog] = list[prog] (list[prog] ? "," : "") port
         }
-        END { for (p in list) printf "  %-18s %s\n", p, list[p] }
+        END { for (p in list) printf "    %-18s %s\n", p, list[p] }
     ' | sort | head -n 30
 }
 
@@ -1784,14 +1945,34 @@ traffic_backup_drop_monitor() {
     json_update "$TRAFFIC_DATA_FILE" 'del(.monitors[$id])' --arg id "$1"
 }
 
-# 规则缺失或与配置不一致时按配置重建（保留计数）。$1=quiet 时不打印。
+# 规则缺失或与配置不一致时按配置重建（保留计数）。$1=quiet 时不打印；$2=boot 表示开机恢复。
+# 开机时表本来就不存在：记为“开机恢复”而不是“规则漂移”，免得每天的重启日志读起来像故障。
+# 先重建、再按结果记日志：重建失败时不能写“已重建”。
 runtime_ensure_nft() {
-    local drift
+    local drift saved="" rc=0
     has_monitors || return 0
     drift=$(nft_runtime_drift 2>/dev/null) && return 0
+    if [ "${2:-}" = boot ] && ! nft_table_exists; then
+        saved=$(jq -r 'if .schema == 2 then (.saved_at // empty) else empty end' "$TRAFFIC_DATA_FILE" 2>/dev/null || true)
+        nft_rebuild_all || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            log_notification "开机恢复失败：按配置重建 nftables 规则未成功（返回码 $rc），请运行 dog --repair"
+        elif [ -n "$saved" ]; then
+            saved=$(beijing_date -d "$saved" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$saved")
+            log_notification "开机恢复：已按配置重建 nftables 规则，计数从灾备恢复（灾备时间 $saved）"
+        else
+            log_notification "开机恢复：已按配置重建 nftables 规则（没有可用灾备，计数从 0 开始）"
+        fi
+        return "$rc"
+    fi
     [ "${1:-}" = "quiet" ] || echo -e "${YELLOW}检测到 nftables 规则与配置不一致，正在按配置修复：${NC}\n$drift" >&2
-    log_notification "nftables 规则漂移，已自动重建：$(tr '\n' ';' <<< "$drift")"
-    nft_rebuild_all
+    nft_rebuild_all || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_notification "nftables 规则漂移，已自动重建：${drift//$'\n'/；}"
+    else
+        log_notification "nftables 规则漂移，自动重建失败（返回码 $rc）：${drift//$'\n'/；}"
+    fi
+    return "$rc"
 }
 
 # 完整恢复：nft 计数/配额/到期 + TC 限速。
@@ -1812,7 +1993,7 @@ restore_runtime() {
 restore_runtime_nft_only() {
     local rc=0
     dog_lock || return 75
-    runtime_ensure_nft quiet || rc=1
+    runtime_ensure_nft quiet boot || rc=1
     stats_rebaseline_all || true
     dog_unlock
     dog_log_event runtime_restore "$rc" mode=nft-only
@@ -2270,37 +2451,36 @@ prompt_reset_policy() {
     today=$(get_current_date)
     while true; do
         {
-            echo
-            echo -e "${BLUE}=== 自动重置策略 ===${NC}"
-            echo "1. 每月几号重置（默认每月${default_day}日）"
-            echo "2. 每隔多少天重置"
-            echo "3. 每隔多少个月重置"
-            echo "4. 每年几月几号重置"
-            echo "5. 指定日期清零一次"
-            echo "0. 不自动重置"
+            ui_title "自动重置策略"
+            ui_option 1 "每月几号重置（默认每月${default_day}日）"
+            ui_option 2 "每隔多少天重置"
+            ui_option 3 "每隔多少个月重置"
+            ui_option 4 "每年几月几号重置"
+            ui_option 5 "指定日期清零一次"
+            ui_option 0 "不自动重置"
         } >&2
-        read -r -p "请选择(回车默认1) [0-5]: " choice
+        ui_prompt 5 choice "回车默认 1" || return 1
         case "$choice" in
             1|"")
-                read -r -p "每月几号重置(回车默认${default_day}) [1-31]: " day
+                read -r -p " 每月几号重置（回车默认 ${default_day}）[1-31]: " day
                 day="${day:-$default_day}"
                 validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
                 jq -cn --argjson d "$day" '{type: "monthly", day: $d}'; return 0 ;;
             2|3)
                 if [ "$choice" = 2 ]; then
-                    read -r -p "每隔多少天重置 [1-3650]: " every
+                    read -r -p " 每隔多少天重置 [1-3650]: " every
                     [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 3650 ] || { echo -e "${RED}天数无效${NC}" >&2; continue; }
                 else
-                    read -r -p "每隔多少个月重置 [1-120]: " every
+                    read -r -p " 每隔多少个月重置 [1-120]: " every
                     [[ "$every" =~ ^[0-9]+$ ]] && [ "$every" -ge 1 ] && [ "$every" -le 120 ] || { echo -e "${RED}月数无效${NC}" >&2; continue; }
                 fi
-                read -r -p "起算日期(回车默认今天 ${today}) [YYYY-MM-DD]: " anchor
+                read -r -p " 起算日期(回车默认今天 ${today}) [YYYY-MM-DD]: " anchor
                 anchor="${anchor:-$today}"
                 is_valid_date "$anchor" || { echo -e "${RED}日期格式应为 YYYY-MM-DD${NC}" >&2; continue; }
                 if [ "$choice" = 2 ]; then
                     jq -cn --argjson e "$every" --arg a "$anchor" '{type: "interval_days", every: $e, anchor_date: $a}'
                 else
-                    read -r -p "每次按几号重置(回车默认 $((10#${anchor:8:2}))) [1-31]: " day
+                    read -r -p " 每次按几号重置(回车默认 $((10#${anchor:8:2}))) [1-31]: " day
                     day="${day:-$((10#${anchor:8:2}))}"
                     validate_day_1_31 "$day" || { echo -e "${RED}日期必须是 1-31${NC}" >&2; continue; }
                     jq -cn --argjson e "$every" --arg a "$anchor" --argjson d "$day" \
@@ -2308,12 +2488,12 @@ prompt_reset_policy() {
                 fi
                 return 0 ;;
             4)
-                read -r -p "每年几月 [1-12]: " month
-                read -r -p "几号 [1-31]: " day
+                read -r -p " 每年几月 [1-12]: " month
+                read -r -p " 几号 [1-31]: " day
                 validate_month_1_12 "$month" && validate_day_1_31 "$day" || { echo -e "${RED}月份或日期无效${NC}" >&2; continue; }
                 jq -cn --argjson m "$month" --argjson d "$day" '{type: "yearly", month: $m, day: $d}'; return 0 ;;
             5)
-                read -r -p "清零日期 [YYYY-MM-DD]: " date
+                read -r -p " 清零日期 [YYYY-MM-DD]: " date
                 is_valid_date "$date" && ! date_lt "$date" "$today" || { echo -e "${RED}日期无效或早于今天${NC}" >&2; continue; }
                 jq -cn --arg d "$date" '{type: "fixed_date", date: $d}'; return 0 ;;
             0) echo '{"type":"none"}'; return 0 ;;
@@ -2448,6 +2628,7 @@ monitor_edit_ports() {
 }
 
 # 拆分：把 $2（成员逗号串）移到新监控项。$3=备注，$4=copy 时复制配额/重置/到期设置。
+# 计费模式与推送开关总是继承：拆分不改变“谁能看到这些端口”，已关闭推送的端口拆出后不应突然出现在推送里。
 monitor_split() {
     local id="$1" move_csv="$2" remark="${3:-}" copy="${4:-}" old move rest new_id snap rt now missing
     dog_lock || return 75
@@ -2472,7 +2653,8 @@ monitor_split() {
             quota: (if $copy then ($src.quota // {enabled: false, monthly_limit: "unlimited"}) else {enabled: false, monthly_limit: "unlimited"} end),
             bandwidth_limit: {enabled: false, rate: "unlimited"},
             reset_policy: (if $copy then ($src.reset_policy // {type: "none"}) else {type: "none"} end),
-            expiry_date: (if $copy then ($src.expiry_date // "") else "" end), created_at: $now} |
+            expiry_date: (if $copy then ($src.expiry_date // "") else "" end), created_at: $now} +
+            (if $src.notify == false then {notify: false} else {} end) |
         .global.next_monitor_id = (($nid | ltrimstr("m") | tonumber) + 1)
     ' --arg id "$id" --arg nid "$new_id" --argjson rest "$rest" --argjson move "$move" \
       --arg r "$remark" --arg now "$now" --argjson copy "$([ "$copy" = copy ] && echo true || echo false)" ||
@@ -2569,6 +2751,29 @@ monitor_set_billing() {
     [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
     dog_unlock
     dog_log_event config_update "$rc" "id=$id" "mode=$mode"
+    return "$rc"
+}
+
+# 推送开关：$2 = on | off。只影响状态报告是否包含该监控项，不改变统计、配额与定时任务。
+monitor_set_notify() {
+    local id="$1" value rc=0
+    case "$2" in on) value=true ;; off) value=false ;; *) dog_error "推送开关只能是 on 或 off"; return 1 ;; esac
+    monitor_exists "$id" || { dog_error "监控项 $id 不存在"; return 1; }
+    config_update '.monitors[$id].notify = $v' --arg id "$id" --argjson v "$value" || rc=1
+    dog_log_event monitor_notify "$rc" "id=$id" "mode=$2"
+    return "$rc"
+}
+
+# 批量设置推送开关（菜单勾选用，一次写入）：$1 = {"m1":true,"m2":false}，只传有变化的项。
+monitors_set_notify() {
+    local changes="$1" rc=0 id value
+    config_update 'reduce ($c | to_entries[]) as $e (.;
+        if .monitors[$e.key] != null then .monitors[$e.key].notify = $e.value else . end)' --argjson c "$changes" || rc=1
+    while IFS=$'\t' read -r id value; do
+        [ -n "$id" ] || continue
+        if [ "$value" = true ]; then value=on; else value=off; fi
+        dog_log_event monitor_notify "$rc" "id=$id" "mode=$value"
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<< "$changes")
     return "$rc"
 }
 
@@ -2687,7 +2892,7 @@ migrate_from_legacy() {
         legacy_tc=true
         tc_require_ntc_compatible || { dog_error "迁移已中止，未做任何修改"; return 1; }
     fi
-    echo -e "${BLUE}检测到 1.5.x 配置，开始迁移到 2.0（监控项改为稳定 ID，可直接增删端口）...${NC}"
+    echo -e "${CYAN}检测到 1.5.x 配置，开始迁移到 2.0（监控项改为稳定 ID，可直接增删端口）...${NC}"
     dog_lock || return 75
     ts=$(date +%Y%m%d-%H%M%S)
     dir="$BACKUP_DIR/migrate-1.5-$ts"
@@ -3110,18 +3315,17 @@ manage_tc_recovery() {
     local status_kind=""
 
     menu_clear
-    echo -e "${BLUE}=== TC 冲突处理 / 自动恢复 ===${NC}"
-    echo "TC 状态: $(dog_tc_status_label)"
-    echo "自动恢复: $(tc_auto_recovery_state)"
-    echo "恢复方式: 单一 systemd oneshot；启用后在网络就绪时执行一次"
+    ui_title "TC 冲突处理 / 自动恢复"
+    ui_kv "TC 状态" "$(dog_tc_status_label)"
+    ui_kv "自动恢复" "$(tc_auto_recovery_state)"
+    ui_kv "恢复方式" "单一 systemd oneshot；启用后在网络就绪时执行一次"
     echo
-    echo "1. 检测并按需重建 Dog/NTC 规则"
-    echo "2. 检测并按需重建，同时启用开机自动恢复"
-    echo "3. 启用开机自动恢复"
-    echo "4. 关闭开机自动恢复"
-    echo "0. 返回主菜单"
-    echo
-    read -r -p "请选择操作 [0-4]: " tc_choice
+    ui_option 1 "检测并按需重建 Dog/NTC 规则"
+    ui_option 2 "检测并按需重建，同时启用开机自动恢复"
+    ui_option 3 "启用开机自动恢复"
+    ui_option 4 "关闭开机自动恢复"
+    ui_option 0 "返回主菜单"
+    ui_prompt 4 tc_choice || return 0
     case "$tc_choice" in
         1|2)
             status_output=$(dog_tc_status 2>/dev/null || true)
@@ -4328,11 +4532,11 @@ ensure_ip_guard_script() {
 
 manage_ip_guard() {
     menu_clear
-    echo -e "${BLUE}=== 在线 IP / 并发连接限制（测试中） ===${NC}"
-    echo -e "${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
-    echo "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
-    echo "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
-    echo "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
+    ui_title "在线 IP / 并发连接限制" "测试中"
+    echo -e "  ${YELLOW}独立实验组件，按本机 TCP 服务端口限制在线 IP 数和并发连接数。${NC}"
+    ui_note "IPv4/IPv6 合计，两项可分别设置，0 表示不限；不处理内核 FORWARD 流量。"
+    ui_note "NAT/代理后可能共用一个来源 IP；同 IP 的多条连接仍分别计入连接数。"
+    ui_note "规则采用故障解封设计，但仍不建议直接限制当前 SSH 端口。"
     echo
     if ! dependency_install_missing false all; then
         echo '依赖未就绪；可在主菜单“依赖管理”中安装。未启用新的防火墙限制。' >&2
@@ -4383,12 +4587,24 @@ build_usage_progress_bar() {
     printf '%s' "$bar"
 }
 
-# 生成状态报告正文。读数失败时输出告警正文并返回 2。
+# 生成状态报告正文：只包含开启推送的监控项（.notify != false）。报告头的数量与周期总流量也只统计这些项，
+# 接收方看不到被关闭项的数量和流量；计数缺失也只检查这些项。
+# 返回 0 正常；2 读数失败（正文为告警）；3 没有开启推送的监控项（正文为说明，调用方不应发送）。
 build_status_report() {
-    local server="${1:-$(hostname)}" now values total=0 count=0 body="" id idx=0
+    local server="${1:-$(hostname)}" now values total=0 count body="" id idx=0
     local in_b out_b mult billed_in billed_out billed ports limit lbytes pct
+    local -a ids=()
+    mapfile -t ids < <(notify_monitor_ids)
+    count=${#ids[@]}
+    if [ "$count" -eq 0 ]; then
+        if has_monitors; then
+            printf '所有监控项均已关闭推送，没有可发送的内容（查看全部监控项：dog list）\n'
+        else
+            printf '暂无监控项\n'
+        fi
+        return 3
+    fi
     now=$(beijing_date '+%Y-%m-%d %H:%M:%S')
-    count=$(monitor_ids | grep -c . || true)
     if ! nft_available; then
         printf '⚠️ 服务器: %s | ⏰ %s\n流量读取失败：找不到 nft 命令（PATH=%s）\n请登录服务器运行 dog --self-check\n' "$server" "$now" "$PATH"
         return 2
@@ -4398,8 +4614,7 @@ build_status_report() {
         return 2
     fi
     values=$(nft_read_values)
-    while IFS= read -r id; do
-        [ -n "$id" ] || continue
+    for id in "${ids[@]}"; do
         if ! jq -e --arg id "$id" 'has($id)' <<< "$values" >/dev/null; then
             printf '⚠️ 服务器: %s | ⏰ %s\n流量读取失败：监控项 %s 的计数器缺失\n请运行 dog --repair\n' "$server" "$now" "$id"
             return 2
@@ -4420,7 +4635,7 @@ build_status_report() {
             body+=$'\n'"$(format_bytes "$billed")/${limit} | ${pct}%$([ "$pct" -ge 100 ] && echo ' (超限)') | $(monitor_cycle_range "$id")"
             body+=$'\n'"[$(build_usage_progress_bar "$pct")]"
         fi
-    done < <(monitor_ids)
+    done
     printf '🔗 服务器: %s | ⏰ %s\n' "$server" "$now"
     printf '────────────────────────────────────────\n'
     printf '状态: 监控中 | 监控项: %s个 | 周期总流量: %s\n' "$count" "$(format_bytes "$total")"
@@ -4523,15 +4738,21 @@ channel_server_name() {
     echo "$n"
 }
 
-# 发送状态报告到指定通道（telegram|wecom）。返回码：0 成功，1 发送失败，2 已发送读数告警。
+# 发送状态报告到指定通道（telegram|wecom）。返回码：0 成功或无需发送，1 发送失败，2 已发送读数告警。
 send_status_report() {
     local channel="$1" report rc=0 send_rc=0
+    case "$channel" in telegram|wecom) ;; *) return 1 ;; esac
     has_monitors || return 0
+    if ! has_notify_monitors; then
+        # 不发空报告：所有监控项都关闭推送时只记日志，返回 0，cron 不报错。
+        log_notification "$channel 状态报告未发送：所有监控项均已关闭推送"
+        return 0
+    fi
     report=$(build_status_report "$(channel_server_name "$channel")") || rc=$?
+    [ "$rc" -ne 3 ] || return 0
     case "$channel" in
         telegram) telegram_send "$report" || send_rc=1 ;;
         wecom) wecom_send "$report" || send_rc=1 ;;
-        *) return 1 ;;
     esac
     if [ "$rc" -ne 0 ]; then
         log_notification "$channel 状态报告读数失败，已发送告警：$(head -n 2 <<< "$report" | tail -n 1)"
@@ -4554,12 +4775,22 @@ notification_interval_cron_expression() {
     esac
 }
 
+notification_interval_label() {
+    case "$1" in
+        1m) echo "1 分钟" ;; 15m) echo "15 分钟" ;; 30m) echo "30 分钟" ;; 1h) echo "1 小时" ;;
+        2h) echo "2 小时" ;; 6h) echo "6 小时" ;; 12h) echo "12 小时" ;; 24h) echo "24 小时" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 select_notification_interval() {
     local choice
     {
-        echo "推送周期：1) 1分钟  2) 15分钟  3) 30分钟  4) 1小时  5) 2小时  6) 6小时  7) 12小时  8) 24小时"
+        ui_title "推送周期"
+        ui_option 1 "1 分钟"; ui_option 2 "15 分钟"; ui_option 3 "30 分钟"; ui_option 4 "1 小时"
+        ui_option 5 "2 小时"; ui_option 6 "6 小时"; ui_option 7 "12 小时"; ui_option 8 "24 小时"
     } >&2
-    read -r -p "请选择 [1-8，默认 4]: " choice
+    read -r -p " 请选择 [1-8，回车默认 4]: " choice || return 1
     case "${choice:-4}" in
         1) echo 1m ;; 2) echo 15m ;; 3) echo 30m ;; 4) echo 1h ;;
         5) echo 2h ;; 6) echo 6h ;; 7) echo 12h ;; 8) echo 24h ;;
@@ -4567,45 +4798,130 @@ select_notification_interval() {
     esac
 }
 
+# 通道状态摘要（菜单显示用）。
+channel_summary() {
+    local c="$1"
+    channel_enabled "$c" || { echo "未开启"; return 0; }
+    if channel_status_enabled "$c"; then
+        echo "已开启 · 定时报告每 $(notification_interval_label "$(cfg ".notifications.${c}.status_notifications.interval // \"1h\"")")"
+    else
+        echo "已开启 · 定时报告关闭"
+    fi
+}
+
+telegram_route_label() {
+    if [ "$(cfg '.notifications.telegram.api_route // "official"')" = custom ]; then
+        echo "自定义 $(cfg '.notifications.telegram.custom_api_base // ""')"
+    else
+        echo "官方 api.telegram.org"
+    fi
+}
+
+# 推送范围摘要，如“2/3 个监控项（不推送：m2）”。
+notify_scope_summary() {
+    local total on off
+    total=$(monitor_ids | grep -c . || true)
+    [ "$total" -gt 0 ] || { echo "暂无监控项"; return 0; }
+    on=$(notify_monitor_ids | grep -c . || true)
+    off=$(jq -r '[.monitors | to_entries[] | select(.value.notify == false) | .key] |
+        sort_by(ltrimstr("m") | tonumber) | join(", ")' "$CONFIG_FILE")
+    if [ "$on" -eq "$total" ]; then echo "全部 $total 个监控项"
+    elif [ "$on" -eq 0 ]; then echo "0/$total 个监控项（全部关闭，不会发送报告）"
+    else echo "$on/$total 个监控项（不推送：$off）"; fi
+}
+
+# 勾选参与推送的监控项：输入序号切换，可一次输入多个；a 全部推送，n 全部不推送；回车返回。
+menu_notify_monitors() {
+    local input token id value i n idw changes bad box
+    local -a ids=() tokens=()
+    local -A cur=() want=()
+    while true; do
+        ids=(); cur=(); idw=2
+        while IFS=$'\t' read -r id value; do
+            [ -n "$id" ] || continue
+            ids+=("$id"); cur[$id]=$value
+            [ "${#id}" -le "$idw" ] || idw=${#id}
+        done < <(jq -r '.monitors // {} | to_entries | sort_by(.key | ltrimstr("m") | tonumber)[] |
+            "\(.key)\t\(.value.notify != false)"' "$CONFIG_FILE")
+        n=${#ids[@]}
+        [ "$n" -gt 0 ] || { echo -e "${YELLOW}暂无监控项${NC}"; return 0; }
+        ui_title "选择推送的监控项" "定时报告只包含已勾选的监控项"
+        for ((i = 0; i < n; i++)); do
+            id="${ids[i]}"
+            if [ "${cur[$id]}" = true ]; then box="${GREEN}[✓]${NC}"; else box="${DIM}[ ]${NC}"; fi
+            printf '   %b%2d.%b %b %s  %s\n' "$CYAN" $((i + 1)) "$NC" "$box" "$(ui_pad "$id" "$idw")" \
+                "$(ui_truncate "$(monitor_label "$id")" 48)"
+        done
+        read -r -p " 输入序号切换（可多个，如 1 3；a 全部推送，n 全部不推送；回车返回）: " input || return 0
+        [ -n "${input//[[:space:]]/}" ] || return 0
+        want=(); bad=""
+        for id in "${ids[@]}"; do want[$id]=${cur[$id]}; done
+        read -ra tokens <<< "${input//[,，]/ }"
+        for token in "${tokens[@]}"; do
+            case "$token" in
+                a|A) for id in "${ids[@]}"; do want[$id]=true; done ;;
+                n|N) for id in "${ids[@]}"; do want[$id]=false; done ;;
+                *)
+                    if [[ "$token" =~ ^[0-9]+$ ]] && [ "$token" -ge 1 ] && [ "$token" -le "$n" ]; then
+                        id="${ids[10#$token - 1]}"   # 10#：08、09 不能按八进制解析（会中止整个命令）
+                        if [ "${want[$id]}" = true ]; then want[$id]=false; else want[$id]=true; fi
+                    else
+                        bad+=" $token"
+                    fi ;;
+            esac
+        done
+        if [ -n "$bad" ]; then echo -e "${RED}无效输入：${bad# }（序号范围 1-$n），未做任何修改${NC}"; continue; fi
+        changes=$(for id in "${ids[@]}"; do
+                [ "${want[$id]}" = "${cur[$id]}" ] || printf '%s\t%s\n' "$id" "${want[$id]}"
+            done | jq -Rn '[inputs | split("\t") | {(.[0]): (.[1] == "true")}] | add // {}')
+        [ "$changes" != "{}" ] || continue
+        if monitors_set_notify "$changes"; then
+            echo -e "${GREEN}推送范围已更新：$(notify_scope_summary)${NC}"
+            if ! has_notify_monitors && { channel_status_enabled telegram || channel_status_enabled wecom; }; then
+                echo -e "${YELLOW}所有监控项均已关闭推送，定时报告将不再发送（每次到点只在通知日志记一条）。${NC}"
+            fi
+        fi
+    done
+}
+
 manage_notification_channel() {
-    local c="$1" title choice v interval
+    local c="$1" title choice v chat base interval rc
     [ "$c" = telegram ] && title="Telegram" || title="企业微信"
     while true; do
+        ui_title "$title 通知"
+        ui_kv "通道" "$(channel_enabled "$c" && echo 已开启 || echo 未开启)"
+        ui_kv "定时报告" "$(channel_status_enabled "$c" && echo "每 $(notification_interval_label "$(cfg ".notifications.${c}.status_notifications.interval // \"1h\"")")" || echo 关闭)"
+        ui_kv "服务器名" "$(channel_server_name "$c")"
+        [ "$c" != telegram ] || ui_kv "API 线路" "$(telegram_route_label)"
         echo
-        echo -e "${BLUE}=== ${title} 通知 ===${NC}"
-        echo "状态：通道 $(channel_enabled "$c" && echo 开启 || echo 关闭) | 定时报告 $(channel_status_enabled "$c" && echo "开启（$(cfg ".notifications.${c}.status_notifications.interval // \"1h\"")）" || echo 关闭)"
-        if [ "$c" = telegram ]; then
-            echo "1. 设置 Bot Token 与 Chat ID"
-            echo "5. 切换 API 线路（当前：$(cfg '.notifications.telegram.api_route // "official"')）"
-        else
-            echo "1. 设置 Webhook 地址"
-        fi
-        echo "2. 设置服务器名称（当前：$(channel_server_name "$c")）"
-        echo "3. 开关定时报告并设置周期"
-        echo "4. 立即发送一次测试报告"
-        echo "6. 关闭此通道"
-        echo "0. 返回"
-        read -r -p "请选择: " choice
+        if [ "$c" = telegram ]; then ui_option 1 "设置 Bot Token 与 Chat ID"; else ui_option 1 "设置 Webhook 地址"; fi
+        ui_option 2 "设置服务器名称"
+        ui_option 3 "开关定时报告并设置周期"
+        ui_option 4 "立即发送一次测试报告"
+        [ "$c" != telegram ] || ui_option 5 "切换 API 线路"
+        ui_option 6 "关闭此通道"
+        ui_option 0 "返回"
+        ui_prompt 6 choice || return 0
         case "$choice" in
             1)
                 if [ "$c" = telegram ]; then
-                    read -r -p "Bot Token: " v
+                    read -r -p " Bot Token（回车取消）: " v || continue
                     [ -n "$v" ] || continue
-                    local chat
-                    read -r -p "Chat ID: " chat
+                    read -r -p " Chat ID: " chat || continue
                     config_update '.notifications.telegram.bot_token = $t | .notifications.telegram.chat_id = $c | .notifications.telegram.enabled = true' \
                         --arg t "$v" --arg c "$chat" && echo -e "${GREEN}已保存${NC}"
                 else
-                    read -r -p "Webhook 地址（https://qyapi.weixin.qq.com/...）: " v
+                    read -r -p " Webhook 地址（https://qyapi.weixin.qq.com/...，回车取消）: " v || continue
+                    [ -n "$v" ] || continue
                     [[ "$v" =~ ^https:// ]] || { echo -e "${RED}必须是 https:// 地址${NC}"; continue; }
                     config_update '.notifications.wecom.webhook_url = $u | .notifications.wecom.enabled = true' --arg u "$v" &&
                         echo -e "${GREEN}已保存${NC}"
                 fi ;;
             2)
-                read -r -p "服务器名称: " v
-                config_update ".notifications.${c}.server_name = \$n" --arg n "$v" ;;
+                read -r -p " 服务器名称（留空则使用主机名）: " v || continue
+                config_update ".notifications.${c}.server_name = \$n" --arg n "$v" && echo -e "${GREEN}已保存${NC}" ;;
             3)
-                if channel_status_enabled "$c" && confirm "定时报告已开启，是否关闭"; then
+                if channel_status_enabled "$c" && confirm " 定时报告已开启，是否关闭"; then
                     config_update ".notifications.${c}.status_notifications.enabled = false"
                 else
                     interval=$(select_notification_interval) || { echo -e "${RED}无效选择${NC}"; continue; }
@@ -4613,7 +4929,11 @@ manage_notification_channel() {
                 fi
                 cron_sync || true ;;
             4)
-                local rc=0
+                if has_monitors && ! has_notify_monitors; then
+                    echo -e "${YELLOW}所有监控项均已关闭推送，没有可发送的内容（通知管理 → 选择推送的监控项）${NC}"
+                    continue
+                fi
+                rc=0
                 send_status_report "$c" || rc=$?
                 case "$rc" in
                     0) echo -e "${GREEN}发送成功${NC}" ;;
@@ -4622,16 +4942,16 @@ manage_notification_channel() {
                 esac ;;
             5)
                 [ "$c" = telegram ] || continue
-                echo "1) 官方 api.telegram.org  2) 自定义反代地址"
-                read -r -p "请选择: " v
+                ui_option 1 "官方 api.telegram.org"
+                ui_option 2 "自定义反代地址"
+                read -r -p " 请选择 [1-2]: " v || continue
                 if [ "$v" = 2 ]; then
-                    local base
-                    read -r -p "API 基础地址（https://example.com）: " base
+                    read -r -p " API 基础地址（https://example.com）: " base || continue
                     base="${base%/}"
                     [[ "$base" =~ ^https:// ]] || [[ "$base" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]] ||
                         { echo -e "${RED}远程地址必须使用 https://${NC}"; continue; }
                     config_update '.notifications.telegram.api_route = "custom" | .notifications.telegram.custom_api_base = $b' --arg b "$base"
-                else
+                elif [ "$v" = 1 ]; then
                     config_update '.notifications.telegram.api_route = "official"'
                 fi ;;
             6)
@@ -4644,17 +4964,24 @@ manage_notification_channel() {
 manage_notifications() {
     local choice
     while true; do
+        ui_title "通知管理"
+        ui_kv "Telegram" "$(channel_summary telegram)"
+        ui_kv "企业微信" "$(channel_summary wecom)"
+        ui_kv "推送范围" "$(notify_scope_summary)"
         echo
-        echo -e "${BLUE}=== 通知管理 ===${NC}"
-        echo "1. Telegram"
-        echo "2. 企业微信"
-        echo "3. 查看通知日志"
-        echo "0. 返回"
-        read -r -p "请选择: " choice
+        ui_option 1 "Telegram 设置"
+        ui_option 2 "企业微信设置"
+        ui_option 3 "选择推送的监控项"
+        ui_option 4 "查看通知日志"
+        ui_option 0 "返回"
+        ui_prompt 4 choice || return 0
         case "$choice" in
             1) manage_notification_channel telegram ;;
             2) manage_notification_channel wecom ;;
-            3) tail -n 40 "$NOTIFY_LOG_FILE" 2>/dev/null || echo "暂无日志"; pause ;;
+            3) menu_notify_monitors ;;
+            4) ui_title "通知日志" "最近 40 条"
+               tail -n 40 "$NOTIFY_LOG_FILE" 2>/dev/null || echo "  暂无日志"
+               pause ;;
             0|"") return 0 ;;
         esac
     done
@@ -5070,6 +5397,7 @@ uninstall_dog() {
     fi
     confirm "确认卸载" || { echo "已取消"; return 0; }
     dog_lock || return 75
+    DOG_UNINSTALL_STARTED=true   # 交互菜单据此判断：已开始卸载则退出菜单；取消或锁忙则回到菜单
     cron_remove_all || rc=1
     if config_exists && [ "$(config_schema)" = "2" ]; then
         begin_tc_update && {
@@ -5115,14 +5443,17 @@ export_config() {
     if has_monitors && ! stats_snapshot; then
         echo -e "${YELLOW}警告：刷新内核计数失败，导出的流量为最近一次灾备值${NC}" >&2
     fi
-    tmp=$(mktemp -d); pkg="$tmp/port-traffic-dog-config"
-    mkdir -p "$pkg"
+    tmp=$(mktemp -d) || { dog_unlock; dog_error "无法创建临时目录，未导出"; return 1; }
+    pkg="$tmp/port-traffic-dog-config"
+    mkdir -p "$pkg" || { dog_unlock; rm -rf "$tmp"; dog_error "无法创建临时目录，未导出"; return 1; }
     for f in $CONFIG_IO_FILES; do
-        [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$pkg/"
+        [ -f "$CONFIG_DIR/$f" ] || continue
+        cp -p "$CONFIG_DIR/$f" "$pkg/" || { dog_unlock; rm -rf "$tmp"; dog_error "复制 $f 失败，未导出"; return 1; }
     done
     dog_unlock
     printf 'version=%s\nexported_at=%s\nhost=%s\nmonitors=%s\n' "$SCRIPT_VERSION" "$(date -u +%FT%TZ)" \
-        "$(hostname)" "$(jq -r '[.monitors | keys[]] | join(" ")' "$CONFIG_FILE" 2>/dev/null)" > "$pkg/package_info.txt"
+        "$(hostname)" "$(jq -r '[.monitors | keys[]] | join(" ")' "$CONFIG_FILE" 2>/dev/null)" > "$pkg/package_info.txt" ||
+        { rm -rf "$tmp"; dog_error "写入包信息失败，未导出"; return 1; }
     ( umask 077; tar -czf "$archive" -C "$tmp" port-traffic-dog-config ) || { rm -rf "$tmp"; dog_error "打包失败"; return 1; }
     rm -rf "$tmp"
     chmod 600 "$archive"
@@ -5166,9 +5497,15 @@ import_config() {
 
     dog_lock || { rm -rf "$tmp"; return 75; }
     backup="$BACKUP_DIR/import-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup" && chmod 700 "$backup"
+    # 备份不完整就不能继续：下面会先拆除运行状态、删除现有文件，失败时的回滚全靠这份备份。
+    if ! mkdir -p "$backup" || ! chmod 700 "$backup"; then
+        dog_unlock; rm -rf "$tmp"; dog_error "无法创建备份目录 $backup，未导入"; return 1
+    fi
     has_monitors && stats_snapshot >/dev/null 2>&1 || true
-    for f in $CONFIG_IO_FILES; do [ -f "$CONFIG_DIR/$f" ] && cp -p "$CONFIG_DIR/$f" "$backup/"; done
+    for f in $CONFIG_IO_FILES; do
+        [ -f "$CONFIG_DIR/$f" ] || continue
+        cp -p "$CONFIG_DIR/$f" "$backup/" || { dog_unlock; rm -rf "$tmp"; dog_error "备份 $f 失败，未导入"; return 1; }
+    done
     teardown_runtime
     for f in $CONFIG_IO_FILES; do
         rm -f "$CONFIG_DIR/$f"
@@ -5217,123 +5554,200 @@ teardown_runtime() {
 
 # ── 交互菜单 ──────────────────────────────────────────────────────
 # 所有子菜单都是循环，返回即回到上一级（1.5.x 的菜单互相递归调用，层数越用越深）。
-
-menu_text_width() {
-    local text="$1" index character code width=0 LC_CTYPE=C.UTF-8
-    for ((index=0; index<${#text}; index++)); do
-        character="${text:index:1}"
-        printf -v code '%d' "'$character"
-        if (( code >= 0x300 && code <= 0x36f )); then continue; fi
-        if (( code >= 0x1100 && (code <= 0x115f || code >= 0x2e80) )); then
-            width=$((width+2))
-        else width=$((width+1)); fi
-    done
-    printf '%s' "$width"
-}
-
-menu_columns() {
-    local columns="${COLUMNS:-80}" size
-    if [ -t 1 ]; then
-        size=$(stty size 2>/dev/null) || size=''
-        [ -z "$size" ] || columns="${size##* }"
-    fi
-    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
-    printf '%s' "$columns"
-}
-
-menu_item() {
-    local number="$1" text="$2" columns="${3:-80}" index character width=4 amount
-    local LC_CTYPE=C.UTF-8
-    printf '%b%2s.%b ' "$BLUE" "$number" "$NC"
-    for ((index=0; index<${#text}; index++)); do
-        character="${text:index:1}"
-        amount=$(menu_text_width "$character")
-        if [ "$((width+amount))" -gt "$columns" ]; then printf '\n    '; width=4; fi
-        printf '%s' "$character"
-        width=$((width+amount))
-    done
-    printf '\n'
-}
+# 标题、分隔线、选项与宽度计算见 16-ui.sh。
 
 readonly -a MAIN_MENU_LABELS=(
-    '添加监控项' '修改端口（加/减/替换/拆分/合并）'
-    '删除监控项' '配额与自动重置'
-    '带宽限制' '服务到期'
-    '计费模式与备注' '立即重置流量'
-    '通知管理' '系统自检/修复'
-    'TC 冲突处理/自动恢复' '在线 IP / 并发限制（测试中）'
-    '依赖检测/安装/卸载' '配置导出/导入'
-    '查看日志' '更新脚本'
-    '卸载'
+    '添加监控项' '修改端口（加/减/替换/拆分/合并）' '删除监控项' '配额与自动重置' '带宽限制'
+    '服务到期' '计费模式与备注' '立即重置流量' '通知管理'
+    '系统自检/修复' 'TC 冲突处理/自动恢复' '在线 IP / 并发限制（测试中）' '依赖检测/安装/卸载'
+    '配置导出/导入' '查看日志' '更新脚本' '卸载'
 )
+# 两列即两组：左列“监控项”1–9，右列“系统维护”10–17；编号先竖排左列、再竖排右列。
+# 编号与功能的对应关系与 2.0 相同。
+readonly MAIN_MENU_SPLIT=9
 
 show_main_menu_options() {
-    local columns index left right width n="${#MAIN_MENU_LABELS[@]}" lw=0 rw=0
-    columns=$(menu_columns)
-    # 左列宽度取最长左侧标签，保证右列对齐；两列放不下时改为单列。
-    for ((index = 0; index < n; index++)); do
-        width=$(menu_text_width "${MAIN_MENU_LABELS[index]}")
-        if ((index % 2 == 0)); then ((width > lw)) && lw=$width; else ((width > rw)) && rw=$width; fi
+    local columns n=${#MAIN_MENU_LABELS[@]} split=$MAIN_MENU_SPLIT rows i lw=0 rw=0 w cell
+    columns=$(ui_columns)
+    for ((i = 0; i < n; i++)); do
+        ui_measure w "${MAIN_MENU_LABELS[i]}"
+        if [ "$i" -lt "$split" ]; then [ "$w" -le "$lw" ] || lw=$w; else [ "$w" -le "$rw" ] || rw=$w; fi
     done
-    if [ $((4 + lw + 2 + 4 + rw)) -le "$columns" ]; then
-        for ((index = 0; index < n; index += 2)); do
-            left="${MAIN_MENU_LABELS[index]}"
-            if [ $((index + 1)) -lt "$n" ]; then
-                right="${MAIN_MENU_LABELS[index + 1]}"
-                width=$(menu_text_width "$left")
-                printf '%b%2d.%b %s%*s%b%2d.%b %s\n' "$BLUE" "$((index + 1))" "$NC" "$left" "$((lw - width + 2))" '' \
-                    "$BLUE" "$((index + 2))" "$NC" "$right"
+    cell=$((4 + lw + 4))   # 左列：编号“ 1. ”4 列 + 最长标签 + 列间距
+    if [ $((3 + cell + 4 + rw)) -le "$columns" ]; then
+        printf '   %b%s%s%b\n' "$DIM" "$(ui_pad 监控项 "$cell")" 系统维护 "$NC"
+        rows=$(( split > n - split ? split : n - split ))
+        for ((i = 0; i < rows; i++)); do
+            printf '   '
+            if [ "$i" -lt "$split" ]; then
+                printf '%b%2d.%b ' "$CYAN" $((i + 1)) "$NC"
+                if [ $((split + i)) -lt "$n" ]; then
+                    printf '%s' "$(ui_pad "${MAIN_MENU_LABELS[i]}" $((lw + 4)))"
+                else
+                    printf '%s' "${MAIN_MENU_LABELS[i]}"
+                fi
             else
-                menu_item "$((index + 1))" "$left" "$columns"
+                printf '%*s' "$cell" ''
             fi
+            [ $((split + i)) -ge "$n" ] || printf '%b%2d.%b %s' "$CYAN" $((split + i + 1)) "$NC" "${MAIN_MENU_LABELS[split + i]}"
+            printf '\n'
         done
     else
-        for ((index = 0; index < n; index++)); do menu_item "$((index + 1))" "${MAIN_MENU_LABELS[index]}" "$columns"; done
+        printf '   %b监控项%b\n' "$DIM" "$NC"
+        for ((i = 0; i < split; i++)); do ui_option $((i + 1)) "${MAIN_MENU_LABELS[i]}"; done
+        printf '   %b系统维护%b\n' "$DIM" "$NC"
+        for ((i = split; i < n; i++)); do ui_option $((i + 1)) "${MAIN_MENU_LABELS[i]}"; done
     fi
-    menu_item 0 退出 "$columns"
+    ui_rule
+    ui_option 0 退出
 }
 
-# 监控项汇总表（只读一次 nft）。
+billing_mode_label() {
+    if [ "$1" = single ]; then echo "单向计费"; else echo "双向计费"; fi
+}
+
+# 配额列：$1=配额（空为不限额） $2=百分比 $3=wide|compact $4=宽屏时百分比的数字位数（默认 3）。
+# 输出“纯文本<US>带颜色文本”，纯文本用于计算宽度。
+_table_quota_cell() {
+    local limit="$1" pct="$2" mode="$3" color="" filled i bar="" cbar="" ptxt
+    if [ -z "$limit" ]; then printf '%s\037%s' 不限额 不限额; return 0; fi
+    if [ "$pct" -ge 100 ]; then color="$RED"; elif [ "$pct" -ge 90 ]; then color="$YELLOW"; fi
+    if [ "$mode" = compact ]; then
+        printf '%s\037%s' "$limit $pct%" "$limit ${color}${pct}%${color:+$NC}"
+        return 0
+    fi
+    filled=$(( (pct * 10 + 50) / 100 )); [ "$filled" -le 10 ] || filled=10
+    for ((i = 0; i < 10; i++)); do if [ "$i" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi; done
+    cbar="${color:-$GREEN}${bar:0:filled}${NC}${DIM}${bar:filled}${NC}"
+    printf -v ptxt '%*d%%' "${4:-3}" "$pct"
+    printf '%s\037%s' "$limit $bar $ptxt" "$limit $cbar ${color}${ptxt}${color:+$NC}"
+}
+
+# 监控项表格（只读一次 nft）。$1 为 nft_read_values 的结果，省略时现读。
+# 按终端宽度选布局：放得下时配额带用量条；稍窄时配额只显示百分比并截断备注；再窄时每项占两行。
 show_monitor_table() {
-    local values id idx=0 in_b out_b mult billed limit pct usage ports n
-    if ! has_monitors; then
-        echo "  （暂无监控项）"
-        return 1
-    fi
-    values=$(nft_read_values 2>/dev/null || echo '{}')
-    printf '  %-3s %-5s %-34s %-12s %s\n' '#' 'ID' '端口 / 备注' '周期流量' '配额 / 状态'
-    while IFS= read -r id; do
+    local values="${1:-}" columns today id label mult limit expiry rate notify in_b out_b billed lbytes pct
+    local n=0 i w plain colored q layout wl want fixed indent cell cell_plain cell_color wq line
+    local -a r_id=() r_label=() r_used=() r_limit=() r_pct=() r_tags=() r_ctags=() t_plain=() t_color=()
+    local -A cin=() cout=()
+    if ! has_monitors; then echo "  （暂无监控项）"; return 1; fi
+    [ -n "$values" ] || values=$(nft_read_values 2>/dev/null || echo '{}')
+    while read -r id in_b out_b; do
         [ -n "$id" ] || continue
-        idx=$((idx + 1))
-        read -r in_b out_b < <(jq -r --arg id "$id" '.[$id] // {} | "\(.in // 0) \(.out // 0)"' <<< "$values")
-        mult=$(monitor_billing_multiplier "$id")
-        billed=$(( (in_b + out_b) * mult ))
-        ports=$(monitor_label "$id")
-        n=$(monitor_ports "$id" | wc -l)
-        [ "$n" -gt 1 ] && ports="$ports [${n}项]"
-        usage="不限额"
-        limit=$(mget "$id" .quota.monthly_limit unlimited)
-        if [ "$(mget "$id" .quota.enabled false)" = "true" ] && [ "$limit" != "unlimited" ]; then
-            pct=$(( billed * 100 / $(parse_size_to_bytes "$limit") ))
-            usage="${limit} ${pct}%"
+        cin[$id]=$in_b; cout[$id]=$out_b
+    done < <(jq -r 'to_entries[] | "\(.key) \(.value.in // 0) \(.value.out // 0)"' <<< "$values" 2>/dev/null)
+    today=$(get_current_date)
+    # 字段用 0x1f 分隔：制表符属于 IFS 空白，连续的空字段会被 read 合并而错位。
+    while IFS=$'\037' read -r id label mult limit expiry rate notify; do
+        [ -n "$id" ] || continue
+        billed=$(( (${cin[$id]:-0} + ${cout[$id]:-0}) * mult ))
+        pct=""
+        if [ "$limit" != unlimited ] && lbytes=$(parse_size_to_bytes "$limit") && [ "$lbytes" -gt 0 ]; then
+            pct=$(( billed * 100 / lbytes ))
+        else
+            limit=""
         fi
-        monitor_is_expired "$id" && usage+=" 已到期"
-        monitor_tc_rate "$id" >/dev/null && usage+=" 限速$(monitor_tc_rate "$id")"
-        jq -e --arg id "$id" 'has($id)' <<< "$values" >/dev/null || usage+=" ⚠计数缺失"
-        printf '  %-3s %-5s %-34s %-12s %s\n' "$idx" "$id" "$ports" "$(format_bytes "$billed")" "$usage"
-    done < <(monitor_ids)
+        t_plain=(); t_color=()
+        if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then t_plain+=("超额"); t_color+=("${RED}超额${NC}"); fi
+        if [ -n "$expiry" ] && date_le "$expiry" "$today"; then t_plain+=("已到期"); t_color+=("${RED}已到期${NC}"); fi
+        if [ "$rate" != unlimited ]; then t_plain+=("限速 $(format_tc_rate "$rate")"); t_color+=("限速 $(format_tc_rate "$rate")"); fi
+        if [ "$notify" = false ]; then t_plain+=("不推送"); t_color+=("${DIM}不推送${NC}"); fi
+        if [ -z "${cin[$id]+x}" ]; then t_plain+=("计数缺失"); t_color+=("${YELLOW}计数缺失${NC}"); fi
+        plain=""; colored=""
+        for ((i = 0; i < ${#t_plain[@]}; i++)); do
+            [ "$i" -eq 0 ] || { plain+=" · "; colored+=" · "; }
+            plain+="${t_plain[i]}"; colored+="${t_color[i]}"
+        done
+        r_id+=("$id"); r_label+=("$label"); r_used+=("$(format_bytes "$billed")")
+        r_limit+=("$limit"); r_pct+=("$pct"); r_tags+=("$plain"); r_ctags+=("$colored")
+        n=$((n + 1))
+    done < <(jq -r "$MONITOR_LABEL_JQ"'
+        .monitors | to_entries | sort_by(.key | ltrimstr("m") | tonumber)[] | .key as $id | .value as $m |
+        [$id, ($m | monitor_label | gsub("[[:cntrl:]]"; " ")),
+         (if ($m.billing_mode // "double") == "single" then 1 else 2 end),
+         (if ($m.quota.enabled // false) then ($m.quota.monthly_limit // "unlimited") else "unlimited" end),
+         ($m.expiry_date // ""),
+         (if ($m.bandwidth_limit.enabled // false) then ($m.bandwidth_limit.rate // "unlimited") else "unlimited" end),
+         ($m.notify != false)] | map(tostring) | join("\u001f")' "$CONFIG_FILE")
+
+    # 列宽：取表头与内容的较大者（表头：# ID 端口/备注 周期流量 配额 状态）。
+    local w_idx=${#n} w_id=2 w_lab=11 w_use=8 w_lim=0 w_pd=3 w_qw=6 w_qc=6 w_st=4
+    for ((i = 0; i < n; i++)); do
+        [ "${#r_id[i]}" -le "$w_id" ] || w_id=${#r_id[i]}
+        ui_measure w "${r_label[i]}"; [ "$w" -le "$w_lab" ] || w_lab=$w
+        [ "${#r_used[i]}" -le "$w_use" ] || w_use=${#r_used[i]}
+        [ "${#r_limit[i]}" -le "$w_lim" ] || w_lim=${#r_limit[i]}
+        ui_measure w "${r_tags[i]}"; [ "$w" -le "$w_st" ] || w_st=$w
+        if [ -n "${r_pct[i]}" ]; then
+            q="${r_limit[i]} ${r_pct[i]}%"; [ "${#q}" -le "$w_qc" ] || w_qc=${#q}
+            [ "${#r_pct[i]}" -le "$w_pd" ] || w_pd=${#r_pct[i]}
+        fi
+    done
+    # 宽屏配额列“240GB █░░░░░░░░░   7%”：配额 + 空格 + 10 格用量条 + 空格 + 百分比（至少 3 位，超额到 1000% 以上时按最长的算）。
+    [ "$w_lim" -eq 0 ] || [ $((w_lim + 13 + w_pd)) -le "$w_qw" ] || w_qw=$((w_lim + 13 + w_pd))
+    want=$w_lab; [ "$want" -le 40 ] || want=40
+    columns=$(ui_columns)
+    fixed=$(( 2 + w_idx + 2 + w_id + 2 + 2 + w_use + 2 + w_qw + 2 + w_st ))
+    if [ $((fixed + want)) -le "$columns" ]; then
+        layout=wide; wl=$want; wq=$w_qw
+    else
+        fixed=$(( 2 + w_idx + 2 + w_id + 2 + 2 + w_use + 2 + w_qc + 2 + w_st ))
+        wl=$((columns - fixed)); [ "$wl" -le "$want" ] || wl=$want
+        if [ "$wl" -ge 11 ]; then layout=compact; wq=$w_qc; else layout=card; fi
+    fi
+
+    if [ "$layout" = card ]; then
+        indent=$(( 2 + w_idx + 2 + w_id + 2 ))
+        w=$((columns - indent)); [ "$w" -ge 4 ] || w=4
+        for ((i = 0; i < n; i++)); do
+            printf '  %s  %s  %s\n' "$(ui_pad $((i + 1)) "$w_idx")" "$(ui_pad "${r_id[i]}" "$w_id")" "$(ui_truncate "${r_label[i]}" "$w")"
+            cell=$(_table_quota_cell "${r_limit[i]}" "${r_pct[i]}" compact)
+            cell_plain="${cell%%$'\037'*}"; cell_color="${cell#*$'\037'}"
+            line="${r_used[i]} · $cell_plain"
+            if [ -z "${r_tags[i]}" ]; then
+                printf '%*s%b\n' "$indent" '' "${r_used[i]} · $cell_color"
+            elif ui_measure q "$line · ${r_tags[i]}" && [ "$q" -le "$w" ]; then
+                printf '%*s%b\n' "$indent" '' "${r_used[i]} · $cell_color · ${r_ctags[i]}"
+            else
+                printf '%*s%b\n%*s%b\n' "$indent" '' "${r_used[i]} · $cell_color" "$indent" '' "${r_ctags[i]}"
+            fi
+        done
+        return 0
+    fi
+
+    printf '  %b%s  %s  %s  %s  %s  %s%b\n' "$DIM" "$(ui_pad '#' "$w_idx")" "$(ui_pad ID "$w_id")" \
+        "$(ui_pad '端口 / 备注' "$wl")" "$(ui_pad 周期流量 "$w_use")" "$(ui_pad 配额 "$wq")" 状态 "$NC"
+    for ((i = 0; i < n; i++)); do
+        if [ -z "${r_limit[i]}" ]; then
+            cell=$(_table_quota_cell "" "" "$layout")
+        elif [ "$layout" = wide ]; then
+            cell=$(_table_quota_cell "$(ui_pad "${r_limit[i]}" "$w_lim")" "${r_pct[i]}" wide "$w_pd")   # 补齐配额与百分比，用量条和状态列对齐
+        else
+            cell=$(_table_quota_cell "${r_limit[i]}" "${r_pct[i]}" compact)
+        fi
+        cell_plain="${cell%%$'\037'*}"; cell_color="${cell#*$'\037'}"
+        printf '  %s  %s  %s  %s  ' "$(ui_pad $((i + 1)) "$w_idx")" "$(ui_pad "${r_id[i]}" "$w_id")" \
+            "$(ui_pad "$(ui_truncate "${r_label[i]}" "$wl")" "$wl")" "$(ui_pad "${r_used[i]}" "$w_use")"
+        if [ -z "${r_tags[i]}" ]; then
+            printf '%b\n' "$cell_color"
+        else
+            ui_measure w "$cell_plain"
+            [ "$w" -le "$wq" ] || w=$wq
+            printf '%b%*s  %b\n' "$cell_color" $((wq - w)) '' "${r_ctags[i]}"
+        fi
+    done
 }
 
-# 交互选择监控项：接受序号、ID（m3）或成员端口（8031）。输出 ID。
+# 交互选择监控项：接受序号、ID（m3）或成员端口（8031）。输出 ID；表格与提示写到 stderr。
 select_monitor() {
     local prompt="${1:-请选择监控项}" input ids id
     mapfile -t ids < <(monitor_ids)
-    [ "${#ids[@]}" -gt 0 ] || { echo -e "${YELLOW}暂无监控项${NC}" >&2; return 1; }
+    [ "${#ids[@]}" -gt 0 ] || { echo -e "  ${YELLOW}暂无监控项，请先添加${NC}" >&2; return 1; }
     show_monitor_table >&2 || true
-    read -r -p "$prompt（序号 / ID / 端口，回车取消）: " input
+    read -r -p " $prompt（序号 / ID / 端口，回车取消）: " input || return 1
     [ -n "$input" ] || return 1
     if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "${#ids[@]}" ] && [ "$input" -le 999 ]; then
-        echo "${ids[$((input - 1))]}"
+        echo "${ids[$((10#$input - 1))]}"   # 10#：08、010 按十进制解析，不当八进制
         return 0
     fi
     if id=$(resolve_monitor "$input"); then echo "$id"; return 0; fi
@@ -5341,66 +5755,74 @@ select_monitor() {
     return 1
 }
 
+# 已选监控项的抬头。
+_menu_monitor_header() {
+    echo
+    ui_kv "监控项" "$1 $(monitor_label "$1")"
+}
+
 menu_add_monitor() {
-    local input units unit remark id
-    echo -e "${BLUE}=== 添加监控项 ===${NC}"
+    local input units unit remark id="" added=0
+    ui_title "添加监控项"
     show_listening_ports
     echo
-    echo -e "格式：${GREEN},${NC} 组合多个端口为一个监控项（共享统计/配额/限速），${GREEN};${NC} 分隔多个独立监控项，${GREEN}-${NC} 表示端口段"
-    echo -e "例：${GREEN}80,443${NC} 一个监控项；${GREEN}80,443;8080-8090${NC} 两个监控项"
-    read -r -p "端口: " input
+    ui_note "逗号把多个端口组合成一个监控项（共享统计/配额/限速）；分号分隔多个监控项；- 表示端口段"
+    ui_note "例：80,443 为一个监控项；80,443;8080-8090 为两个监控项"
+    read -r -p " 端口（回车取消）: " input || return 0
     [ -n "$input" ] || return 0
-    parse_monitor_units "$input" units || { pause; return 1; }
-    read -r -p "备注（可留空）: " remark
+    parse_monitor_units "$input" units || return 1
+    read -r -p " 备注（可留空）: " remark || return 0
     for unit in "${units[@]}"; do
         if id=$(monitor_add "$unit" "$remark"); then
             echo -e "${GREEN}已添加 $id：$unit${NC}"
+            added=$((added + 1))
         else
             echo -e "${RED}添加 $unit 失败${NC}"
         fi
     done
     cron_sync || true
-    if [ "${#units[@]}" -eq 1 ] && [ -n "${id:-}" ] && confirm "现在设置配额与自动重置"; then
+    if [ "${#units[@]}" -eq 1 ] && [ "$added" -eq 1 ] && confirm " 现在设置配额与自动重置"; then
         menu_quota_for "$id"
     fi
 }
 
 menu_edit_ports() {
     local id choice input target remark copy
+    ui_title "修改端口"
     id=$(select_monitor "要修改的监控项") || return 0
     while monitor_exists "$id"; do
+        _menu_monitor_header "$id"
+        ui_kv "当前成员" "$(monitor_ports_csv "$id")"
         echo
-        echo -e "${BLUE}=== 修改端口：$id $(monitor_label "$id") ===${NC}"
-        echo "当前成员：$(monitor_ports_csv "$id")"
-        echo "1. 添加端口/端口段（流量继续累计）"
-        echo "2. 删除端口（已统计流量保留在本项）"
-        echo "3. 整组替换端口"
-        echo "4. 拆出部分端口为新监控项（新项从 0 开始计）"
-        echo "5. 把本项合并到另一个监控项（流量相加）"
-        echo "0. 返回"
-        read -r -p "请选择: " choice
+        ui_option 1 "添加端口/端口段（流量继续累计）"
+        ui_option 2 "删除端口（已统计流量保留在本项）"
+        ui_option 3 "整组替换端口"
+        ui_option 4 "拆出部分端口为新监控项（新项从 0 开始计）"
+        ui_option 5 "把本项合并到另一个监控项（流量相加）"
+        ui_option 0 "返回"
+        ui_prompt 5 choice || return 0
         case "$choice" in
-            1) read -r -p "要添加的端口（逗号分隔）: " input
+            1) read -r -p " 要添加的端口（逗号分隔）: " input || return 0
                [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "$input" "" "" &&
                    echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
-            2) read -r -p "要删除的成员（逗号分隔，端口段按原样写）: " input
+            2) read -r -p " 要删除的成员（逗号分隔，端口段按原样写）: " input || return 0
                [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "" "$input" "" &&
                    echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
-            3) read -r -p "新的完整端口列表: " input
+            3) read -r -p " 新的完整端口列表: " input || return 0
                [ -n "$input" ] && input=$(parse_port_list "$input" | paste -sd,) && monitor_edit_ports "$id" "" "" "$input" &&
                    echo -e "${GREEN}已更新：$(monitor_ports_csv "$id")${NC}" ;;
-            4) read -r -p "要拆出的成员（逗号分隔）: " input
+            4) read -r -p " 要拆出的成员（逗号分隔）: " input || return 0
                [ -n "$input" ] || continue
                input=$(parse_port_list "$input" | paste -sd,) || continue
-               read -r -p "新监控项备注（可留空）: " remark
-               copy=""; confirm "新项是否复制本项的配额、重置策略和到期日" && copy=copy
+               read -r -p " 新监控项备注（可留空）: " remark || return 0
+               copy=""; confirm " 新项是否复制本项的配额、重置策略和到期日" && copy=copy
                if target=$(monitor_split "$id" "$input" "$remark" "$copy"); then
                    echo -e "${GREEN}已拆出新监控项 $target${NC}"
                fi ;;
             5) target=$(select_monitor "合并到哪个监控项") || continue
                [ "$target" != "$id" ] || { echo -e "${RED}不能合并到自身${NC}"; continue; }
                echo "将把 $id 的端口与流量并入 $target，$id 的配额/限速/到期设置作废，以 $target 为准。"
-               confirm "确认合并" || continue
+               confirm " 确认合并" || continue
                if monitor_merge "$id" "$target"; then
                    echo -e "${GREEN}已合并到 $target${NC}"
                    return 0
@@ -5412,40 +5834,54 @@ menu_edit_ports() {
 
 menu_remove_monitor() {
     local id
+    ui_title "删除监控项"
     id=$(select_monitor "要删除的监控项") || return 0
-    confirm "确认删除 $id（$(monitor_label "$id")）及其统计、配额、限速与到期设置" || return 0
+    confirm " 确认删除 $id（$(monitor_label "$id")）及其统计、配额、限速与到期设置" || return 0
     monitor_remove "$id" && echo -e "${GREEN}已删除 $id${NC}"
     cron_sync || true
 }
 
 menu_quota_for() {
-    local id="$1" limit policy
-    echo "当前配额：$(mget "$id" .quota.monthly_limit unlimited)（$(mget "$id" .billing_mode double) 计费）"
-    read -r -p "流量配额（如 500GB、1.5TB；0 取消；回车不变）: " limit
+    local id="$1" limit policy quota
+    quota=$(mget "$id" .quota.monthly_limit unlimited)
+    [ "$(mget "$id" .quota.enabled false)" = "true" ] || quota=unlimited
+    [ "$quota" != unlimited ] || quota="不限额"
+    _menu_monitor_header "$id"
+    ui_kv "当前配额" "$quota（$(billing_mode_label "$(mget "$id" .billing_mode double)")）"
+    ui_kv "自动重置" "$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)"
+    echo
+    read -r -p " 流量配额（如 500GB、1.5TB；0 取消配额；回车不变）: " limit || return 0
     if [ -n "$limit" ]; then
         monitor_set_quota "$id" "$limit" && echo -e "${GREEN}配额已更新${NC}"
     fi
-    if confirm "设置自动重置策略（当前：$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)）"; then
+    if confirm " 修改自动重置策略"; then
         policy=$(prompt_reset_policy "$(mget "$id" .reset_policy.day 1)") || return 0
-        monitor_set_reset_policy "$id" "$policy" && echo -e "${GREEN}重置策略已更新：$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)${NC}"
+        monitor_set_reset_policy "$id" "$policy" &&
+            echo -e "${GREEN}重置策略已更新：$(monitor_reset_label "$id" 2>/dev/null || echo 不自动重置)${NC}"
     fi
 }
 
 menu_quota_reset() {
     local id
-    id=$(select_monitor "设置配额/重置的监控项") || return 0
+    ui_title "配额与自动重置"
+    id=$(select_monitor "要设置的监控项") || return 0
     menu_quota_for "$id"
 }
 
 menu_bandwidth() {
-    local id input rate
-    id=$(select_monitor "设置带宽限制的监控项") || return 0
-    echo "当前：$(monitor_tc_rate "$id" 2>/dev/null || echo 不限速)（上下行分别限制，同项端口共享）"
-    read -r -p "带宽（如 100Mbps、1Gbps；0 取消）: " input
+    local id input rate current
+    ui_title "带宽限制"
+    id=$(select_monitor "要设置的监控项") || return 0
+    if current=$(monitor_tc_rate "$id"); then current=$(format_tc_rate "$current"); else current="不限速"; fi
+    _menu_monitor_header "$id"
+    ui_kv "当前限速" "$current"
+    ui_note "上下行分别限制，同一监控项的端口共享带宽"
+    echo
+    read -r -p " 带宽（如 100Mbps、1Gbps；0 取消限速；回车不变）: " input || return 0
     [ -n "$input" ] || return 0
-    validate_bandwidth "$input" || { echo -e "${RED}格式无效${NC}"; return 1; }
+    validate_bandwidth "$input" || { echo -e "${RED}格式无效，示例：100Mbps、1Gbps${NC}"; return 1; }
     if [ "$input" = "0" ]; then rate=0; else rate=$(convert_bandwidth_to_tc "$input"); fi
-    if [ "$rate" != "0" ] && [ "$(tc_auto_recovery_state 2>/dev/null || echo disabled)" != "enabled" ]; then
+    if [ "$rate" != "0" ] && [ "$(tc_auto_recovery_state 2>/dev/null || echo 未启用)" != "已启用" ]; then
         show_tc_auto_recovery_notice 2>/dev/null || true
     fi
     tc_set_monitor_limit "$id" "$rate" && echo -e "${GREEN}带宽限制已更新${NC}"
@@ -5453,97 +5889,136 @@ menu_bandwidth() {
 
 menu_expiry() {
     local id input
-    id=$(select_monitor "设置服务到期的监控项") || return 0
-    echo "当前：$(monitor_expiry_label "$id" 2>/dev/null || echo 未设置)"
-    read -r -p "到期日 YYYY-MM-DD（输入 0 取消到期）: " input
+    ui_title "服务到期"
+    id=$(select_monitor "要设置的监控项") || return 0
+    _menu_monitor_header "$id"
+    ui_kv "当前到期" "$(monitor_expiry_label "$id" 2>/dev/null || echo 未设置)"
+    echo
+    read -r -p " 到期日 YYYY-MM-DD（0 取消到期；回车不变）: " input || return 0
     [ -n "$input" ] || return 0
     [ "$input" = "0" ] && input=""
     monitor_set_expiry "$id" "$input" && echo -e "${GREEN}到期设置已更新${NC}"
 }
 
 menu_billing_remark() {
-    local id choice input
+    local id choice input remark
+    ui_title "计费模式与备注"
     id=$(select_monitor "要修改的监控项") || return 0
-    echo "1. 计费模式（当前：$(mget "$id" .billing_mode double)）"
-    echo "2. 备注（当前：$(mget "$id" .remark "")）"
-    read -r -p "请选择: " choice
+    remark=$(mget "$id" .remark "")
+    _menu_monitor_header "$id"
+    echo
+    ui_option 1 "计费模式（当前：$(billing_mode_label "$(mget "$id" .billing_mode double)")）"
+    ui_option 2 "备注（当前：${remark:-无}）"
+    ui_option 0 "返回"
+    ui_prompt 2 choice || return 0
     case "$choice" in
-        1) echo "double：入站+出站，各按 2 倍计（与上游一致）；single：入站+出站按 1 倍计"
-           read -r -p "模式 [double/single]: " input
-           [ -n "$input" ] && monitor_set_billing "$id" "$input" && echo -e "${GREEN}已切换${NC}" ;;
-        2) read -r -p "新备注（最长 64 字符，留空清除）: " input
-           monitor_set_remark "$id" "$input" && echo -e "${GREEN}已更新${NC}" ;;
+        1) ui_note "double 双向：入站+出站，各按 2 倍计（与上游一致）；single 单向：入站+出站按 1 倍计"
+           read -r -p " 模式 [double/single]: " input || return 0
+           [ -n "$input" ] && monitor_set_billing "$id" "$input" && echo -e "${GREEN}已切换为$(billing_mode_label "$input")${NC}" ;;
+        2) read -r -p " 新备注（最长 64 字符，留空清除）: " input || return 0
+           monitor_set_remark "$id" "$input" && echo -e "${GREEN}备注已更新${NC}" ;;
     esac
 }
 
 menu_reset_now() {
     local id
-    id=$(select_monitor "要立即清零流量的监控项") || return 0
-    confirm "确认清零 $id 的本周期流量与已用配额（自动重置日程不变）" || return 0
+    ui_title "立即重置流量"
+    id=$(select_monitor "要清零的监控项") || return 0
+    confirm " 确认清零 $id 的本周期流量与已用配额（自动重置日程不变）" || return 0
     reset_monitor "$id" manual && echo -e "${GREEN}已清零${NC}"
 }
 
 menu_config_io() {
     local choice file
-    echo "1. 导出配置与统计"
-    echo "2. 导入配置包"
-    read -r -p "请选择: " choice
+    ui_title "配置导出/导入"
+    ui_option 1 "导出配置与统计"
+    ui_option 2 "导入配置包"
+    ui_option 0 "返回"
+    ui_prompt 2 choice || return 0
     case "$choice" in
         1) export_config ;;
-        2) read -r -p "配置包路径: " file; [ -n "$file" ] && import_config "$file" ;;
+        2) read -r -p " 配置包路径: " file || return 0
+           [ -n "$file" ] && import_config "$file" ;;
     esac
 }
 
 show_dashboard() {
-    local total=0 values id machine
-    echo -e "${BLUE}=== ${SCRIPT_NAME} v${SCRIPT_VERSION} ===${NC}"
+    local values='{}' total=0 count=0 machine state w
+    printf '\n %b%s v%s%b %b·%b %s\n' "$BOLD_CYAN" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$NC" "$DIM" "$NC" "$(hostname)"
+    ui_rule
     if has_monitors; then
         values=$(nft_read_values 2>/dev/null || echo '{}')
-        while IFS= read -r id; do
-            [ -n "$id" ] || continue
-            total=$(( total + $(jq -r --arg id "$id" '.[$id] // {} | ((.in // 0) + (.out // 0))' <<< "$values") * $(monitor_billing_multiplier "$id") ))
-        done < <(monitor_ids)
-        echo -e "${GREEN}状态: 监控中${NC} | 监控项 $(monitor_ids | grep -c .) 个 | 周期总流量 $(format_bytes "$total")"
+        count=$(monitor_ids | grep -c . || true)
+        total=$(jq -rn --slurpfile c "$CONFIG_FILE" --argjson v "$values" '
+            $c[0].monitors | to_entries | map(((($v[.key].in // 0) + ($v[.key].out // 0)) *
+                (if (.value.billing_mode // "double") == "single" then 1 else 2 end))) | add // 0' 2>/dev/null || echo 0)
+        if nft_table_exists; then state="${GREEN}● 监控中${NC}"; else state="${RED}● 规则缺失${NC}"; fi
+        total=$(format_bytes "$total")
+        ui_measure w "● 监控中   $count 个监控项   周期总流量 $total"
+        if [ $((w + 2)) -le "$(ui_columns)" ]; then
+            printf '  %b   %s 个监控项   周期总流量 %s\n' "$state" "$count" "$total"
+        else
+            printf '  %b   %s 个监控项\n  周期总流量 %s\n' "$state" "$count" "$total"
+        fi
     else
-        echo -e "${YELLOW}状态: 未添加监控项${NC}"
+        printf '  %b○ 未添加监控项%b   输入 1 添加\n' "$YELLOW" "$NC"
     fi
     machine=$(machine_traffic_summary 2>/dev/null || true)
-    [ -n "$machine" ] && echo "$machine"
-    show_monitor_table >/dev/null 2>&1 && show_monitor_table
-    if ! nft_runtime_drift >/dev/null 2>&1 && has_monitors; then
-        echo -e "${YELLOW}⚠ nftables 规则与配置不一致，建议执行 10. 系统自检/修复${NC}"
+    [ -z "$machine" ] || printf '  %b本机网卡本月%b  %s\n' "$DIM" "$NC" "$machine"
+    has_monitors || return 0
+    echo
+    show_monitor_table "$values" || true
+    if ! nft_runtime_drift >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ nftables 规则与配置不一致，建议执行 10. 系统自检/修复${NC}"
     fi
-    if has_monitors && ! cron_in_sync 2>/dev/null; then
-        echo -e "${YELLOW}⚠ 定时任务与配置不一致，建议执行 10. 系统自检/修复${NC}"
+    if ! cron_in_sync 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ 定时任务与配置不一致，建议执行 10. 系统自检/修复${NC}"
     fi
 }
 
+# 菜单动作在子 shell 中运行并重新打开 errexit：动作中途出错只结束这一个动作、回到菜单
+# （2.0.0 中带宽格式错误、导入文件不存在等会让 set -e 直接结束整个菜单）。
+# 必须作为普通命令调用：写成 `menu_run x || true` 或放进 if 条件时，bash 会连同其中的子 shell
+# 一起忽略 set -e，动作出错后仍继续往下执行。动作对变量的修改不会带回菜单（菜单每轮重新读配置）。
+menu_run() {
+    local errexit=false
+    case $- in *e*) errexit=true ;; esac
+    set +e
+    ( set -e; "$@" )
+    [ "$errexit" = false ] || set -e
+    return 0
+}
+
 show_main_menu() {
-    local choice
+    local choice rc
     while true; do
         menu_clear
         show_dashboard
-        echo
+        ui_rule
         show_main_menu_options
-        read -r -p "请选择操作: " choice || exit 0
+        ui_prompt 17 choice || exit 0
         case "$choice" in
-            1) menu_add_monitor ;;
-            2) menu_edit_ports ;;
-            3) menu_remove_monitor ;;
-            4) menu_quota_reset ;;
-            5) menu_bandwidth ;;
-            6) menu_expiry ;;
-            7) menu_billing_remark ;;
-            8) menu_reset_now ;;
-            9) manage_notifications; continue ;;
-            10) system_check_and_repair ;;
-            11) manage_tc_recovery ;;
-            12) manage_ip_guard; continue ;;
-            13) dependency_menu ;;
-            14) menu_config_io ;;
-            15) show_operation_logs ;;
-            16) update_dog ;;
-            17) uninstall_dog && exit 0 ;;
+            1) menu_run menu_add_monitor ;;
+            2) menu_run menu_edit_ports; continue ;;
+            3) menu_run menu_remove_monitor ;;
+            4) menu_run menu_quota_reset ;;
+            5) menu_run menu_bandwidth ;;
+            6) menu_run menu_expiry ;;
+            7) menu_run menu_billing_remark ;;
+            8) menu_run menu_reset_now ;;
+            9) menu_run manage_notifications; continue ;;
+            10) menu_run system_check_and_repair ;;
+            11) menu_run manage_tc_recovery ;;
+            12) menu_run manage_ip_guard; continue ;;
+            13) menu_run dependency_menu; continue ;;
+            14) menu_run menu_config_io ;;
+            15) menu_run show_operation_logs ;;
+            16) menu_run update_dog ;;
+            17) # 卸载在当前 shell 运行：一旦开始（不论是否全部成功）程序文件已删除，直接退出菜单；
+                # 取消卸载则回到菜单（2.0.0 取消后也会退出菜单）。
+                DOG_UNINSTALL_STARTED=false; rc=0
+                uninstall_dog || rc=$?
+                [ "$DOG_UNINSTALL_STARTED" = false ] || exit "$rc" ;;
             0) exit 0 ;;
             *) continue ;;
         esac
@@ -5569,7 +6044,7 @@ nft_version_ok() {
 self_check() {
     local exe cmd rt drift id age saved c
     SC_ERRORS=0; SC_WARNINGS=0
-    echo -e "${BLUE}=== Dog 自检（v${SCRIPT_VERSION}） ===${NC}"
+    ui_title "Dog 自检" "v${SCRIPT_VERSION}"
 
     echo "[运行环境]"
     for cmd in nft jq tc ip crontab curl flock awk ss sha256sum; do
@@ -5660,6 +6135,13 @@ self_check() {
             [ -n "$(cfg '.notifications.wecom.webhook_url // ""')" ] && sc_ok "企业微信已配置" || sc_err "企业微信已开启但未设置 Webhook"
         fi
     done
+    if has_monitors && { channel_status_enabled telegram || channel_status_enabled wecom; }; then
+        if ! has_notify_monitors; then
+            sc_warn "所有监控项均已关闭推送，定时报告不会发送（通知管理 → 选择推送的监控项）"
+        elif [ "$(notify_monitor_ids | grep -c .)" -lt "$(monitor_ids | grep -c .)" ]; then
+            sc_ok "推送范围：$(notify_scope_summary)"
+        fi
+    fi
 
     echo
     if [ "$SC_ERRORS" -eq 0 ]; then
@@ -5672,7 +6154,7 @@ self_check() {
 
 # 修复：补依赖、迁移、重建规则与限速、刷新定时任务，然后自检。
 system_check_and_repair() {
-    echo -e "${BLUE}=== 系统修复 ===${NC}"
+    ui_title "系统修复"
     # 只检测一次；缺失时交给 dependency_install_missing（--yes 时自动装，否则询问）。
     # check_dependencies 自带无确认安装，不能与之串用（会绕过确认并重复执行 apt）。
     dependency_report core >/dev/null 2>&1 || dependency_install_missing "$DOG_NONINTERACTIVE" core || true
@@ -5700,12 +6182,12 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 用法：dog                         打开交互菜单
       dog list [--json]           列出监控项
-      dog status                  打印状态报告（与推送内容相同）
+      dog status                  打印状态报告（与推送内容相同：只含开启推送的监控项）
       dog add <端口> [--remark R]  添加监控项；"80,443" 为一项，"80;443" 为两项，"8000-8010" 为端口段
       dog edit <ID|端口> [选项]    修改监控项：
           --add P,P   --del P,P   --set P,P        增加 / 删除 / 整组替换端口（流量连续）
           --remark R  --quota 500GB|0  --billing double|single
-          --limit 100Mbps|0  --expiry YYYY-MM-DD|0
+          --limit 100Mbps|0  --expiry YYYY-MM-DD|0  --notify on|off（是否出现在状态推送中）
           --reset monthly:1 | days:30[@YYYY-MM-DD] | months:3[@YYYY-MM-DD][:15] | yearly:1-1 | once:YYYY-MM-DD | none
       dog split <ID> <端口> [--remark R] [--copy]   拆出为新监控项（--copy 复制配额/重置/到期）
       dog merge <源ID> <目标ID>                     合并（流量相加，保留目标设置）
@@ -5750,7 +6232,7 @@ parse_reset_spec() {
 cli_list() {
     if [ "${1:-}" = "--json" ]; then
         jq -n --argjson c "$(jq '.monitors' "$CONFIG_FILE")" --argjson v "$(nft_read_values)" '
-            $c | to_entries | map(.value + {id: .key, counters: ($v[.key] // null)})'
+            $c | to_entries | map(.value + {id: .key, notify: (.value.notify != false), counters: ($v[.key] // null)})'
     else
         show_monitor_table || true
     fi
@@ -5766,7 +6248,7 @@ cli_edit() {
             --add|--del|--set) [ -n "${2:-}" ] || { show_usage; return 2; }
                 local v; v=$(parse_port_list "$2" | paste -sd,) || return 1
                 case "$1" in --add) add="$v" ;; --del) del="$v" ;; --set) set="$v" ;; esac; shift 2 ;;
-            --remark|--quota|--billing|--limit|--expiry|--reset)
+            --remark|--quota|--billing|--limit|--expiry|--reset|--notify)
                 [ "$#" -ge 2 ] || { show_usage; return 2; }
                 ops+=("$1" "$2"); shift 2 ;;
             *) dog_error "未知选项：$1"; return 2 ;;
@@ -5782,6 +6264,7 @@ cli_edit() {
             --remark) monitor_set_remark "$id" "$val" || rc=1 ;;
             --quota) monitor_set_quota "$id" "$val" || rc=1 ;;
             --billing) monitor_set_billing "$id" "$val" || rc=1 ;;
+            --notify) monitor_set_notify "$id" "$val" || rc=1 ;;
             --expiry) [ "$val" = "0" ] && val=""; monitor_set_expiry "$id" "$val" || rc=1 ;;
             --limit)
                 if [ "$val" = "0" ]; then tc_set_monitor_limit "$id" 0 || rc=1
@@ -5837,7 +6320,11 @@ main() {
             validate_config_file "$CONFIG_FILE" || { dog_error "配置无效，请修正 $CONFIG_FILE 或运行 dog --repair"; return 1; }
             show_main_menu ;;
         list) cli_list "$@" ;;
-        status) build_status_report "$(hostname)" ;;
+        status)
+            local src=0
+            build_status_report "$(hostname)" || src=$?
+            [ "$src" -ne 3 ] || src=0   # 没有开启推送的监控项：已打印说明，不算失败
+            return "$src" ;;
         add)
             [ -n "${1:-}" ] || { show_usage; return 2; }
             local input="$1" remark="" units u rc=0

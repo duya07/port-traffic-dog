@@ -124,6 +124,7 @@ monitor_edit_ports() {
 }
 
 # 拆分：把 $2（成员逗号串）移到新监控项。$3=备注，$4=copy 时复制配额/重置/到期设置。
+# 计费模式与推送开关总是继承：拆分不改变“谁能看到这些端口”，已关闭推送的端口拆出后不应突然出现在推送里。
 monitor_split() {
     local id="$1" move_csv="$2" remark="${3:-}" copy="${4:-}" old move rest new_id snap rt now missing
     dog_lock || return 75
@@ -148,7 +149,8 @@ monitor_split() {
             quota: (if $copy then ($src.quota // {enabled: false, monthly_limit: "unlimited"}) else {enabled: false, monthly_limit: "unlimited"} end),
             bandwidth_limit: {enabled: false, rate: "unlimited"},
             reset_policy: (if $copy then ($src.reset_policy // {type: "none"}) else {type: "none"} end),
-            expiry_date: (if $copy then ($src.expiry_date // "") else "" end), created_at: $now} |
+            expiry_date: (if $copy then ($src.expiry_date // "") else "" end), created_at: $now} +
+            (if $src.notify == false then {notify: false} else {} end) |
         .global.next_monitor_id = (($nid | ltrimstr("m") | tonumber) + 1)
     ' --arg id "$id" --arg nid "$new_id" --argjson rest "$rest" --argjson move "$move" \
       --arg r "$remark" --arg now "$now" --argjson copy "$([ "$copy" = copy ] && echo true || echo false)" ||
@@ -245,5 +247,28 @@ monitor_set_billing() {
     [ "$rc" -eq 0 ] && { nft_sync_monitor "$id" || rc=1; }
     dog_unlock
     dog_log_event config_update "$rc" "id=$id" "mode=$mode"
+    return "$rc"
+}
+
+# 推送开关：$2 = on | off。只影响状态报告是否包含该监控项，不改变统计、配额与定时任务。
+monitor_set_notify() {
+    local id="$1" value rc=0
+    case "$2" in on) value=true ;; off) value=false ;; *) dog_error "推送开关只能是 on 或 off"; return 1 ;; esac
+    monitor_exists "$id" || { dog_error "监控项 $id 不存在"; return 1; }
+    config_update '.monitors[$id].notify = $v' --arg id "$id" --argjson v "$value" || rc=1
+    dog_log_event monitor_notify "$rc" "id=$id" "mode=$2"
+    return "$rc"
+}
+
+# 批量设置推送开关（菜单勾选用，一次写入）：$1 = {"m1":true,"m2":false}，只传有变化的项。
+monitors_set_notify() {
+    local changes="$1" rc=0 id value
+    config_update 'reduce ($c | to_entries[]) as $e (.;
+        if .monitors[$e.key] != null then .monitors[$e.key].notify = $e.value else . end)' --argjson c "$changes" || rc=1
+    while IFS=$'\t' read -r id value; do
+        [ -n "$id" ] || continue
+        if [ "$value" = true ]; then value=on; else value=off; fi
+        dog_log_event monitor_notify "$rc" "id=$id" "mode=$value"
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<< "$changes")
     return "$rc"
 }

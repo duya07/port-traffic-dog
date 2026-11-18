@@ -1,6 +1,7 @@
 # ── 配置（schema 2） ──────────────────────────────────────────────
 # 监控项以稳定 ID（m1、m2…）为身份，端口只是成员列表：
-#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at }
+#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
+# notify 缺省视为 true（2.1 新增；2.0.0 读到会忽略，即全部推送）。
 # 所有 nft/tc/统计/历史的名字都从 ID 派生，所以加减端口不会改变身份。
 
 default_config_json() {
@@ -43,6 +44,8 @@ def monitor_errors($id):
              "监控项 \($id) 的端口无效: \(.)") end),
       (if (($m.billing_mode // "double") | IN("single", "double")) | not then "监控项 \($id) 计费模式无效" else empty end),
       (if (($m.remark // "") | type) != "string" or (($m.remark // "") | length) > 64 then "监控项 \($id) 备注无效（最长 64 字符）" else empty end),
+      (if ($m | type) == "object" and ($m | has("notify")) and (($m.notify | type) != "boolean")
+         then "监控项 \($id) 推送开关无效（只能是 true 或 false）" else empty end),
       (if ($m.quota // {}) | type != "object" then "监控项 \($id) quota 无效" else empty end),
       (if (($m.quota.enabled // false) | type) != "boolean" then "监控项 \($id) 配额开关无效" else empty end),
       (if (($m.quota.monthly_limit // "unlimited") | size_ok) | not then "监控项 \($id) 配额大小无效" else empty end),
@@ -179,14 +182,29 @@ monitor_ports_csv() {
     jq -r --arg id "$1" '(.monitors[$id].ports // []) | join(",")' "$CONFIG_FILE"
 }
 
-# 显示用标签：备注 + 端口，端口过多时截断。
+# 显示用标签：备注 + 端口，端口过多时截断。监控项表格与 monitor_label 共用这份 jq 定义。
+readonly MONITOR_LABEL_JQ='def monitor_label:
+    ((.ports // []) | join(",")) as $p |
+    (if ($p | length) > 40 then ($p[0:37] + "…") else $p end) as $ps |
+    if (.remark // "") != "" then "\(.remark)（\($ps)）" else $ps end;'
+
 monitor_label() {
-    jq -r --arg id "$1" '
-        .monitors[$id] as $m |
-        ($m.ports | join(",")) as $p |
-        (if ($p | length) > 40 then ($p[0:37] + "…") else $p end) as $ps |
-        if ($m.remark // "") != "" then "\($m.remark)（\($ps)）" else $ps end
-    ' "$CONFIG_FILE"
+    jq -r --arg id "$1" "$MONITOR_LABEL_JQ"' .monitors[$id] | monitor_label' "$CONFIG_FILE"
+}
+
+# 监控项是否参与状态推送（.notify 缺省为 true）。
+# 不能用 mget：jq 的 `//` 把 false 也当作“没有值”，`.notify // true` 永远得到 true。
+monitor_notify_enabled() {
+    jq -e --arg id "$1" '.monitors[$id].notify != false' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 参与状态推送的监控项 ID，按数字顺序。
+notify_monitor_ids() {
+    jq -r '.monitors // {} | to_entries[] | select(.value.notify != false) | .key' "$CONFIG_FILE" 2>/dev/null | sort -t m -k2 -n
+}
+
+has_notify_monitors() {
+    jq -e '[(.monitors // {})[] | select(.notify != false)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 monitor_billing_multiplier() {
