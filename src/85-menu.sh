@@ -129,7 +129,7 @@ show_monitor_table() {
             [ "${#r_pct[i]}" -le "$w_pd" ] || w_pd=${#r_pct[i]}
         fi
     done
-    # 宽屏配额列“240GB █░░░░░░░░░   7%”：配额 + 空格 + 10 格用量条 + 空格 + 百分比（至少 3 位，超额到 1000% 以上时按最长的算）。
+    # 宽屏配额列“300GB █░░░░░░░░░   7%”：配额 + 空格 + 10 格用量条 + 空格 + 百分比（至少 3 位，超额到 1000% 以上时按最长的算）。
     [ "$w_lim" -eq 0 ] || [ $((w_lim + 13 + w_pd)) -le "$w_qw" ] || w_qw=$((w_lim + 13 + w_pd))
     want=$w_lab; [ "$want" -le 40 ] || want=40
     columns=$(ui_columns)
@@ -184,7 +184,7 @@ show_monitor_table() {
     done
 }
 
-# 交互选择监控项：接受序号、ID（m3）或成员端口（8031）。输出 ID；表格与提示写到 stderr。
+# 交互选择监控项：接受序号、ID（m3）或成员端口（7031）。输出 ID；表格与提示写到 stderr。
 select_monitor() {
     local prompt="${1:-请选择监控项}" input ids id
     mapfile -t ids < <(monitor_ids)

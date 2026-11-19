@@ -102,7 +102,7 @@ ports_json_normalize() {
     jq -cRn '[inputs | select(length > 0)]' <<< "$members"
 }
 
-# 渲染为 nft 集合元素："8031, 9000-9010"
+# 渲染为 nft 集合元素："7031, 9000-9010"
 ports_json_to_nft_elements() {
     jq -r 'join(", ")' <<< "$1"
 }

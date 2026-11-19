@@ -11,7 +11,7 @@
 
 | | 1.5.x | 2.0 |
 | --- | --- | --- |
-| 监控项身份 | 端口字符串（`"8031,8032"`），改端口 = 删了重建、流量清零 | 稳定 ID `m1`、`m2`…，端口只是成员，可随时 `--add/--del/--set` |
+| 监控项身份 | 端口字符串（`"7031,7032"`），改端口 = 删了重建、流量清零 | 稳定 ID `m1`、`m2`…，端口只是成员，可随时 `--add/--del/--set` |
 | nft 规则 | 每端口一组规则，双向计费靠重复规则把计数翻倍 | 区间 verdict map 分派到每个监控项的链；增删端口只改 map 元素；计数器存原始字节，计费倍率在软件里乘 |
 | 定时任务 | 7 条以上（快照、重置、到期、机器流量…） | 每分钟一个 `--tick`、一个 `@reboot --boot`，开了推送再各加一条 `--send-status` |
 | 通知 | 外置 `telegram.sh` / `wecom.sh` 模块 | 内置；读不到计数时发明确的异常提示，**不会再推送空报告** |
@@ -78,7 +78,7 @@ dog edit m1 --del 80 | --set 80,8443  删除端口 / 整组替换
 dog edit m1 --quota 500GB | 0         配额（0 = 不限）
 dog edit m1 --billing double|single   计费：双向 (入+出)×2，单向 入+出
 dog edit m1 --limit 100Mbps | 0       带宽限制（上下行各自生效）
-dog edit m1 --expiry 2027-02-10 | 0   服务到期日
+dog edit m1 --expiry 2027-12-31 | 0   服务到期日
 dog edit m1 --reset monthly:1 | days:30[@起始日] | months:3[@起始日][:结算日] | yearly:1-1 | once:YYYY-MM-DD | none
 dog split m1 8443 [--copy]            把端口拆成新监控项（--copy 复制配额/重置/到期）
 dog merge m2 m1                       合并：流量相加，保留 m1 的设置

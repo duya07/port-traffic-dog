@@ -773,7 +773,7 @@ format_bytes() {
     }'
 }
 
-# "240GB" / "1.5T" / "500M" / "800KB" → 字节；无法解析返回 1。
+# "300GB" / "1.5T" / "500M" / "800KB" → 字节；无法解析返回 1。
 parse_size_to_bytes() {
     local s="${1^^}"
     s="${s// /}"
@@ -1175,7 +1175,7 @@ menu_clear() {
 
 # ── 配置（schema 2） ──────────────────────────────────────────────
 # 监控项以稳定 ID（m1、m2…）为身份，端口只是成员列表：
-#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
+#   .monitors.m1 = { ports:["7031","7032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
 # notify 缺省视为 true（2.1 新增；2.0.0 读到会忽略，即全部推送）。
 # 所有 nft/tc/统计/历史的名字都从 ID 派生，所以加减端口不会改变身份。
 
@@ -1394,7 +1394,7 @@ next_monitor_id() {
     ' "$CONFIG_FILE"
 }
 
-# 把 "m3" 或成员端口 "8031" 解析为监控项 ID。
+# 把 "m3" 或成员端口 "7031" 解析为监控项 ID。
 resolve_monitor() {
     local ref="$1" id
     if [[ "$ref" =~ ^[mM]([0-9]+)$ ]]; then
@@ -1515,7 +1515,7 @@ ports_json_normalize() {
     jq -cRn '[inputs | select(length > 0)]' <<< "$members"
 }
 
-# 渲染为 nft 集合元素："8031, 9000-9010"
+# 渲染为 nft 集合元素："7031, 9000-9010"
 ports_json_to_nft_elements() {
     jq -r 'join(", ")' <<< "$1"
 }
@@ -2721,7 +2721,7 @@ monitor_set_remark() {
     config_update '.monitors[$id].remark = $r' --arg id "$id" --arg r "$remark"
 }
 
-# 设置配额：$2 为 "240GB" 之类或 0（取消）。
+# 设置配额：$2 为 "300GB" 之类或 0（取消）。
 monitor_set_quota() {
     local id="$1" limit="$2" rc=0
     if [ "$limit" != "0" ]; then
@@ -2778,7 +2778,7 @@ monitors_set_notify() {
 }
 
 # ── 1.5.x → 2.0 迁移 ──────────────────────────────────────────────
-# 1.5.x 以端口串为 key（.ports["8031,8032"]），计数器名由 key 派生，且“双倍计费”靠重复规则实现，
+# 1.5.x 以端口串为 key（.ports["7031,7032"]），计数器名由 key 派生，且“双倍计费”靠重复规则实现，
 # 内核计数已包含倍率。迁移把计数除以旧倍率得到原始字节，在新结构中以初值原样恢复。
 # 迁移前完整备份；任何一步失败都恢复旧配置、旧 nft 表与 crontab。
 
@@ -5683,7 +5683,7 @@ show_monitor_table() {
             [ "${#r_pct[i]}" -le "$w_pd" ] || w_pd=${#r_pct[i]}
         fi
     done
-    # 宽屏配额列“240GB █░░░░░░░░░   7%”：配额 + 空格 + 10 格用量条 + 空格 + 百分比（至少 3 位，超额到 1000% 以上时按最长的算）。
+    # 宽屏配额列“300GB █░░░░░░░░░   7%”：配额 + 空格 + 10 格用量条 + 空格 + 百分比（至少 3 位，超额到 1000% 以上时按最长的算）。
     [ "$w_lim" -eq 0 ] || [ $((w_lim + 13 + w_pd)) -le "$w_qw" ] || w_qw=$((w_lim + 13 + w_pd))
     want=$w_lab; [ "$want" -le 40 ] || want=40
     columns=$(ui_columns)
@@ -5738,7 +5738,7 @@ show_monitor_table() {
     done
 }
 
-# 交互选择监控项：接受序号、ID（m3）或成员端口（8031）。输出 ID；表格与提示写到 stderr。
+# 交互选择监控项：接受序号、ID（m3）或成员端口（7031）。输出 ID；表格与提示写到 stderr。
 select_monitor() {
     local prompt="${1:-请选择监控项}" input ids id
     mapfile -t ids < <(monitor_ids)

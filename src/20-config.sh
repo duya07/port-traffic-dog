@@ -1,6 +1,6 @@
 # ── 配置（schema 2） ──────────────────────────────────────────────
 # 监控项以稳定 ID（m1、m2…）为身份，端口只是成员列表：
-#   .monitors.m1 = { ports:["8031","8032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
+#   .monitors.m1 = { ports:["7031","7032"], remark, billing_mode, quota, bandwidth_limit, expiry_date, created_at, notify }
 # notify 缺省视为 true（2.1 新增；2.0.0 读到会忽略，即全部推送）。
 # 所有 nft/tc/统计/历史的名字都从 ID 派生，所以加减端口不会改变身份。
 
@@ -219,7 +219,7 @@ next_monitor_id() {
     ' "$CONFIG_FILE"
 }
 
-# 把 "m3" 或成员端口 "8031" 解析为监控项 ID。
+# 把 "m3" 或成员端口 "7031" 解析为监控项 ID。
 resolve_monitor() {
     local ref="$1" id
     if [[ "$ref" =~ ^[mM]([0-9]+)$ ]]; then

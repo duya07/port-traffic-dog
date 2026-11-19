@@ -67,29 +67,29 @@ PY
 }
 
 echo "# 添加与重叠校验"
-check "添加 m1（8031,8032）" "${DOG[@]}" add "8031,8032" --remark web1
-check "一次添加两项（3001-3009;8080）" "${DOG[@]}" add "3001-3009;8080"
+check "添加 m1（7031,7032）" "${DOG[@]}" add "7031,7032" --remark web1
+check "一次添加两项（5001-5009;8080）" "${DOG[@]}" add "5001-5009;8080"
 [ "$(cfg '.monitors | keys | join(",")')" = "m1,m2,m3" ] && ok "ID 为 m1,m2,m3" || bad "ID 分配：$(cfg '.monitors | keys')"
-if "${DOG[@]}" add 8032 >/dev/null 2>&1; then bad "重叠端口应被拒绝"; else ok "重叠端口被拒绝"; fi
-if "${DOG[@]}" add "3005" >/dev/null 2>&1; then bad "落入端口段的端口应被拒绝"; else ok "落入端口段的端口被拒绝"; fi
+if "${DOG[@]}" add 7032 >/dev/null 2>&1; then bad "重叠端口应被拒绝"; else ok "重叠端口被拒绝"; fi
+if "${DOG[@]}" add "5005" >/dev/null 2>&1; then bad "落入端口段的端口应被拒绝"; else ok "落入端口段的端口被拒绝"; fi
 [ "$(nft list chain inet port_traffic_monitor input | grep -c vmap)" -eq 1 ] && ok "input 链只有 1 条 vmap 规则" || bad "input 规则数"
 
 echo "# 计数与加减端口"
-send_udp 8031 972 3
+send_udp 7031 972 3
 in1=$(nft_bytes ptd_m1_in); out1=$(nft_bytes ptd_m1_out)
 [ "$in1" -eq 3000 ] && ok "m1 入站 3000 字节" || bad "m1 入站=$in1（期望 3000）"
 [ "$out1" -eq 384 ] && ok "m1 出站 384 字节" || bad "m1 出站=$out1（期望 384）"
-check "给 m1 加端口 8033" "${DOG[@]}" edit m1 --add 8033
+check "给 m1 加端口 7033" "${DOG[@]}" edit m1 --add 7033
 [ "$(nft_bytes ptd_m1_in)" -eq "$in1" ] && ok "加端口后计数不变" || bad "加端口后计数变化"
-send_udp 8033 972 1
+send_udp 7033 972 1
 [ "$(nft_bytes ptd_m1_in)" -eq $((in1 + 1000)) ] && ok "新端口流量计入 m1" || bad "新端口流量未计入"
-check "按端口引用删除成员（8031 → 删 8032）" "${DOG[@]}" edit 8031 --del 8032
-[ "$(cfg '.monitors.m1.ports | join(",")')" = "8031,8033" ] && ok "m1 成员为 8031,8033" || bad "成员=$(cfg '.monitors.m1.ports')"
-send_udp 8032 972 1
+check "按端口引用删除成员（7031 → 删 7032）" "${DOG[@]}" edit 7031 --del 7032
+[ "$(cfg '.monitors.m1.ports | join(",")')" = "7031,7033" ] && ok "m1 成员为 7031,7033" || bad "成员=$(cfg '.monitors.m1.ports')"
+send_udp 7032 972 1
 [ "$(nft_bytes ptd_m1_in)" -eq $((in1 + 1000)) ] && ok "删除的端口不再计入" || bad "删除后仍计数"
-if "${DOG[@]}" edit m1 --del 8031,8033 >/dev/null 2>&1; then bad "删光端口应被拒绝"; else ok "删光端口被拒绝"; fi
+if "${DOG[@]}" edit m1 --del 7031,7033 >/dev/null 2>&1; then bad "删光端口应被拒绝"; else ok "删光端口被拒绝"; fi
 if "${DOG[@]}" edit m1 --add 8080 >/dev/null 2>&1; then bad "加入他项端口应被拒绝"; else ok "加入他项端口被拒绝"; fi
-check "整组替换为 8031,8033-8035" "${DOG[@]}" edit m1 --set 8031,8033-8035
+check "整组替换为 7031,7033-7035" "${DOG[@]}" edit m1 --set 7031,7033-7035
 [ "$(nft_bytes ptd_m1_in)" -eq $((in1 + 1000)) ] && ok "整组替换后计数不变" || bad "替换后计数变化"
 
 echo "# 配额"
@@ -99,30 +99,30 @@ q=$(quota_json ptd_m1_quota)
 check "切换为单向计费" "${DOG[@]}" edit m1 --billing single
 [ "$(jq '.bytes' <<< "$(quota_json ptd_m1_quota)")" -eq 1048576 ] && ok "单向计费阈值 = 1MB" || bad "单向阈值"
 [ "$(nft_bytes ptd_m1_in)" -eq $((in1 + 1000)) ] && ok "切换计费不改写计数" || bad "切换计费改写了计数"
-send_udp 8031 60000 25
+send_udp 7031 60000 25
 used=$(jq '.used' <<< "$(quota_json ptd_m1_quota)")
 [ "$used" -ge 1048576 ] && ok "超额后配额 used 达到阈值（内核导出时封顶）" || bad "配额 used=$used"
-before=$(nft_bytes ptd_m1_in); send_udp 8031 972 2
+before=$(nft_bytes ptd_m1_in); send_udp 7031 972 2
 [ "$(nft_bytes ptd_m1_in)" -eq "$before" ] && ok "超额后流量被丢弃且不计数" || bad "超额后仍计数"
 check "取消配额" "${DOG[@]}" edit m1 --quota 0
 [ -z "$(quota_json ptd_m1_quota)" ] && ok "配额对象已删除" || bad "配额对象仍在"
 
 echo "# 拆分与合并"
 m1_before=$(nft_bytes ptd_m1_in)
-check "拆出 8033-8035 为新项" "${DOG[@]}" split m1 8033-8035 --remark split
-[ "$(cfg '.monitors.m4.ports | join(",")')" = "8033-8035" ] && ok "新项 m4 = 8033-8035" || bad "拆分结果 $(cfg '.monitors | keys')"
+check "拆出 7033-7035 为新项" "${DOG[@]}" split m1 7033-7035 --remark split
+[ "$(cfg '.monitors.m4.ports | join(",")')" = "7033-7035" ] && ok "新项 m4 = 7033-7035" || bad "拆分结果 $(cfg '.monitors | keys')"
 [ "$(nft_bytes ptd_m4_in)" -eq 0 ] && ok "新项从 0 开始" || bad "新项计数非 0"
 [ "$(nft_bytes ptd_m1_in)" -eq "$m1_before" ] && ok "原项计数保留" || bad "原项计数变化"
-send_udp 8034 972 2
+send_udp 7034 972 2
 check "合并 m4 → m1" "${DOG[@]}" merge m4 m1
 [ "$(nft_bytes ptd_m1_in)" -eq $((m1_before + 2000)) ] && ok "合并后计数相加" || bad "合并后=$(nft_bytes ptd_m1_in)"
 [ "$(cfg '.monitors | has("m4")')" = "false" ] && ok "源项已删除" || bad "源项仍在"
-[ "$(cfg '.monitors.m1.ports | join(",")')" = "8031,8033-8035" ] && ok "端口已并入" || bad "合并端口 $(cfg '.monitors.m1.ports')"
+[ "$(cfg '.monitors.m1.ports | join(",")')" = "7031,7033-7035" ] && ok "端口已并入" || bad "合并端口 $(cfg '.monitors.m1.ports')"
 
 echo "# 到期封锁"
 check "设置已过期日期" "${DOG[@]}" edit m1 --expiry 2020-01-01
 grep -q ptd_expired <<< "$(nft list chain inet port_traffic_monitor ptd_m1_in 2>/dev/null)" && ok "链首有到期 drop" || bad "缺到期规则"
-before=$(nft_bytes ptd_m1_in); send_udp 8031 972 2
+before=$(nft_bytes ptd_m1_in); send_udp 7031 972 2
 [ "$(nft_bytes ptd_m1_in)" -eq "$before" ] && ok "到期后流量被封锁" || bad "到期后仍有流量"
 check "取消到期" "${DOG[@]}" edit m1 --expiry 0
 grep -q ptd_expired <<< "$(nft list chain inet port_traffic_monitor ptd_m1_in 2>/dev/null)" && bad "到期规则未解除" || ok "到期规则已解除"
@@ -216,7 +216,7 @@ rc=0; env PATH="$T/tgstub:$PATH" "${DOG[@]}" --send-status telegram >/dev/null 2
 [ "$rc" -eq 0 ] && grep -q '\[m1\]' "$T/tg.args" 2>/dev/null && ! grep -q '\[m2\]' "$T/tg.args" && ! grep -q '\[m3\]' "$T/tg.args" &&
     ok "推送只包含开启的监控项" || bad "推送内容 rc=$rc：$(grep -o '\[m[0-9]*\]' "$T/tg.args" 2>/dev/null | paste -sd,)"
 check "关闭 m1 推送（准备拆分）" "${DOG[@]}" edit m1 --notify off
-sid=$("${DOG[@]}" split m1 8033-8035 2>/dev/null | tail -n1)
+sid=$("${DOG[@]}" split m1 7033-7035 2>/dev/null | tail -n1)
 [ -n "$sid" ] && [ "$(cfg ".monitors.$sid.notify")" = "false" ] && ok "拆出的新项 $sid 继承 notify=false" || bad "拆分后 $sid notify=$(cfg ".monitors.${sid:-x}.notify")"
 check "合并回 m1" "${DOG[@]}" merge "$sid" m1
 for id in m1 m2 m3; do "${DOG[@]}" edit "$id" --notify on >/dev/null 2>&1 || bad "开启 $id 推送失败"; done
@@ -249,11 +249,11 @@ nft delete table inet port_traffic_monitor
 rm -rf "$PORT_TRAFFIC_DOG_CONFIG_DIR"; mkdir -p "$PORT_TRAFFIC_DOG_CONFIG_DIR"
 cat > "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json" <<'JSON'
 {"global":{"billing_mode":"double"},
- "ports":{"8031,8032":{"name":"端口8031,8032","enabled":true,"billing_mode":"double",
+ "ports":{"7031,7032":{"name":"端口7031,7032","enabled":true,"billing_mode":"double",
     "bandwidth_limit":{"enabled":false,"rate":"unlimited"},
-    "quota":{"enabled":true,"monthly_limit":"240GB","reset_day":1,
+    "quota":{"enabled":true,"monthly_limit":"300GB","reset_day":1,
              "reset_policy":{"type":"monthly","day":1,"instance_id":"x-1","next_reset_date":"2099-12-01"}},
-    "expiry_date":"2099-02-15","remark":"demo-node@example","created_at":"2026-11-14T17:58:24+08:00"},
+    "expiry_date":"2099-06-30","remark":"demo-node@example","created_at":"2026-01-01T08:00:00+08:00"},
   "443":{"name":"端口443","billing_mode":"single","quota":{"enabled":false,"monthly_limit":"unlimited"},
     "bandwidth_limit":{"enabled":false,"rate":"unlimited"},"remark":""}},
  "nftables":{"table_name":"port_traffic_monitor","family":"inet"},
@@ -263,14 +263,14 @@ cat > "$PORT_TRAFFIC_DOG_CONFIG_DIR/config.json" <<'JSON'
 JSON
 nft -f - <<'NFT'
 table inet port_traffic_monitor {
-    counter port_g8031_8032_in { packets 10 bytes 2863350496 }
-    counter port_g8031_8032_out { packets 10 bytes 492600652 }
-    quota port_g8031_8032_quota { over 245760 mbytes used 3355951148 bytes }
+    counter port_g7031_7032_in { packets 10 bytes 2000000000 }
+    counter port_g7031_7032_out { packets 10 bytes 600000000 }
+    quota port_g7031_7032_quota { over 307200 mbytes used 2600000000 bytes }
     counter port_443_in { packets 1 bytes 1000 }
     counter port_443_out { packets 1 bytes 500 }
     chain input { type filter hook input priority filter; policy accept;
-        tcp dport 8031 counter name "port_g8031_8032_in"
-        tcp dport 8031 counter name "port_g8031_8032_in"
+        tcp dport 7031 counter name "port_g7031_7032_in"
+        tcp dport 7031 counter name "port_g7031_7032_in"
     }
 }
 NFT
@@ -285,16 +285,16 @@ printf '{"ports":{"abc":{}}}' > "$T/bad-legacy2.json"
 check "迁移（1.5.x 更新器调用 --finalize-update）" "${DOG[@]}" --finalize-update
 check "迁移后 list 正常" "${DOG[@]}" list
 [ "$(cfg '.schema')" = "2" ] && ok "schema=2" || bad "schema=$(cfg '.schema')"
-[ "$(cfg '.monitors.m1.ports | join(",")')" = "443" ] && [ "$(cfg '.monitors.m2.ports | join(",")')" = "8031,8032" ] && ok "按端口排序分配 ID" || bad "ID 映射 $(cfg '.monitors')"
-[ "$(nft_bytes ptd_m2_in)" -eq 1431675248 ] && ok "双向计数 ÷2 迁移（2863350496 → 1431675248）" || bad "m2 in=$(nft_bytes ptd_m2_in)"
+[ "$(cfg '.monitors.m1.ports | join(",")')" = "443" ] && [ "$(cfg '.monitors.m2.ports | join(",")')" = "7031,7032" ] && ok "按端口排序分配 ID" || bad "ID 映射 $(cfg '.monitors')"
+[ "$(nft_bytes ptd_m2_in)" -eq 1000000000 ] && ok "双向计数 ÷2 迁移（2000000000 → 1000000000）" || bad "m2 in=$(nft_bytes ptd_m2_in)"
 [ "$(nft_bytes ptd_m1_out)" -eq 500 ] && ok "单向计数原样迁移" || bad "m1 out=$(nft_bytes ptd_m1_out)"
-[ "$(jq '.used' <<< "$(quota_json ptd_m2_quota)")" -eq 1677975574 ] && ok "已用配额 ÷2 迁移" || bad "quota $(quota_json ptd_m2_quota)"
+[ "$(jq '.used' <<< "$(quota_json ptd_m2_quota)")" -eq 1300000000 ] && ok "已用配额 ÷2 迁移" || bad "quota $(quota_json ptd_m2_quota)"
 [ "$(cfg '.monitors.m2.remark')" = "demo-node@example" ] && [ "$(cfg '.monitors.m2.reset_policy.next_reset_date')" = "2099-12-01" ] &&
-    [ "$(cfg '.monitors.m2.expiry_date')" = "2099-02-15" ] && ok "备注/重置/到期保留" || bad "字段迁移"
+    [ "$(cfg '.monitors.m2.expiry_date')" = "2099-06-30" ] && ok "备注/重置/到期保留" || bad "字段迁移"
 [ "$(cfg '.notifications.telegram.custom_api_base')" = "https://tg.example.com" ] && ok "通知配置保留" || bad "通知配置"
 grep -q 'send-status telegram' "$T/crontab" && ! grep -q 'snapshot-traffic' "$T/crontab" && grep -q backup.sh "$T/crontab" && ok "旧 cron 替换为新任务" || bad "cron 迁移：$(cat "$T/crontab")"
 ls "$PORT_TRAFFIC_DOG_CONFIG_DIR"/backups/migrate-1.5-*/config.json >/dev/null 2>&1 && ok "迁移备份存在" || bad "无迁移备份"
-grep -q 'port_g8031' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)" && bad "旧对象残留" || ok "旧对象已清除"
+grep -q 'port_g7031' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)" && bad "旧对象残留" || ok "旧对象已清除"
 
 echo "# 更新（Release + SHA256SUMS，curl 桩按文件名供给）"
 export PORT_TRAFFIC_DOG_INSTALL_PATH="$T/bin/port-traffic-dog.sh" PORT_TRAFFIC_DOG_MIRROR="https://mirror.invalid"

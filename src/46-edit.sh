@@ -217,7 +217,7 @@ monitor_set_remark() {
     config_update '.monitors[$id].remark = $r' --arg id "$id" --arg r "$remark"
 }
 
-# 设置配额：$2 为 "240GB" 之类或 0（取消）。
+# 设置配额：$2 为 "300GB" 之类或 0（取消）。
 monitor_set_quota() {
     local id="$1" limit="$2" rc=0
     if [ "$limit" != "0" ]; then

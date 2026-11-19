@@ -36,7 +36,7 @@ parse_monitor_units '80,443;8080-8090' units
 # shellcheck disable=SC2154  # units 由 parse_monitor_units 通过 nameref 赋值
 eq "多项拆分" "${units[*]}" "80,443 8080-8090"
 no_ parse_monitor_units '80;70-90' units
-eq "GB" "$(parse_size_to_bytes 240GB)" "257698037760"
+eq "GB" "$(parse_size_to_bytes 300GB)" "322122547200"
 eq "小数 TB" "$(parse_size_to_bytes 1.5t)" "1649267441664"
 eq "KB" "$(parse_size_to_bytes 800KB)" "819200"
 no_ parse_size_to_bytes 12XB
@@ -56,26 +56,26 @@ no_ parse_reset_spec monthly:32
 # 配置与监控项访问
 cat > "$CONFIG_FILE" <<'JSON'
 {"schema":2,"global":{"next_monitor_id":3},
- "monitors":{"m1":{"ports":["8031","8032"],"remark":"web1","billing_mode":"double",
-   "quota":{"enabled":true,"monthly_limit":"240GB"},"bandwidth_limit":{"enabled":false,"rate":"unlimited"},
+ "monitors":{"m1":{"ports":["7031","7032"],"remark":"web1","billing_mode":"double",
+   "quota":{"enabled":true,"monthly_limit":"300GB"},"bandwidth_limit":{"enabled":false,"rate":"unlimited"},
    "reset_policy":{"type":"monthly","day":1,"next_reset_date":"2026-12-01","last_reset_date":"2026-11-01"},
-   "expiry_date":"2027-02-15","created_at":"2026-11-14T17:58:24+08:00"},
-  "m2":{"ports":["3001-3009"],"billing_mode":"single","quota":{"enabled":false,"monthly_limit":"unlimited"},
+   "expiry_date":"2027-06-30","created_at":"2026-01-01T08:00:00+08:00"},
+  "m2":{"ports":["5001-5009"],"billing_mode":"single","quota":{"enabled":false,"monthly_limit":"unlimited"},
    "reset_policy":{"type":"none"}}},
  "notifications":{"telegram":{"enabled":true,"bot_token":"123456:SECRETTOKEN","chat_id":"42","server_name":"demo-node",
    "api_route":"official","status_notifications":{"enabled":true,"interval":"12h"}},
   "wecom":{"enabled":false,"status_notifications":{"enabled":false,"interval":"1h"}}}}
 JSON
 yes_ validate_config_file "$CONFIG_FILE"
-eq "按端口定位" "$(resolve_monitor 3005)" "m2"
+eq "按端口定位" "$(resolve_monitor 5005)" "m2"
 eq "按 ID 定位" "$(resolve_monitor M1)" "m1"
 no_ resolve_monitor 9999
 eq "下一个 ID" "$(next_monitor_id)" "m3"
 eq "倍率" "$(monitor_billing_multiplier m2)" "1"
-eq "配额阈值（双向）" "$(monitor_quota_raw_limit m1)" "128849018880"
+eq "配额阈值（双向）" "$(monitor_quota_raw_limit m1)" "161061273600"
 eq "周期" "$(monitor_cycle_range m1)" "2026-11-01~2026-11-30"
-eq "冲突检测" "$(find_port_conflict '["3005"]')" "m2 3001-3009 3005"
-eq "冲突排除自身" "$(find_port_conflict '["8031"]' m1)" ""
+eq "冲突检测" "$(find_port_conflict '["5005"]')" "m2 5001-5009 5005"
+eq "冲突排除自身" "$(find_port_conflict '["7031"]' m1)" ""
 
 # cron 期望行
 cron_lines=$(desired_dog_cron_lines)
@@ -233,7 +233,7 @@ eq "宽度：ASCII" "$(ui_width 'abc 12')" "6"
 eq "宽度：中文与全角标点" "$(ui_width '东京（主线）')" "12"
 eq "宽度：符号" "$(ui_width '─…·█░●✓')" "7"
 eq "补齐按显示宽度" "$(ui_pad '中a' 6)|" "中a   |"
-eq "超宽截断加省略号" "$(ui_truncate '东京主线（8023）' 9)" "东京主线…"
+eq "超宽截断加省略号" "$(ui_truncate '东京主线（7023）' 9)" "东京主线…"
 eq "不超宽不截断" "$(ui_truncate '8443' 9)" "8443"
 eq "tc 速率显示" "$(format_tc_rate 100mbit)" "100Mbps"
 eq "宽度：emoji 与符号（交通、扩展、杂项）" "$(ui_width '🚀🪐⌚✅')" "8"

@@ -33,9 +33,9 @@ CONFIG = {
     'schema': 2,
     'global': {'billing_mode': 'double', 'next_monitor_id': 4, 'data_retention_days': 400},
     'monitors': {
-        'm1': {'ports': ['8023', '8031', '8032', '8082'], 'remark': '东京主线', 'billing_mode': 'double',
-               'quota': {'enabled': True, 'monthly_limit': '240GB'},
-               'reset_policy': {'type': 'monthly', 'day': 1, 'next_reset_date': '2099-12-01'}, 'expiry_date': '2099-02-17'},
+        'm1': {'ports': ['7023', '7031', '7032', '7082'], 'remark': '东京主线', 'billing_mode': 'double',
+               'quota': {'enabled': True, 'monthly_limit': '300GB'},
+               'reset_policy': {'type': 'monthly', 'day': 1, 'next_reset_date': '2099-12-01'}, 'expiry_date': '2099-12-31'},
         'm2': {'ports': ['9000-9010'], 'remark': '客户A', 'billing_mode': 'single',
                'quota': {'enabled': False, 'monthly_limit': 'unlimited'},
                'bandwidth_limit': {'enabled': True, 'rate': '100mbit'}, 'notify': False},
@@ -49,11 +49,11 @@ CONFIG = {
                   'status_notifications': {'enabled': False, 'interval': '1h'}},
     },
 }
-VALUES = {'m1': {'in': 101463059, 'out': 9368037949}, 'm2': {'in': 200000000, 'out': 336870912},
+VALUES = {'m1': {'in': 1000000000, 'out': 8000000000}, 'm2': {'in': 200000000, 'out': 336870912},
           'm3': {'in': 13300000000, 'out': 14344245094}}
 MACHINE = {'monthly': {'ifaces': {'eth0': {'rx_bytes': 1330000000000, 'tx_bytes': 1240000000000}}}}
-USED = {'m1': '17.64GB', 'm2': '512.00MB', 'm3': '51.49GB'}
-QUOTA = {'m1': '240GB', 'm2': '不限额', 'm3': '50GB'}
+USED = {'m1': '16.76GB', 'm2': '512.00MB', 'm3': '51.49GB'}
+QUOTA = {'m1': '300GB', 'm2': '不限额', 'm3': '50GB'}
 LABEL = {'m1': '东京主线', 'm2': '客户A', 'm3': '8443'}
 FIRST_TAG = {'m2': '限速 100Mbps', 'm3': '超额'}
 WRAPPER = '''#!/bin/bash
@@ -217,7 +217,7 @@ def main():
 
         _, env = new_state(temp, 'edit')
         text = plain(capture(100, env, wrapper, (b'2\n', b'1\n', b'0\n', b'0\n')))
-        assert '当前成员  8023,8031,8032,8082' in text and '请选择 [0-5]' in text and ' 修改端口' in text, text[-2000:]
+        assert '当前成员  7023,7031,7032,7082' in text and '请选择 [0-5]' in text and ' 修改端口' in text, text[-2000:]
         cases['edit-menu'] = {'passed': True}
 
         # 菜单动作失败（导入不存在的文件）只提示并回到菜单；2.0.0 中 set -e 会直接结束脚本（rc=1）。

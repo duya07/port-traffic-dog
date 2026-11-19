@@ -93,11 +93,11 @@ setup_legacy() {
     cp "$ROOT/telegram.sh" "$ROOT/wecom.sh" /etc/port-traffic-dog/notifications/
     cat > /etc/port-traffic-dog/config.json <<'JSON'
 {"global":{"billing_mode":"double"},
- "ports":{"8031,8032":{"name":"端口8031,8032","enabled":true,"billing_mode":"double",
+ "ports":{"7031,7032":{"name":"端口7031,7032","enabled":true,"billing_mode":"double",
     "bandwidth_limit":{"enabled":false,"rate":"unlimited"},
-    "quota":{"enabled":true,"monthly_limit":"240GB","reset_day":1,
+    "quota":{"enabled":true,"monthly_limit":"300GB","reset_day":1,
              "reset_policy":{"type":"monthly","day":1,"instance_id":"x-1","next_reset_date":"2099-12-01"}},
-    "expiry_date":"2099-02-15","remark":"demo-node@example","created_at":"2026-11-14T17:58:24+08:00"},
+    "expiry_date":"2099-06-30","remark":"demo-node@example","created_at":"2026-01-01T08:00:00+08:00"},
   "443":{"name":"端口443","enabled":true,"billing_mode":"single","quota":{"enabled":false,"monthly_limit":"unlimited"},
     "bandwidth_limit":{"enabled":false,"rate":"unlimited"},"remark":""}},
  "nftables":{"table_name":"port_traffic_monitor","family":"inet"},
@@ -112,7 +112,7 @@ JSON
     bash /usr/local/bin/port-traffic-dog.sh --refresh-all-cron >/dev/null 2>&1 || true
 }
 
-# 往旧计数器灌流量（回环 UDP，入方向命中 8031）。
+# 往旧计数器灌流量（回环 UDP，入方向命中 7031）。
 send_udp() {
     python3 - "$@" <<'PY'
 import socket, sys
@@ -126,13 +126,13 @@ PY
 
 echo "# 准备 1.5.23 环境"
 setup_legacy
-if grep -q 'port_g8031_8032_in' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)"; then
+if grep -q 'port_g7031_7032_in' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)"; then
     ok "1.5.23 已建立旧格式计数器"
 else
     bad "1.5.23 未建立旧计数器"; nft list table inet port_traffic_monitor 2>&1 | head -20
 fi
-send_udp 8031 972 100   # 每包 1000 字节（含 IP/UDP 头），双倍计费下旧计数 = 200000
-old_in=$(nft_bytes port_g8031_8032_in)
+send_udp 7031 972 100   # 每包 1000 字节（含 IP/UDP 头），双倍计费下旧计数 = 200000
+old_in=$(nft_bytes port_g7031_7032_in)
 [ "${old_in:-0}" -gt 0 ] && ok "旧计数器有流量（$old_in）" || bad "旧计数器无流量"
 grep -q 'port-traffic-dog' "$T/crontab" && ok "旧定时任务已写入" || bad "旧定时任务缺失"
 
@@ -146,7 +146,7 @@ rc=$?
 [ "$rc" -ne 0 ] && ok "失败安装包返回非 0（$rc）" || bad "失败安装包竟然成功"
 [ "$(installed_version)" = "1.5.23" ] && ok "旧版脚本已恢复" || bad "回滚后版本=$(installed_version)"
 [ "$(cfg '.ports | keys | length')" = "2" ] && [ "$(cfg '.schema // "none"')" = "none" ] && ok "旧配置保持 1.5 格式" || bad "回滚后配置已被改动"
-[ "$(nft_bytes port_g8031_8032_in)" = "$old_in" ] && ok "旧计数器未受影响" || bad "回滚后计数=$(nft_bytes port_g8031_8032_in)"
+[ "$(nft_bytes port_g7031_7032_in)" = "$old_in" ] && ok "旧计数器未受影响" || bad "回滚后计数=$(nft_bytes port_g7031_7032_in)"
 [ "$(cat "$T/crontab")" = "$cron_before" ] && ok "定时任务已恢复" || bad "回滚后定时任务变化"
 
 echo "# 成功路径：1.5.23 --install-local 安装 2.0"
@@ -157,11 +157,11 @@ rc=$?
 [ "$(installed_version)" = "$(awk -F'"' '/^readonly SCRIPT_VERSION=/ { print $2; exit }' "$ROOT/port-traffic-dog.sh")" ] &&
     ok "已安装版本 $(installed_version)" || bad "已安装版本=$(installed_version)"
 [ "$(cfg '.schema')" = "2" ] && ok "配置迁移为 schema 2" || bad "schema=$(cfg '.schema')"
-id=$(jq -r '.monitors | to_entries[] | select(.value.ports == ["8031","8032"]) | .key' /etc/port-traffic-dog/config.json)
-[ -n "$id" ] && ok "8031,8032 → $id" || bad "找不到 8031,8032 监控项"
+id=$(jq -r '.monitors | to_entries[] | select(.value.ports == ["7031","7032"]) | .key' /etc/port-traffic-dog/config.json)
+[ -n "$id" ] && ok "7031,7032 → $id" || bad "找不到 7031,7032 监控项"
 new_in=$(nft_bytes "ptd_${id}_in")
 [ "${new_in:-x}" = "$((old_in / 2))" ] && ok "计数按旧倍率换算（$old_in ÷ 2 = $new_in）" || bad "新计数=$new_in，期望 $((old_in / 2))"
-grep -q 'port_g8031' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)" && bad "旧对象残留" || ok "旧 nft 对象已清除"
+grep -q 'port_g7031' <<< "$(nft list table inet port_traffic_monitor 2>/dev/null)" && bad "旧对象残留" || ok "旧 nft 对象已清除"
 grep -q -- '--tick' "$T/crontab" && ! grep -q -- '--snapshot-traffic' "$T/crontab" && grep -q backup.sh "$T/crontab" &&
     head -n1 "$T/crontab" | grep -q '^PATH=' && ok "定时任务已换成 2.0 格式，用户行与 PATH 行保留" || bad "定时任务：$(cat "$T/crontab")"
 [ ! -d /etc/port-traffic-dog/notifications ] && ok "旧通知模块目录已移除" || bad "notifications 目录残留"
@@ -172,7 +172,7 @@ jq -e '[.monitors[] | has("notify")] | any | not' /etc/port-traffic-dog/config.j
 st=$(bash /usr/local/bin/port-traffic-dog.sh status 2>&1)
 [ "$(grep -c '^[0-9][0-9]*\. \[m[0-9][0-9]*\]' <<< "$st")" -eq "$(jq '.monitors | length' /etc/port-traffic-dog/config.json)" ] &&
     ok "升级后 status 包含全部监控项" || bad "status：$st"
-send_udp 8032 972 10
+send_udp 7032 972 10
 [ "$(nft_bytes "ptd_${id}_in")" -gt "$new_in" ] && ok "升级后继续计数" || bad "升级后计数未增长"
 
 # migrate-to-custom.sh 使用的离线发布目录（与 tools/release.sh 产物同结构）。
@@ -183,16 +183,16 @@ MIGRATE=(bash "$ROOT/migrate-to-custom.sh" --from-dir "$DIST")
 
 echo "# migrate-to-custom.sh：校验不符时拒绝且不改动"
 setup_legacy
-send_udp 8031 972 50
-old_in=$(nft_bytes port_g8031_8032_in)
+send_udp 7031 972 50
+old_in=$(nft_bytes port_g7031_7032_in)
 cp -a "$DIST" "$T/dist-bad"; echo '# x' >> "$T/dist-bad/port-traffic-dog.sh"
 bash "$ROOT/migrate-to-custom.sh" --from-dir "$T/dist-bad" --yes > "$T/m-bad.out" 2>&1 && bad "篡改的安装包被接受" || ok "篡改的安装包被拒绝"
-[ "$(installed_version)" = "1.5.23" ] && [ "$(nft_bytes port_g8031_8032_in)" = "$old_in" ] && ok "拒绝后 1.5.23 原样" || bad "拒绝后状态变化"
+[ "$(installed_version)" = "1.5.23" ] && [ "$(nft_bytes port_g7031_7032_in)" = "$old_in" ] && ok "拒绝后 1.5.23 原样" || bad "拒绝后状态变化"
 
 echo "# migrate-to-custom.sh：1.5.23 → 2.0"
 "${MIGRATE[@]}" --yes > "$T/m.out" 2>&1 && ok "迁移脚本返回 0" || { bad "迁移脚本失败"; tail -20 "$T/m.out"; }
 [ "$(installed_version)" != "1.5.23" ] && [ "$(cfg '.schema')" = "2" ] && ok "已安装 2.x 且配置为 schema 2" || bad "版本/配置：$(installed_version) $(cfg '.schema')"
-id=$(jq -r '.monitors | to_entries[] | select(.value.ports == ["8031","8032"]) | .key' /etc/port-traffic-dog/config.json)
+id=$(jq -r '.monitors | to_entries[] | select(.value.ports == ["7031","7032"]) | .key' /etc/port-traffic-dog/config.json)
 [ "$(nft_bytes "ptd_${id}_in")" = "$((old_in / 2))" ] && ok "计数无损（$old_in ÷ 2）" || bad "计数=$(nft_bytes "ptd_${id}_in")"
 grep -q '# port-traffic-dog shortcut' /usr/local/bin/dog && ok "dog 快捷命令已换成 2.0 版" || bad "dog 快捷命令未更新：$(cat /usr/local/bin/dog)"
 [ -x /etc/port-traffic-dog/port-ip-guard.sh ] && ok "IP Guard 组件已安装" || bad "IP Guard 组件缺失"
@@ -201,14 +201,14 @@ grep -q -- '--tick' "$T/crontab" && grep -q backup.sh "$T/crontab" && ok "定时
 
 echo "# migrate-to-custom.sh：新版迁移失败时整体回滚"
 setup_legacy
-send_udp 8031 972 20
-old_in=$(nft_bytes port_g8031_8032_in); cron_before=$(cat "$T/crontab"); dog_before=$( { sha256sum < /usr/local/bin/dog; } 2>/dev/null || echo none)
+send_udp 7031 972 20
+old_in=$(nft_bytes port_g7031_7032_in); cron_before=$(cat "$T/crontab"); dog_before=$( { sha256sum < /usr/local/bin/dog; } 2>/dev/null || echo none)
 cp -a "$DIST" "$T/dist-fail"
 sed -i 's/^        --post-update|--finalize-update) post_update ;;$/        --post-update|--finalize-update) return 9 ;;/' "$T/dist-fail/port-traffic-dog.sh"
 (cd "$T/dist-fail" && sha256sum port-traffic-dog.sh port-ip-guard.sh > SHA256SUMS)
 bash "$ROOT/migrate-to-custom.sh" --from-dir "$T/dist-fail" --yes > "$T/m-fail.out" 2>&1 && bad "失败未报告" || ok "新版失败时返回非 0"
 [ "$(installed_version)" = "1.5.23" ] && [ "$(cfg '.schema // "none"')" = "none" ] && ok "脚本与配置已回滚" || bad "回滚后：$(installed_version) $(cfg '.schema')"
-[ "$(nft_bytes port_g8031_8032_in)" = "$old_in" ] && ok "旧 nft 表已恢复" || bad "回滚后计数=$(nft_bytes port_g8031_8032_in)"
+[ "$(nft_bytes port_g7031_7032_in)" = "$old_in" ] && ok "旧 nft 表已恢复" || bad "回滚后计数=$(nft_bytes port_g7031_7032_in)"
 [ "$(cat "$T/crontab")" = "$cron_before" ] && [ "$( { sha256sum < /usr/local/bin/dog; } 2>/dev/null || echo none)" = "$dog_before" ] && ok "定时任务与快捷命令已恢复" || bad "定时任务/快捷命令未恢复"
 
 echo "# migrate-to-custom.sh：上游 1.4.x 格式"
@@ -227,7 +227,7 @@ cat > /etc/port-traffic-dog/config.json <<'JSON'
           "bandwidth_limit":{"enabled":false,"rate":"unlimited"},"remark":"grp"}},
  "nftables":{"table_name":"port_traffic_monitor","family":"inet"},"notifications":{}}
 JSON
-printf '{"9001,9002":{"input":0,"output":7777,"backup_time":"2026-11-14T00:00:00+08:00"}}\n' > /etc/port-traffic-dog/traffic_data.json
+printf '{"9001,9002":{"input":0,"output":7777,"backup_time":"2026-01-01T00:00:00+08:00"}}\n' > /etc/port-traffic-dog/traffic_data.json
 nft -f - <<'NFT'
 table inet port_traffic_monitor {
     counter port_8443_in { packets 1 bytes 4000 }
